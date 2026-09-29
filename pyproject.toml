@@ -1,3 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maven-mcp"
+version = "1.0.0"
+description = "MCP server for Maven and Gradle dependency intelligence"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+maven-mcp = "server:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["plugin/server/server.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"plugin/server" = ""
+
 [tool.coverage.run]
 # Repo-root-relative: CI invokes `coverage run --rcfile=pyproject.toml`
 # from the repo root (coverage.py does not walk up from an --rcfile to

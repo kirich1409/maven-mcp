@@ -337,13 +337,16 @@ class McpProtocolTest(unittest.TestCase):
         self.assertEqual(result["structuredContent"], fixture)
         self.assertEqual(json.loads(result["content"][0]["text"]), fixture)
 
-    def test_tools_call_omits_structured_content_for_no_schema_tool(self):
-        # search_artifacts deliberately shipped with no outputSchema (#398) --
-        # its result must stay content-only, never gain structuredContent.
+    def test_tools_call_omits_structured_content_when_schema_not_indexed(self):
+        # Every shipped tool declares a schema. The omit path stays covered by
+        # dropping one name from the index for this call only.
         def _fake_handler(_arguments):
             return {"results": [{"groupId": "g", "artifactId": "a"}]}
 
-        with unittest.mock.patch.dict(server.TOOL_HANDLERS, {"search_artifacts": _fake_handler}):
+        reduced = set(server.TOOLS_WITH_OUTPUT_SCHEMA)
+        reduced.discard("search_artifacts")
+        with unittest.mock.patch.dict(server.TOOL_HANDLERS, {"search_artifacts": _fake_handler}), \
+                unittest.mock.patch.object(server, "TOOLS_WITH_OUTPUT_SCHEMA", reduced):
             out = _run_main(
                 [
                     json.dumps(

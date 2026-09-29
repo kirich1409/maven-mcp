@@ -1,16 +1,15 @@
 """Tool annotations + outputSchema/structuredContent tests (#398).
 
 Covers three things the MCP protocol-revision bump added to every shipped
-tool's ``tools/list`` entry and (for a 14/20 subset) to ``tools/call``
-results:
+tool's ``tools/list`` entry and to ``tools/call`` results:
 
 1. Every tool carries ``annotations`` with the correct ``readOnlyHint`` /
    ``openWorldHint`` (see AnnotationsTest) — this server's tools are all
    read-only queries, so this is uniform except ``openWorldHint`` for the one
    purely-local tool (``catalog_entry``).
-2. A tractable subset of tools declared an ``outputSchema`` describing their
-   structured result shape (see OutputSchemaWellFormedTest for presence, and
-   the omission list for which 6 tools deliberately did not, and why).
+2. Every tool declares an ``outputSchema`` describing its structured result
+   (see OutputSchemaWellFormedTest). Properties are a subset of a real
+   handler return; ``additionalProperties`` stays open.
 3. For every tool that DID declare an outputSchema, a representative
    ``structuredContent`` result — round-tripped through the real dispatcher,
    not just checked in isolation — validates against that schema (see
@@ -26,24 +25,16 @@ real `jsonschema` dependency for this would violate the project's zero-pip-
 dependency ethos for a check this narrow in scope.
 """
 
+import base64
 import json
 import unittest
 import unittest.mock
 
-from _helpers import server
+from _helpers import server, mock_urlopen, temp_project
 
-# Tools deliberately shipped WITHOUT an outputSchema (#398) — each reason is
-# echoed as an inline comment on the tool's own "annotations" line in
-# server.py's TOOLS list; kept here too so a future accidental addition/removal
-# is caught by test_every_tool_is_accounted_for below.
-_TOOLS_WITHOUT_OUTPUT_SCHEMA = frozenset({
-    "get_dependency_changes",
-    "scan_project_dependencies",
-    "get_dependency_health",
-    "search_artifacts",
-    "audit_project_dependencies",
-    "catalog_entry",
-})
+# Empty: every tool declares an outputSchema. The accounted-for test still
+# fails if a new tool is added without one (or with one that the set misses).
+_TOOLS_WITHOUT_OUTPUT_SCHEMA: frozenset[str] = frozenset()
 
 
 def _type_matches(instance, expected_type):
@@ -98,6 +89,20 @@ def validate_against_schema(instance, schema, path="$"):
         if items_schema:
             for i, item in enumerate(instance):
                 validate_against_schema(item, items_schema, f"{path}[{i}]")
+
+
+def _assert_schema_properties_subset(instance, schema, path="$"):
+    """Every outputSchema property name is a key of this real handler return."""
+    if not isinstance(schema, dict):
+        return
+    if isinstance(instance, dict):
+        for key, sub in (schema.get("properties") or {}).items():
+            if key not in instance:
+                raise AssertionError(f"{path}: schema property {key!r} missing from handler return")
+            _assert_schema_properties_subset(instance[key], sub, f"{path}.{key}")
+    elif isinstance(instance, list) and schema.get("items"):
+        for i, item in enumerate(instance):
+            _assert_schema_properties_subset(item, schema["items"], f"{path}[{i}]")
 
 
 def _minimal_valid_arguments(tool_name):
@@ -358,6 +363,93 @@ _FIXTURES = {
             },
         ],
     },
+    "get_dependency_changes": {
+        "groupId": "io.ktor",
+        "artifactId": "ktor-core",
+        "fromVersion": "1.0.0",
+        "toVersion": "2.0.0",
+        "changes": [{"version": "2.0.0", "body": "Shipped", "releaseUrl": "https://github.com/ktorio/ktor/blob/main/CHANGELOG.md"}],
+        "repositoryUrl": "https://github.com/ktorio/ktor",
+        "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": True},
+        "changelogUrl": "https://github.com/ktorio/ktor/blob/main/CHANGELOG.md",
+    },
+    "scan_project_dependencies": {
+        "buildSystem": "maven",
+        "dependencies": [{
+            "groupId": "com.example",
+            "artifactId": "lib",
+            "version": "1.2.3",
+            "configuration": "implementation",
+            "module": None,
+            "source": "pom.xml",
+            "sourceKind": "module-direct",
+        }],
+        "deadRepositoryHints": [],
+    },
+    "get_dependency_health": {
+        "results": [{
+            "groupId": "com.squareup.okhttp3",
+            "artifactId": "okhttp",
+            "versionCount": 40,
+            "repository": {"owner": "square", "repo": "okhttp", "url": "https://github.com/square/okhttp"},
+            "scm": {"url": "https://github.com/square/okhttp", "host": "github"},
+            "github": {
+                "stars": 10,
+                "forks": 2,
+                "openIssues": 1,
+                "archived": False,
+                "ownerType": "Organization",
+                "lastCommit": "2024-01-01T00:00:00Z",
+                "lastRelease": "2024-01-01T00:00:00Z",
+                "releaseCount": 1,
+                "releaseCadenceDays": None,
+                "license": "Apache-2.0",
+                "createdAt": "2012-01-01T00:00:00Z",
+                "issues": {"open": 1, "closed": 2},
+            },
+            "signals": [],
+            "latestVersion": "4.12.0",
+            "stability": "STABLE",
+            "lastPublishedToMaven": "20240101",
+            "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": True},
+            "scorecard": {"overallScore": 8.1, "date": "2024-01-01", "checks": [], "generatedBy": "OpenSSF"},
+        }],
+    },
+    "search_artifacts": {
+        "results": [{
+            "groupId": "com.squareup.okhttp3",
+            "artifactId": "okhttp",
+            "latestVersion": "4.12.0",
+            "versionCount": 40,
+        }],
+        "searchBackend": "central",
+    },
+    "audit_project_dependencies": {
+        "buildSystem": "maven",
+        "dependencies": [{
+            "groupId": "com.example",
+            "artifactId": "lib",
+            "currentVersion": "1.2.3",
+            "latestVersion": "1.3.0",
+            "upgradeType": "minor",
+            "source": {"kind": "module-direct", "file": "pom.xml", "module": None},
+            "usages": [{"module": None, "configuration": "implementation"}],
+            "module": None,
+            "configuration": "implementation",
+            "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": True},
+            "vulnerabilities": [],
+        }],
+        "summary": {"total": 1, "upgradeable": 1, "vulnerable": 0, "major": 0, "minor": 1, "patch": 0},
+    },
+    "catalog_entry": {
+        "alias": "okhttp",
+        "accessor": "libs.okhttp",
+        "entry": {"section": "libraries", "alias": "okhttp"},
+        "suggestedDiff": "[libraries]\n",
+        "violations": [],
+        "catalogPath": "gradle/libs.versions.toml",
+        "notes": ["apply manually"],
+    },
     "get_eol_status": {
         "results": [
             {
@@ -421,6 +513,185 @@ class StructuredContentRoundTripTest(unittest.TestCase):
         fixture = {"groupId": "com.example", "artifactId": "nope", "version": "9.9.9", "exists": False}
         tool = next(t for t in server.TOOLS if t["name"] == "check_version_exists")
         validate_against_schema(fixture, tool["outputSchema"])
+
+
+def _metadata_xml(versions):
+    body = "".join(f"<version>{v}</version>" for v in versions)
+    return (
+        f"<metadata><versioning><versions>{body}</versions>"
+        f"<lastUpdated>20240101000000</lastUpdated></versioning></metadata>"
+    ).encode()
+
+
+class RealHandlerOutputSchemaTest(unittest.TestCase):
+    """Schema properties are a subset of the dict the shipped handler returns,
+    and tools/call copies that dict into structuredContent."""
+
+    def _dispatch(self, name, arguments):
+        response = server._dispatch_message({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+        self.assertNotIn("error", response)
+        result = response["result"]
+        self.assertNotIn("isError", result)
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(result["structuredContent"], payload)
+        tool = next(t for t in server.TOOLS if t["name"] == name)
+        _assert_schema_properties_subset(payload, tool["outputSchema"])
+        validate_against_schema(payload, tool["outputSchema"])
+        return payload
+
+    def test_get_dependency_changes(self):
+        markdown = "## [2.0.0]\n\nShipped the thing\n"
+        payload = {
+            "encoding": "base64",
+            "content": base64.b64encode(markdown.encode()).decode("ascii"),
+            "html_url": "https://github.com/ktorio/ktor/blob/main/CHANGELOG.md",
+        }
+        pom = (
+            '<?xml version="1.0"?><project><scm>'
+            "<url>https://github.com/ktorio/ktor</url></scm></project>"
+        )
+        responses = [
+            (200, _metadata_xml(["1.0.0", "2.0.0"])),
+            (200, pom.encode()),
+            (200, b"[]"),
+            (200, json.dumps({"default_branch": "main"}).encode()),
+            (200, json.dumps(payload).encode()),
+        ]
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ):
+            out = self._dispatch("get_dependency_changes", {
+                "groupId": "io.ktor",
+                "artifactId": "ktor-core",
+                "fromVersion": "1.0.0",
+                "toVersion": "2.0.0",
+                "projectPath": root,
+            })
+        self.assertEqual(out["changes"][0]["body"], "Shipped the thing")
+        self.assertIn("changelogUrl", out)
+
+    def test_scan_project_dependencies(self):
+        pom = (
+            "<project><dependencies><dependency>"
+            "<groupId>com.example</groupId><artifactId>lib</artifactId>"
+            "<version>1.2.3</version></dependency></dependencies></project>"
+        )
+        with temp_project({"pom.xml": pom}) as root:
+            out = self._dispatch("scan_project_dependencies", {"projectPath": root})
+        self.assertEqual(out["buildSystem"], "maven")
+        self.assertEqual(out["dependencies"][0]["artifactId"], "lib")
+
+    def test_search_artifacts(self):
+        solr = {
+            "response": {"docs": [{
+                "g": "com.squareup.okhttp3",
+                "a": "okhttp",
+                "latestVersion": "4.12.0",
+                "versionCount": 40,
+            }]},
+        }
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen([(200, json.dumps(solr).encode())])
+        ):
+            out = self._dispatch("search_artifacts", {"query": "okhttp", "projectPath": root})
+        self.assertEqual(out["searchBackend"], "central")
+        self.assertEqual(out["results"][0]["artifactId"], "okhttp")
+
+    def test_get_dependency_health(self):
+        pom = (
+            '<?xml version="1.0"?><project>'
+            "<scm><url>https://github.com/square/okhttp</url></scm>"
+            "<licenses><license><name>Apache-2.0</name></license></licenses>"
+            "</project>"
+        )
+        metadata = {
+            "versions": ["4.12.0"],
+            "lastUpdated": "20240101",
+            "resolvedFrom": {
+                "url": "https://repo1.maven.org/maven2/",
+                "scope": "dependency",
+                "viaPublicFallback": True,
+            },
+        }
+        repo = {
+            "stargazers_count": 10,
+            "forks_count": 2,
+            "open_issues_count": 1,
+            "archived": False,
+            "owner": {"login": "square", "type": "Organization"},
+            "pushed_at": "2024-06-01T00:00:00Z",
+            "created_at": "2012-01-01T00:00:00Z",
+            "license": {"spdx_id": "Apache-2.0"},
+        }
+        with temp_project({}) as root, unittest.mock.patch.object(
+            server, "fetch_metadata", return_value=metadata
+        ), unittest.mock.patch.object(
+            server, "fetch_pom", return_value=pom
+        ), unittest.mock.patch.object(
+            server, "fetch_depsdev_scorecard",
+            return_value={"ok": True, "scorecard": {
+                "overallScore": 8.1, "date": "2024-01-01", "checks": [], "generatedBy": "OpenSSF",
+            }},
+        ), unittest.mock.patch.object(
+            server, "gh_fetch_repo", return_value=repo
+        ), unittest.mock.patch.object(
+            server, "gh_fetch_releases",
+            return_value=[{"published_at": "2024-01-01T00:00:00Z", "tag_name": "4.12.0"}],
+        ), unittest.mock.patch.object(
+            server, "gh_fetch_issue_stats",
+            return_value={"open": 1, "closed": 2, "closeRatio": 0.6, "medianDaysToClose": 4},
+        ), unittest.mock.patch.object(
+            server, "gh_fetch_user", return_value={"public_repos": 3, "created_at": "2011-01-01T00:00:00Z"}
+        ):
+            out = self._dispatch("get_dependency_health", {
+                "dependencies": [{"groupId": "com.squareup.okhttp3", "artifactId": "okhttp", "version": "4.12.0"}],
+                "projectPath": root,
+            })
+        self.assertEqual(out["results"][0]["github"]["stars"], 10)
+        self.assertEqual(out["results"][0]["scorecard"]["generatedBy"], "OpenSSF")
+
+    def test_audit_project_dependencies(self):
+        pom = (
+            "<project><dependencies><dependency>"
+            "<groupId>com.example</groupId><artifactId>lib</artifactId>"
+            "<version>1.2.3</version></dependency></dependencies></project>"
+        )
+        osv = [{
+            "vulnerabilities": [{
+                "id": "GHSA-test",
+                "severity": "HIGH",
+                "fixedVersion": "1.2.4",
+                "malicious": False,
+            }],
+        }]
+        with temp_project({"pom.xml": pom}) as root, unittest.mock.patch(
+            "urllib.request.urlopen",
+            side_effect=mock_urlopen([(200, _metadata_xml(["1.2.3", "1.3.0"]))]),
+        ), unittest.mock.patch.object(
+            server, "resolve_plugin_marker_implementation", return_value=None
+        ), unittest.mock.patch.object(
+            server, "query_osv_batch", return_value=osv
+        ):
+            out = self._dispatch("audit_project_dependencies", {"projectPath": root})
+        self.assertEqual(out["summary"]["total"], 1)
+        self.assertEqual(out["dependencies"][0]["vulnerabilities"][0]["id"], "GHSA-test")
+
+    def test_catalog_entry(self):
+        out = self._dispatch("catalog_entry", {
+            "mode": "generate",
+            "coordinate": {
+                "groupId": "com.squareup.okhttp3",
+                "artifactId": "okhttp",
+                "version": "4.12.0",
+            },
+        })
+        self.assertEqual(out["alias"], "okhttp")
+        self.assertIn("violations", out)
 
 
 if __name__ == "__main__":

@@ -16,19 +16,19 @@ Created: 2026-09-29
   - README: матрица клиентов, исправление команды Claude Code, `uv` вместо абсолютного пути в монорепо, HTTP для клиентов без локального stdio.
   - Smoke: MCP `initialize` через установленную команду, без checkout.
   - Windows: `gradlew.bat` раньше POSIX `gradlew`, `OSError`/`WinError` не маскируется под успех (#457).
-  - В README явно перечислены ограничения, которые 1.0 не закрывает.
+  - В README явно: npm, Homebrew и MCPB не являются каналом установки.
   - Релизный коммит `1.0.0` и чеклист тега. Push тега и публикация на PyPI — только после подтверждения.
 - Out:
   - Перенос закрытой истории issues из предыдущего репозитория. Marketplace этого репозитория — `.claude-plugin/marketplace.json`.
   - npm-обёртка и Homebrew как канал поставки.
   - MCPB-бандл. `scripts/pack-mcpb.sh` завязан на youtube-transcript; для Claude Code и Grok канал — marketplace.
-  - `outputSchema` у шести content-only tools, fallback `CHANGELOG.md` в `get_dependency_changes`, резолв репозиториев #318–#320.
+  - Issues #3, #4 и #5 закрыты в 1.0: `outputSchema` у всех tools, fallback `CHANGELOG.md`, residuals резолва репозиториев.
   - Починка upstream Grok #572 (`args` в `hooks.json`). У этого плагина поля `args` нет.
   - Жёсткий запрет правок в хуках. Deny остаётся advisory и fail-open.
 
 ## Context / sources of truth
 
-- Исследование: сессия `01a0ec7e`, отчёт deep-research (Partial). Поставка сейчас `0.27.2`.
+- Исследование: сессия `01a0ec7e`, отчёт deep-research (Partial). Релизная версия `1.0.0`.
 - Решения этой сессии: сервер остаётся Python; для не-plugin клиентов — `uv`/`uvx`, не npm и не brew. Локально Python 3.9+ не гарантирован (Claude Code, Codex, Grok его не ставят). В облачной VM Claude Code Python 3.10–3.13 и `uv` уже есть.
 - Версии: `plugin/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `SERVER_VERSION` в `server.py` (`USER_AGENT` от него). Гейт: `python3 scripts/check-versions.py`.
 - Клиенты: `.mcp.json` — `python3` + `${CLAUDE_PLUGIN_ROOT}/server/server.py`. Marketplace — `kirich1409/maven-mcp`, установка `maven-mcp@maven-mcp`. Локально: `claude plugin marketplace add` / `claude plugin install` на корень этого репозитория.
@@ -98,10 +98,10 @@ Red-green required: yes, только T5. Остальное — тесты вм
 |---|---|---|
 | T1–T4, T7 | [#2](https://github.com/kirich1409/maven-mcp/issues/2) | важно для 1.0: `uv` и клиенты. Было #459 |
 | T5 | [#1](https://github.com/kirich1409/maven-mcp/issues/1) | Windows `gradlew.bat`. Было #457 |
-| T6 | этот план + ссылки на #3–#5 | текст «не в 1.0», без нового issue |
-| schema | [#3](https://github.com/kirich1409/maven-mcp/issues/3) | на будущее. Было #460 |
-| CHANGELOG.md fallback | [#4](https://github.com/kirich1409/maven-mcp/issues/4) | на будущее. Было #461 |
-| хвосты резолва | [#5](https://github.com/kirich1409/maven-mcp/issues/5) | на будущее. Было #462 |
+| T6 | этот план | npm, Homebrew и MCPB остаются вне канала установки |
+| schema | [#3](https://github.com/kirich1409/maven-mcp/issues/3) | сделано в 1.0. Было #460 |
+| CHANGELOG.md fallback | [#4](https://github.com/kirich1409/maven-mcp/issues/4) | сделано в 1.0. Было #461 |
+| хвосты резолва | [#5](https://github.com/kirich1409/maven-mcp/issues/5) | сделано в 1.0. Было #462 |
 
 ## Tasks
 
@@ -110,7 +110,7 @@ Red-green required: yes, только T5. Остальное — тесты вм
 - [ ] T3: README «Use with any MCP client» и Installation. Убрать `claude plugin add`. Матрица: Claude Code marketplace, Grok `--trust`, Codex/Cursor/Claude Desktop/Gemini/Kimi через `uvx maven-mcp`, веб-ChatGPT только HTTP, облако Claude Code без доустановки Python. Предусловия хуков: `jq`, на macOS `gtimeout`. → verify: TC-6, TC-7, TC-9
 - [ ] T4: Smoke установленного stdio в CI или в скрипте рядом с существующими `scripts/smoke-*.sh`: временный `uv tool install`, `initialize`, удаление tool. Не ходить в сеть Maven. → verify: TC-2, L5
 - [ ] T5: #1. Сначала красный тест на порядок `gradlew.bat` и на `OSError`. Затем минимальная правка `_find_gradle_wrapper` и `except`. Configuration-cache / Gradle 9 из draft PR #458 не брать без отдельного repro. → verify: TC-8 red→green, L1b
-- [ ] T6: В README или `CLAUDE.md` список «не в 1.0» со ссылками на #3, #4, #5: шесть tools без `outputSchema`, нет fallback на `CHANGELOG.md`, residuals резолва, нет MCPB, нет npm/brew. → verify: ревью текста, код не меняется
+- [x] T6: README и `CLAUDE.md` описывают #3, #4 и #5 как сделанные. Вне канала установки остаются MCPB, npm и Homebrew. → verify: ревью текста
 - [ ] T7: Релизный коммит `1.0.0`: `plugin.json`, `marketplace.json`, `SERVER_VERSION` и `pyproject.toml` совпадают, `python3 scripts/check-versions.py 1.0.0` зелёный. Тег и PyPI не пушить без явного подтверждения. → verify: TC-5 на релизном коммите
 
 Порядок: T1 → T2 → T4. T3 после T1 (нужно финальное имя пакета). T5 параллельно с T1, отдельным коммитом. T6 в любой момент. T7 последним.
@@ -128,7 +128,7 @@ Red-green required: yes, только T5. Остальное — тесты вм
 - Q: npm или brew вместо Python? → decision: нет. Сервер Python, поставка для не-plugin клиентов — `uv`/`uvx`. Brew и npm в 1.0 не делаем.
 - Q: где source of truth? → decision: этот репозиторий. Marketplace — `.claude-plugin/marketplace.json`, проверка версий — `scripts/check-versions.py`.
 - Q: MCPB как у youtube-transcript? → decision: нет в 1.0. Упаковщик захардкожен на другой плагин. Отдельным issue не заводим.
-- Q: закрывать #318–#320, schema и changelog fallback до тега? → decision: нет. Хвосты — #3, #4, #5. T6 только ссылается на них.
+- Q: закрывать #318–#320, schema и changelog fallback до тега? → decision: да, в этом релизе (#3, #4, #5). npm, Homebrew и MCPB по-прежнему вне канала.
 - Q: Windows wrapper в 1.0? → decision: да, #1. Порядок `gradlew.bat` и `OSError`. Configuration-cache и Gradle 9 из неотправленного draft PR не входят.
 - Q: новая runtime-зависимость? → decision: нет. hatchling только в `build-system.requires`.
 - Q: кто пушит тег и PyPI? → decision: не этот план. Нужно явное подтверждение на push тега и на публикацию.

@@ -16,7 +16,7 @@ The server registers tools that the host agent can call during a conversation. I
 | `check_version_exists` | Verify if a specific version exists and classify its stability |
 | `check_multiple_dependencies` | Bulk lookup of latest versions for multiple dependencies |
 | `compare_dependency_versions` | Compare current versions against latest (major/minor/patch) |
-| `get_dependency_changes` | Show changes between versions (AndroidX/AGP docs or GitHub releases) |
+| `get_dependency_changes` | Show changes between versions (AndroidX docs, then AGP docs, then GitHub releases; `CHANGELOG.md` on the default branch when no release body is usable) |
 | `scan_project_dependencies` | Scan Gradle/Maven build files and Gradle version catalogs (`gradle/libs.versions.toml`) for dependencies |
 | `expand_bom` | Expand a Maven BOM into managed dependency versions |
 | `get_transitive_graph` | Resolved transitive dependency graph for a GAV via deps.dev |
@@ -139,15 +139,11 @@ grok plugin install maven-mcp@maven-mcp --trust
 
 The plugin registers the bundled server via `.mcp.json` automatically; no separate install or build step is required.
 
+npm, Homebrew, and an MCPB bundle are not install channels. Non-plugin clients use `uv` (`uvx maven-mcp`, or `maven-mcp` after `uv tool install maven-mcp`). `uv` downloads Python 3.9+; it is not preinstalled by local Claude Code, Codex, or Grok. Claude Code cloud VMs already have Python and `uv`. Web ChatGPT cannot spawn a local process and is HTTP-only (see below).
+
 ## Use with any MCP client
 
-The bundled server is a plain stdio MCP process, so any MCP-compatible agent can run it directly — no Claude Code required. The only requirement is Python 3.9+.
-
-```bash
-python3 /path/to/maven-mcp/plugin/server/server.py
-```
-
-Point your agent's MCP config at that command (use the absolute path to `server.py`):
+Codex, Cursor, Claude Desktop, Gemini CLI, and Kimi run the published console script. The command is `uvx maven-mcp` (distribution name `maven-mcp`).
 
 - **Kimi Code** — `~/.kimi-code/mcp.json` (user-level) or `.kimi-code/mcp.json` (project-level):
 
@@ -155,8 +151,8 @@ Point your agent's MCP config at that command (use the absolute path to `server.
   {
     "mcpServers": {
       "maven-mcp": {
-        "command": "python3",
-        "args": ["/path/to/maven-mcp/plugin/server/server.py"]
+        "command": "uvx",
+        "args": ["maven-mcp"]
       }
     }
   }
@@ -170,22 +166,22 @@ Point your agent's MCP config at that command (use the absolute path to `server.
   {
     "mcpServers": {
       "maven-mcp": {
-        "command": "python3",
-        "args": ["/path/to/maven-mcp/plugin/server/server.py"]
+        "command": "uvx",
+        "args": ["maven-mcp"]
       }
     }
   }
   ```
 
-- **Codex** — `~/.codex/config.toml`:
+- **Codex** — `~/.codex/config.toml` (Codex Desktop may ignore a project `.codex/config.toml`; the user-level file is the one these steps use):
 
   ```toml
   [mcp_servers.maven-mcp]
-  command = "python3"
-  args = ["/path/to/maven-mcp/plugin/server/server.py"]
+  command = "uvx"
+  args = ["maven-mcp"]
   ```
 
-Environment variables (`GITHUB_TOKEN`, `MAVEN_MCP_OFFLINE`, …) can be passed through each client's `env` field.
+Environment variables (`GITHUB_TOKEN`, `MAVEN_MCP_OFFLINE`, …) can be passed through each client's `env` field. Plugin installs keep `python3` and `${CLAUDE_PLUGIN_ROOT}/server/server.py` in `.mcp.json`.
 
 ### HTTP mode (remote / cloud agents)
 
@@ -193,7 +189,7 @@ For agents that cannot spawn a local process (cloud sandboxes, remote workspaces
 
 ```bash
 MAVEN_MCP_TRANSPORT=http MAVEN_MCP_HTTP_HOST=127.0.0.1 MAVEN_MCP_HTTP_PORT=8765 \
-  python3 /path/to/maven-mcp/plugin/server/server.py
+  uvx maven-mcp
 ```
 
 The MCP endpoint is `http://<host>:<port>/mcp` (single `POST` endpoint, JSON responses, no SSE). Connect with a URL-based entry instead of `command`:
