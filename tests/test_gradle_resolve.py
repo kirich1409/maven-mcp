@@ -205,7 +205,56 @@ class TestGradleResolveTimeoutOverride(unittest.TestCase):
         self.assertEqual(captured["timeout"], 900)
 
 
+class TestFindGradleWrapper(unittest.TestCase):
+    def test_windows_selects_bat_when_both_exist(self):
+        with temp_project({}) as root:
+            for name in ("gradlew", "gradlew.bat"):
+                with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                    fh.write(name + "\n")
+            with unittest.mock.patch.object(server.os, "name", "nt"):
+                chosen = server._find_gradle_wrapper(root)
+            self.assertEqual(os.path.basename(chosen), "gradlew.bat")
+
+    def test_posix_selects_gradlew_when_both_exist(self):
+        with temp_project({}) as root:
+            for name in ("gradlew", "gradlew.bat"):
+                with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                    fh.write(name + "\n")
+            with unittest.mock.patch.object(server.os, "name", "posix"):
+                chosen = server._find_gradle_wrapper(root)
+            self.assertEqual(os.path.basename(chosen), "gradlew")
+
+
 class TestRunGradleCommand(unittest.TestCase):
+    def test_oserror_names_wrapper_and_is_not_success(self):
+        def _raise(*_args, **_kwargs):
+            err = OSError("[WinError 193] %1 is not a valid Win32 application")
+            raise err
+
+        wrapper = os.path.join("/proj", "gradlew.bat")
+        with unittest.mock.patch.object(server, "_gradle_run", side_effect=_raise):
+            code, stdout, stderr = server._run_gradle_command("/proj", wrapper, ["--version"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stdout, "")
+        self.assertIn(wrapper, stderr)
+        self.assertIn("WinError 193", stderr)
+
+    def test_oserror_reaches_scan_as_tool_error_text(self):
+        def _raise(*_args, **_kwargs):
+            raise OSError("[WinError 193] %1 is not a valid Win32 application")
+
+        with temp_project({"build.gradle": "repositories { mavenCentral() }\n"}) as root:
+            for name in ("gradlew", "gradlew.bat"):
+                with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                    fh.write(name + "\n")
+            with unittest.mock.patch.object(server.os, "name", "nt"):
+                with unittest.mock.patch.object(server, "_gradle_run", side_effect=_raise):
+                    with self.assertRaises(ValueError) as raised:
+                        server.scan_project(root)
+        message = str(raised.exception)
+        self.assertIn(os.path.join(root, "gradlew.bat"), message)
+        self.assertNotIn("not a valid Win32 application", message.split("Failed to launch", 1)[0])
+
     def test_timeout_expired_returns_124(self):
         def _raise_timeout(*_args, **_kwargs):
             raise subprocess.TimeoutExpired(cmd="gradlew", timeout=1)

@@ -8,6 +8,7 @@ orchestrator. Stdlib only; build files are written into real temp directories.
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 from _helpers import server
 
@@ -579,7 +580,8 @@ class TestDiscoverRepositoriesParentAndProfiles(unittest.TestCase):
                 "<artifactId>child</artifactId></project>"
             )
             self._write(root, "pom.xml", child_pom)
-            res = server.discover_repositories(root)
+            with unittest.mock.patch.object(server, "http_get", return_value=(404, b"")):
+                res = server.discover_repositories(root)
             self.assertEqual(res["dependency"], [])
             self.assertEqual(res["plugin"], [])
 
@@ -602,7 +604,8 @@ class TestDiscoverRepositoriesParentAndProfiles(unittest.TestCase):
             )
             self._write(root, "pom.xml", unrelated_pom)
             self._write(root, "child/pom.xml", child_pom)
-            res = server.discover_repositories(os.path.join(root, "child"))
+            with unittest.mock.patch.object(server, "http_get", return_value=(404, b"")):
+                res = server.discover_repositories(os.path.join(root, "child"))
             self.assertNotIn("https://unrelated/r", _urls(res["dependency"]))
 
     def test_cyclic_parent_chain_does_not_infinite_loop(self):
@@ -625,6 +628,154 @@ class TestDiscoverRepositoriesParentAndProfiles(unittest.TestCase):
             res = server.discover_repositories(os.path.join(root, "a"))
             self.assertEqual(res["dependency"], [])
             self.assertEqual(res["plugin"], [])
+
+
+class TestSettingsXmlProfileRepos(unittest.TestCase):
+    def test_property_activation_and_active_profiles_apply(self):
+        settings = (
+            "<settings>"
+            "<activeProfiles><activeProfile>explicit</activeProfile></activeProfiles>"
+            "<profiles>"
+            "<profile><id>by-prop</id>"
+            "<activation><property><name>MAVEN_MCP_PROFILE_TEST</name>"
+            "<value>on</value></property></activation>"
+            "<repositories><repository><url>https://prop/r</url></repository></repositories>"
+            "</profile>"
+            "<profile><id>explicit</id>"
+            "<repositories><repository><url>https://explicit/r</url></repository></repositories>"
+            "</profile>"
+            "<profile><id>off</id>"
+            "<activation><property><name>MAVEN_MCP_PROFILE_TEST</name>"
+            "<value>nope</value></property></activation>"
+            "<repositories><repository><url>https://off/r</url></repository></repositories>"
+            "</profile>"
+            "<profile><id>default</id>"
+            "<activation><activeByDefault>true</activeByDefault></activation>"
+            "<repositories><repository><url>https://default/r</url></repository></repositories>"
+            "</profile>"
+            "</profiles></settings>"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings_path = os.path.join(root, "settings.xml")
+            with open(settings_path, "w", encoding="utf-8") as fh:
+                fh.write(settings)
+            pom = "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version></project>"
+            with open(os.path.join(root, "pom.xml"), "w", encoding="utf-8") as fh:
+                fh.write(pom)
+            env = {"MAVEN_MCP_SETTINGS": settings_path, "MAVEN_MCP_PROFILE_TEST": "on"}
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                res = server.discover_repositories(root)
+        urls = _urls(res["dependency"])
+        self.assertIn("https://prop/r", urls)
+        self.assertIn("https://explicit/r", urls)
+        self.assertNotIn("https://off/r", urls)
+        # A non-default activation is present, so activeByDefault stays off.
+        self.assertNotIn("https://default/r", urls)
+
+    def test_active_by_default_applies_when_nothing_else_matches(self):
+        settings = (
+            "<settings><profiles><profile><id>default</id>"
+            "<activation><activeByDefault>true</activeByDefault></activation>"
+            "<repositories><repository><url>https://default/r</url></repository></repositories>"
+            "</profile></profiles></settings>"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            settings_path = os.path.join(root, "settings.xml")
+            with open(settings_path, "w", encoding="utf-8") as fh:
+                fh.write(settings)
+            with open(os.path.join(root, "pom.xml"), "w", encoding="utf-8") as fh:
+                fh.write("<project><artifactId>a</artifactId></project>")
+            with unittest.mock.patch.dict(os.environ, {"MAVEN_MCP_SETTINGS": settings_path}, clear=False):
+                res = server.discover_repositories(root)
+        self.assertEqual(_urls(res["dependency"]), ["https://default/r"])
+
+
+class TestFetchedParentPom(unittest.TestCase):
+    def test_parent_not_on_disk_is_fetched_and_its_repos_apply(self):
+        parent_pom = (
+            "<project><groupId>com.example</groupId><artifactId>parent</artifactId>"
+            "<version>1.2.3</version>"
+            "<repositories><repository><url>https://fetched/r</url></repository></repositories>"
+            "</project>"
+        )
+        child = (
+            "<project><parent><groupId>com.example</groupId><artifactId>parent</artifactId>"
+            "<version>1.2.3</version><relativePath/></parent>"
+            "<artifactId>child</artifactId></project>"
+        )
+
+        def fake_get(url, headers=None, timeout=None):
+            if url.endswith("/com/example/parent/1.2.3/parent-1.2.3.pom"):
+                return 200, parent_pom.encode()
+            return 404, b""
+
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "pom.xml"), "w", encoding="utf-8") as fh:
+                fh.write(child)
+            with unittest.mock.patch.object(server, "http_get", side_effect=fake_get) as get:
+                res = server.discover_repositories(root)
+        self.assertIn("https://fetched/r", _urls(res["dependency"]))
+        self.assertTrue(get.called)
+        self.assertTrue(any(call.args[0].endswith("parent-1.2.3.pom") for call in get.call_args_list))
+
+
+class TestExclusiveContentShorthand(unittest.TestCase):
+    def test_google_inside_for_repository_receives_filter(self):
+        body = (
+            "exclusiveContent {\n"
+            "  forRepository { google() }\n"
+            "  filter { includeGroup(\"com.google.firebase\") }\n"
+            "}\n"
+            "mavenCentral()\n"
+        )
+        entries = server._parse_gradle_repos(body)
+        by_url = {e["url"]: e for e in entries}
+        google = by_url[server.GOOGLE_MAVEN_URL]
+        self.assertEqual(google["group_filters"], [{"type": "exact", "value": "com.google.firebase"}])
+        central = by_url[server.MAVEN_CENTRAL_URL]
+        self.assertNotIn("group_filters", central)
+        self.assertEqual(len(entries), 2)
+
+
+class TestSubmoduleRepositories(unittest.TestCase):
+    def test_prefer_project_includes_submodule_repos(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = (
+                'include(":app")\n'
+                "dependencyResolutionManagement {\n"
+                "  repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)\n"
+                '  repositories { maven("https://SETTINGS/r") }\n'
+                "}\n"
+            )
+            os.makedirs(os.path.join(root, "app"))
+            with open(os.path.join(root, "settings.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write(settings)
+            with open(os.path.join(root, "build.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write('repositories { maven("https://ROOT/r") }\n')
+            with open(os.path.join(root, "app", "build.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write('repositories { maven("https://APP/r") }\n')
+            res = server.discover_repositories(root)
+        urls = _urls(res["dependency"])
+        self.assertIn("https://ROOT/r", urls)
+        self.assertIn("https://APP/r", urls)
+        self.assertNotIn("https://SETTINGS/r", urls)
+
+    def test_fail_on_project_repos_drops_submodule_repos(self):
+        with tempfile.TemporaryDirectory() as root:
+            settings = (
+                'include(":app")\n'
+                "dependencyResolutionManagement {\n"
+                "  repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n"
+                '  repositories { maven("https://SETTINGS/r") }\n'
+                "}\n"
+            )
+            os.makedirs(os.path.join(root, "app"))
+            with open(os.path.join(root, "settings.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write(settings)
+            with open(os.path.join(root, "app", "build.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write('repositories { maven("https://APP/r") }\n')
+            res = server.discover_repositories(root)
+        self.assertEqual(_urls(res["dependency"]), ["https://SETTINGS/r"])
 
 
 if __name__ == "__main__":

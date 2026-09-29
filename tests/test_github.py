@@ -11,12 +11,11 @@ patched mock object records the urllib Request objects so URL + header
 assertions read the exact bytes the server sent.
 
 Provider selection (AndroidX → AGP → GitHub) and the AGP/AndroidX HTML parsers
-live in ``test_changelog_providers.py`` (#308). This module covers the GitHub
-releases branch only. The GitHub path still does NOT fall back to a
-CHANGELOG.md file when no releases match (the retired TS github-provider did) —
-that residual is intentionally out of scope here.
+live in ``test_changelog_providers.py`` (#308). This module covers GitHub
+releases and the CHANGELOG.md fallback used only when no release body is usable.
 """
 
+import base64
 import json
 import re
 import unittest
@@ -384,13 +383,14 @@ class DependencyChangesImplTest(unittest.TestCase):
         self.assertNotIn("repositoryUrl", result)
 
     def test_no_releases_branch(self):
-        # Repo discovered but it has zero releases: every change is bare {version}.
-        # Python divergence: unlike the TS github-provider, there is NO CHANGELOG.md
-        # file fallback here — an empty releases list yields version-only entries.
+        # Empty releases and a missing CHANGELOG.md stay version-only. The file
+        # lookup is explicit (repo meta + contents 404), not a swallowed extra call.
         responses = [
             (200, _metadata_xml(["1.0.0", "2.0.0"])),
             (200, POM_WITH_SCM_KTOR.encode()),
-            (200, b"[]"),  # gh_fetch_releases -> []
+            (200, b"[]"),
+            http_error("https://api.github.com/repos/ktorio/ktor", 404),
+            http_error("https://api.github.com/repos/ktorio/ktor/contents/CHANGELOG.md", 404),
         ]
         with unittest.mock.patch("urllib.request.urlopen", side_effect=mock_urlopen(responses)):
             result = server._get_dependency_changes_impl(
@@ -398,7 +398,73 @@ class DependencyChangesImplTest(unittest.TestCase):
             )
         self.assertNotIn("error", result)
         self.assertEqual(result["repositoryUrl"], "https://github.com/ktorio/ktor")
+        self.assertNotIn("changelogUrl", result)
         self.assertEqual(result["changes"], [{"version": "2.0.0"}])
+        self.assertNotIn("body", result["changes"][0])
+
+    def test_release_body_skips_changelog_file(self):
+        releases = [{
+            "tag_name": "v2.0.0",
+            "body": "From releases",
+            "html_url": "https://github.com/ktorio/ktor/releases/tag/2.0.0",
+        }]
+        responses = [
+            (200, _metadata_xml(["1.0.0", "2.0.0"])),
+            (200, POM_WITH_SCM_KTOR.encode()),
+            (200, json.dumps(releases).encode()),
+        ]
+        with unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ) as m:
+            result = server._get_dependency_changes_impl(
+                "io.ktor", "ktor-core", "1.0.0", "2.0.0", empty_ctx()
+            )
+        self.assertEqual(len(m.call_args_list), 3)
+        by_version = {c["version"]: c for c in result["changes"]}
+        self.assertEqual(by_version["2.0.0"]["body"], "From releases")
+        self.assertNotIn("changelogUrl", result)
+
+    def test_changelog_file_when_releases_have_no_body(self):
+        markdown = (
+            "# Changelog\n\n"
+            "## Unreleased\n\n"
+            "not a version\n\n"
+            "## [2.0.0] - 2024-01-01\n\n"
+            "Shipped the thing\n\n"
+            "## 1.5.0\n\n"
+            "\n"
+            "## [9.9.9]\n\n"
+            "outside the requested range\n"
+        )
+        payload = {
+            "encoding": "base64",
+            "content": base64.b64encode(markdown.encode()).decode("ascii"),
+            "html_url": "https://github.com/ktorio/ktor/blob/develop/CHANGELOG.md",
+        }
+        responses = [
+            (200, _metadata_xml(["1.0.0", "1.5.0", "2.0.0"])),
+            (200, POM_WITH_SCM_KTOR.encode()),
+            (200, b"[]"),
+            (200, json.dumps({"default_branch": "develop"}).encode()),
+            (200, json.dumps(payload).encode()),
+        ]
+        with unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ) as m:
+            result = server._get_dependency_changes_impl(
+                "io.ktor", "ktor-core", "1.0.0", "2.0.0", empty_ctx()
+            )
+        contents = m.call_args_list[4].args[0].full_url
+        self.assertIn("/contents/CHANGELOG.md?ref=develop", contents)
+        self.assertEqual(
+            result["changelogUrl"],
+            "https://github.com/ktorio/ktor/blob/develop/CHANGELOG.md",
+        )
+        by_version = {c["version"]: c for c in result["changes"]}
+        self.assertEqual(set(by_version), {"1.5.0", "2.0.0"})
+        self.assertEqual(by_version["2.0.0"]["body"], "Shipped the thing")
+        self.assertNotIn("body", by_version["1.5.0"])
+        self.assertNotIn("9.9.9", by_version)
 
     def test_empty_range_branch(self):
         # Filter yields nothing -> "No versions found" error, no network past metadata.

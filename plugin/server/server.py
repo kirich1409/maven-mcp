@@ -36,8 +36,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 SERVER_NAME = "maven-mcp"
-SERVER_VERSION = "0.27.2"
-USER_AGENT = "maven-mcp/0.27.2"
+SERVER_VERSION = "1.0.0"
+USER_AGENT = "maven-mcp/1.0.0"
 
 # MCP protocol revisions this server negotiates (#398). Every message shape this
 # server emits (tool annotations, outputSchema/structuredContent) is additive-only
@@ -5476,15 +5476,63 @@ def _fetch_androidx_changelog(group_id: str) -> Optional[Dict]:
     }
 
 
-def _fetch_github_changelog(
-    group_id: str, artifact_id: str, to_version: str, ctx: "ResolutionContext"
-) -> Optional[Dict]:
-    """GitHub releases path (no CHANGELOG.md fallback — intentional Python MVP)."""
-    gh_repo = discover_github_repo(group_id, artifact_id, to_version, ctx)
-    if not gh_repo:
+_CHANGELOG_HEADING_RE = re.compile(
+    r"^#{1,3}[ \t]+\[?v?(\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.]+)?)\]?",
+    re.MULTILINE,
+)
+
+
+def _parse_changelog_markdown(text: str) -> Dict[str, str]:
+    """Map a version heading in CHANGELOG.md to the section under it.
+
+    Headings that are not versions (``## Unreleased``) are ignored. An empty
+    section is omitted so a later lookup does not invent notes."""
+    matches = list(_CHANGELOG_HEADING_RE.finditer(text))
+    sections: Dict[str, str] = {}
+    for i, match in enumerate(matches):
+        line_end = text.find("\n", match.end())
+        start = len(text) if line_end < 0 else line_end + 1
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if start > end:
+            start = match.end()
+        body = text[start:end].strip()
+        if body:
+            sections[match.group(1)] = body
+    return sections
+
+
+def _fetch_github_changelog_file(owner: str, repo: str) -> Optional[Dict]:
+    """CHANGELOG.md on the repository default branch, or None when it is
+    missing or has no version section."""
+    meta = gh_fetch_repo(owner, repo)
+    branch = "main"
+    if isinstance(meta, dict) and meta.get("default_branch"):
+        branch = str(meta["default_branch"])
+    data = _gh_get(f"/repos/{owner}/{repo}/contents/CHANGELOG.md?ref={urllib.parse.quote(branch)}")
+    if not isinstance(data, dict):
         return None
-    owner, repo = gh_repo["owner"], gh_repo["repo"]
-    releases = gh_fetch_releases(owner, repo)
+    raw = data.get("content") or ""
+    if data.get("encoding") == "base64":
+        try:
+            text = base64.b64decode(raw).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        return None
+    sections = _parse_changelog_markdown(text)
+    if not sections:
+        return None
+    file_url = data.get("html_url") or f"https://github.com/{owner}/{repo}/blob/{branch}/CHANGELOG.md"
+    return {
+        "repositoryUrl": f"https://github.com/{owner}/{repo}",
+        "changelogUrl": file_url,
+        "entries": _changelog_entries_from_sections(sections, lambda _v: file_url),
+    }
+
+
+def _release_entries(releases: List[Dict]) -> Dict[str, Dict]:
     entries: Dict[str, Dict] = {}
     for rel in releases:
         tag = rel.get("tag_name", "")
@@ -5500,6 +5548,27 @@ def _fetch_github_changelog(
         entries[key] = entry
         if tag != key:
             entries[tag] = entry
+    return entries
+
+
+def _fetch_github_changelog(
+    group_id: str, artifact_id: str, to_version: str, ctx: "ResolutionContext"
+) -> Optional[Dict]:
+    """GitHub releases, then CHANGELOG.md when no release body is usable."""
+    gh_repo = discover_github_repo(group_id, artifact_id, to_version, ctx)
+    if not gh_repo:
+        return None
+    owner, repo = gh_repo["owner"], gh_repo["repo"]
+    releases = gh_fetch_releases(owner, repo)
+    entries = _release_entries(releases)
+    if any(entry.get("body") for entry in entries.values()):
+        return {
+            "repositoryUrl": f"https://github.com/{owner}/{repo}",
+            "entries": entries,
+        }
+    fallback = _fetch_github_changelog_file(owner, repo)
+    if fallback is not None:
+        return fallback
     return {
         "repositoryUrl": f"https://github.com/{owner}/{repo}",
         "entries": entries,
@@ -7651,6 +7720,26 @@ def _dedup_repos(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _gradle_shorthand_entries(block_body: str) -> List[Dict[str, Any]]:
+    """`mavenCentral()` / `google()` / `gradlePluginPortal()` / `mavenLocal()`
+    calls in `block_body`. Callers that have already excised `exclusiveContent`
+    spans pass that excised text so a shorthand wrapped in `forRepository`
+    is not also recorded here without its `filter`."""
+    entries: List[Dict[str, Any]] = []
+    for fn, name, url in _GRADLE_SHORTHANDS:
+        if re.search(r"\b" + fn + r"\s*\(\s*\)", block_body):
+            entries.append({"name": name, "url": url})
+    if re.search(r"\bmavenLocal\s*\(\s*\)", block_body):
+        entries.append({"name": "Maven Local", "url": _maven_local_url()})
+    return entries
+
+
+def _attach_group_filters(entry: Dict[str, Any], filters: List[Dict[str, str]]) -> Dict[str, Any]:
+    if filters:
+        entry["group_filters"] = filters
+    return entry
+
+
 def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
     """Parse a Gradle `repositories { ... }` body into RepoEntry dicts
     ``{"name", "url"}`` (scope is filled in by the caller). Handles shorthand
@@ -7659,24 +7748,14 @@ def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
     brace scanner — NOT a brace-naive regex, so `maven { credentials{…}; url=… }`
     is handled). A `maven { }` block's nested `content { includeGroup(...) }` /
     `includeGroupByRegex(...)`, and the `exclusiveContent { forRepository { maven
-    {...} }; filter {...} }` shorthand, are both captured onto the entry as an
-    optional `group_filters` list (#320 — see *Repository resolution* in
-    CLAUDE.md). Deduped by URL, declaration order preserved."""
-    entries: List[Dict[str, str]] = []
+    {...} | google() | mavenCentral() }; filter {...} }` form, are both captured
+    onto the entry as an optional `group_filters` list (#320 — see *Repository
+    resolution* in CLAUDE.md). Deduped by URL, declaration order preserved."""
+    entries: List[Dict[str, Any]] = []
 
-    for fn, name, url in _GRADLE_SHORTHANDS:
-        if re.search(r"\b" + fn + r"\s*\(\s*\)", block_body):
-            entries.append({"name": name, "url": url})
-    if re.search(r"\bmavenLocal\s*\(\s*\)", block_body):
-        entries.append({"name": "Maven Local", "url": _maven_local_url()})
-
-    # exclusiveContent { forRepository { maven {...} }; filter { includeGroup(...) } }
-    # — same net effect as `maven { content {...} }` (a repo + a group filter),
-    # different syntax shape. Handled BEFORE the bare `maven { ... }` scan below
-    # and its span excised from the content that scan sees — otherwise the
-    # `maven {}` nested inside `forRepository {}` would ALSO be picked up there
-    # as an unfiltered top-level repo, duplicating the entry and losing its
-    # group filter.
+    # exclusiveContent is parsed first and its span is excised before the bare
+    # shorthand / maven scans. A `google()` inside `forRepository` must pick up
+    # `filter { }`, not fall through to the unfiltered shorthand scan.
     exclusive_spans: List[Tuple[int, int]] = []
     pos = 0
     while True:
@@ -7689,23 +7768,26 @@ def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
         for_repo_body = _extract_block(body, "forRepository")
         if for_repo_body is None:
             continue
-        maven_found = _find_block(for_repo_body, "maven")
-        if not maven_found:
-            continue
-        maven_body, _mstart, _mafter = maven_found
-        um = re.search(r"\burl\b\s*(?:=\s*)?(?:uri\s*\(\s*)?[\"']([^\"']+)[\"']", maven_body)
-        if not um:
-            continue
-        url = um.group(1)
-        nm = re.search(r"\bname\s*=\s*[\"']([^\"']+)[\"']", maven_body)
-        entry = {"name": nm.group(1) if nm else url, "url": url}
         filter_body = _extract_block(body, "filter")
-        if filter_body is not None:
-            filters = _parse_group_filters(filter_body)
-            if filters:
-                entry["group_filters"] = filters
-        entries.append(entry)
+        filters = _parse_group_filters(filter_body) if filter_body is not None else []
+        for shorthand in _gradle_shorthand_entries(for_repo_body):
+            entries.append(_attach_group_filters(shorthand, filters))
+        maven_pos = 0
+        while True:
+            maven_found = _find_block(for_repo_body, "maven", maven_pos)
+            if not maven_found:
+                break
+            maven_body, _mstart, maven_after = maven_found
+            maven_pos = maven_after
+            um = re.search(r"\burl\b\s*(?:=\s*)?(?:uri\s*\(\s*)?[\"']([^\"']+)[\"']", maven_body)
+            if not um:
+                continue
+            url = um.group(1)
+            nm = re.search(r"\bname\s*=\s*[\"']([^\"']+)[\"']", maven_body)
+            entry = {"name": nm.group(1) if nm else url, "url": url}
+            entries.append(_attach_group_filters(entry, filters))
     block_body_sans_exclusive = _excise_spans(block_body, exclusive_spans)
+    entries.extend(_gradle_shorthand_entries(block_body_sans_exclusive))
 
     # Explicit maven("url") and maven(url = "url") (optionally wrapped in uri()).
     for m in re.finditer(
@@ -7870,64 +7952,246 @@ def _parse_maven_active_profile_repos(
     return dep_entries, plugin_entries
 
 
+def _parent_pom_coords_match(pom_xml: str, parent: Dict[str, Optional[str]]) -> bool:
+    """True when `pom_xml`'s own coordinate agrees with the child's `<parent>`
+    reference. A missing field on either side is not a mismatch."""
+    coords = _parse_maven_project_coords(pom_xml)
+    if coords["artifactId"] and coords["artifactId"] != parent["artifactId"]:
+        return False
+    if coords["groupId"] and parent["groupId"] and coords["groupId"] != parent["groupId"]:
+        return False
+    if coords["version"] and parent["version"] and coords["version"] != parent["version"]:
+        return False
+    return True
+
+
+def _fetch_published_parent_pom(
+    group_id: Optional[str], artifact_id: Optional[str], version: Optional[str]
+) -> Optional[str]:
+    """GET a parent POM that is not already on disk. Maven Central, then Google
+    Maven. Returns the POM text, or None when the coordinate is incomplete or
+    neither host answers 200. Never raises."""
+    if not group_id or not artifact_id or not version or version.startswith("${"):
+        return None
+    rel = f"{group_path(group_id)}/{artifact_id}/{version}/{artifact_id}-{version}.pom"
+    for base in (MAVEN_CENTRAL_URL, GOOGLE_MAVEN_URL):
+        url = base.rstrip("/") + "/" + rel
+        try:
+            status, body = http_get(url, timeout=HTTP_TIMEOUT_EXTERNAL)
+        except Exception:
+            continue
+        if status == 200 and body:
+            return body.decode("utf-8", errors="replace")
+    return None
+
+
 def _resolve_parent_chain_repos(
     pom_path: str,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-    """Walk the LOCAL parent-POM chain (child -> parent -> grandparent, ...)
-    starting from `pom_path`, merging `<repositories>`/`<pluginRepositories>`
-    declared in each locally-resolvable parent POM (#319). A parent is
-    resolved from the filesystem only — this is the common multi-module
-    reactor-build case and needs no network. Stops (gracefully, no raise) as
-    soon as a hop is not locally resolvable: no `<parent>`, no/empty
-    `relativePath`, the resolved path missing, or its own coordinate not
-    matching the child's `<parent>` declaration. Depth-capped at
-    `_MAX_PARENT_CHAIN_DEPTH` and cycle-guarded via realpath, so a
-    cyclic/malformed `<parent>` reference cannot loop forever."""
+    """Walk the parent-POM chain (child -> parent -> grandparent, ...) starting
+    from `pom_path`, merging `<repositories>`/`<pluginRepositories>` declared
+    in each parent (#319). A hop is taken from the local `relativePath` when
+    that file exists and its coordinate matches; otherwise the parent POM is
+    fetched by GAV. Depth-capped at `_MAX_PARENT_CHAIN_DEPTH` and cycle-guarded
+    via realpath (local files) and GAV (fetched POMs)."""
     dep_entries: List[Dict[str, str]] = []
     plugin_entries: List[Dict[str, str]] = []
-    current_path = pom_path
-    visited = set()
+    current_path: Optional[str] = pom_path
+    current_content: Optional[str] = None
+    visited_paths = set()
+    visited_gavs = set()
     for _ in range(_MAX_PARENT_CHAIN_DEPTH):
-        real = os.path.realpath(current_path)
-        if real in visited:
-            break
-        visited.add(real)
-        content = _read_build_file(current_path)
+        if current_path:
+            real = os.path.realpath(current_path)
+            if real in visited_paths:
+                break
+            visited_paths.add(real)
+            content = _read_build_file(current_path)
+        else:
+            content = current_content or ""
         if not content:
             break
         parent = _parse_maven_parent(content)
-        if not parent or not parent["relativePath"]:
+        if not parent:
             break
-        parent_path = os.path.normpath(
-            os.path.join(os.path.dirname(current_path), parent["relativePath"])
-        )
-        if os.path.isdir(parent_path):
-            parent_path = os.path.join(parent_path, "pom.xml")
-        if not os.path.exists(parent_path):
-            break  # not locally resolvable — network fetch is out of scope here (#319)
-        parent_content = _read_build_file(parent_path)
+        gav = (parent.get("groupId"), parent.get("artifactId"), parent.get("version"))
+        if gav in visited_gavs:
+            break
+        visited_gavs.add(gav)
+        parent_content: Optional[str] = None
+        next_path: Optional[str] = None
+        if parent["relativePath"] and current_path:
+            parent_path = os.path.normpath(
+                os.path.join(os.path.dirname(current_path), parent["relativePath"])
+            )
+            if os.path.isdir(parent_path):
+                parent_path = os.path.join(parent_path, "pom.xml")
+            if os.path.exists(parent_path):
+                candidate = _read_build_file(parent_path)
+                if candidate and _parent_pom_coords_match(candidate, parent):
+                    parent_content = candidate
+                    next_path = parent_path
+        if parent_content is None:
+            fetched = _fetch_published_parent_pom(
+                parent.get("groupId"), parent.get("artifactId"), parent.get("version")
+            )
+            if fetched and _parent_pom_coords_match(fetched, parent):
+                parent_content = fetched
+                next_path = None
         if not parent_content:
             break
-        coords = _parse_maven_project_coords(parent_content)
-        if coords["artifactId"] and coords["artifactId"] != parent["artifactId"]:
-            break  # resolved file's own identity doesn't match the <parent> reference
-        if coords["groupId"] and parent["groupId"] and coords["groupId"] != parent["groupId"]:
-            break
-        if coords["version"] and parent["version"] and coords["version"] != parent["version"]:
-            break
-        # Mirrors the local-pom guard in discover_repositories: _parse_maven_repos
-        # regex-searches for the FIRST <repositories>/<pluginRepositories> block
-        # anywhere in the content, unaware of <profiles> nesting, so a parent POM
-        # that also has profiles must have them stripped first — otherwise an
-        # (in)active profile's repos could leak in or shadow the parent's own
-        # top-level ones. A parent's own ACTIVE profile repos are not collected
-        # while walking the chain — documented as a residual gap (#319).
+        # _parse_maven_repos takes the first <repositories> block anywhere, so
+        # <profiles> are stripped first. A parent's own active-profile repos
+        # are not collected while walking the chain.
         parent_content_sans_profiles = re.sub(r"<profiles>[\s\S]*?</profiles>", "", parent_content)
         deps, plugins = _parse_maven_repos(parent_content_sans_profiles)
         dep_entries.extend(deps)
         plugin_entries.extend(plugins)
-        current_path = parent_path
+        current_path = next_path
+        current_content = None if next_path else parent_content
     return dep_entries, plugin_entries
+
+
+def _settings_activation_matches(activation_xml: str) -> str:
+    """Classify a settings.xml `<activation>` body.
+
+    Returns ``"match"`` when a non-default condition is true (property, os,
+    jdk, or file), ``"miss"`` when such a condition is present but false,
+    ``"default"`` when only `<activeByDefault>true</activeByDefault>` is set,
+    and ``"none"`` otherwise. Property values are read from the process
+    environment (Maven user properties are not available to this server).
+    """
+    if re.search(r"<property>([\s\S]*?)</property>", activation_xml):
+        prop = re.search(r"<property>([\s\S]*?)</property>", activation_xml)
+        body = prop.group(1) if prop else ""
+        name_m = _extract_tag(body, "name")
+        if not name_m:
+            return "miss"
+        name = name_m.strip()
+        value_m = _extract_tag(body, "value")
+        if name.startswith("!"):
+            return "match" if os.environ.get(name[1:]) is None else "miss"
+        env_val = os.environ.get(name)
+        if value_m is None:
+            return "match" if env_val is not None else "miss"
+        return "match" if env_val == value_m.strip() else "miss"
+    os_m = re.search(r"<os>([\s\S]*?)</os>", activation_xml)
+    if os_m:
+        family_m = _extract_tag(os_m.group(1), "family")
+        if family_m:
+            family = family_m.strip().lower()
+            if os.name == "nt":
+                actual = "windows"
+            elif sys.platform == "darwin":
+                actual = "mac"
+            else:
+                actual = "unix"
+            return "match" if family == actual else "miss"
+        name_m = _extract_tag(os_m.group(1), "name")
+        if name_m:
+            needle = name_m.strip().lower()
+            hay = (os.name + " " + sys.platform).lower()
+            return "match" if needle in hay else "miss"
+        return "miss"
+    jdk_m = _extract_tag(activation_xml, "jdk")
+    if jdk_m:
+        # No Java runtime is invoked. A range the server cannot evaluate does
+        # not activate the profile.
+        return "miss"
+    file_m = re.search(r"<file>([\s\S]*?)</file>", activation_xml)
+    if file_m:
+        exists_m = _extract_tag(file_m.group(1), "exists")
+        missing_m = _extract_tag(file_m.group(1), "missing")
+        if exists_m is not None:
+            return "match" if os.path.exists(os.path.expanduser(exists_m.strip())) else "miss"
+        if missing_m is not None:
+            return "match" if not os.path.exists(os.path.expanduser(missing_m.strip())) else "miss"
+        return "miss"
+    if re.search(r"<activeByDefault>\s*true\s*</activeByDefault>", activation_xml):
+        return "default"
+    return "none"
+
+
+def _parse_settings_xml_profile_repos(
+    xml: str,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Repositories from active `settings.xml` profiles.
+
+    A profile is active when its `<id>` is listed in `<activeProfiles>`, or
+    when a non-default activation condition matches. `<activeByDefault>`
+    applies only when no profile in the file was activated another way (Maven's
+    own rule)."""
+    xml = _strip_xml_comments(xml)
+    active_ids = set()
+    active_m = re.search(r"<activeProfiles>([\s\S]*?)</activeProfiles>", xml)
+    if active_m:
+        for id_m in re.finditer(r"<activeProfile>([^<]*)</activeProfile>", active_m.group(1)):
+            ident = id_m.group(1).strip()
+            if ident:
+                active_ids.add(ident)
+    profiles_m = re.search(r"<profiles>([\s\S]*?)</profiles>", xml)
+    if not profiles_m:
+        return [], []
+    classified = []
+    nondefault_hit = False
+    for pm in re.finditer(r"<profile>([\s\S]*?)</profile>", profiles_m.group(1)):
+        block = pm.group(1)
+        id_text = _extract_tag(block, "id")
+        ident = id_text.strip() if id_text else ""
+        if ident and ident in active_ids:
+            classified.append((block, "force"))
+            nondefault_hit = True
+            continue
+        activation_m = re.search(r"<activation>([\s\S]*?)</activation>", block)
+        kind = _settings_activation_matches(activation_m.group(1)) if activation_m else "none"
+        if kind == "match":
+            nondefault_hit = True
+        classified.append((block, kind))
+    dep_entries: List[Dict[str, str]] = []
+    plugin_entries: List[Dict[str, str]] = []
+    for block, kind in classified:
+        take = kind in ("force", "match") or (kind == "default" and not nondefault_hit)
+        if not take:
+            continue
+        deps, plugins = _parse_maven_repos(block)
+        dep_entries.extend(deps)
+        plugin_entries.extend(plugins)
+    return dep_entries, plugin_entries
+
+
+def _load_settings_xml_profile_repos() -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """Profile repositories from the first readable settings.xml."""
+    for path in _settings_xml_paths():
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                return _parse_settings_xml_profile_repos(fh.read())
+        except OSError:
+            continue
+    return [], []
+
+
+def _gradle_included_module_repos(project_root: str, settings_content: str) -> List[Dict[str, Any]]:
+    """Dependency-scope `repositories {}` from Gradle modules named by
+    `include` in `settings_content`. Root build files are not re-read."""
+    entries: List[Dict[str, Any]] = []
+    for module in _parse_settings_modules(settings_content):
+        module_dir = _module_path_to_dir(project_root, module)
+        if os.path.normpath(module_dir) == os.path.normpath(project_root):
+            continue
+        for fname in GRADLE_BUILD_FILES:
+            path = os.path.join(module_dir, fname)
+            if not os.path.exists(path):
+                continue
+            content = _read_build_file(path)
+            consumed: List[Tuple[int, int]] = []
+            for header in _GRADLE_PLUGIN_CONTAINERS:
+                found = _find_block(content, header)
+                if found:
+                    consumed.append((found[1], found[2]))
+            bare = _extract_block(_excise_spans(content, consumed), "repositories")
+            if bare is not None:
+                entries.extend(_parse_gradle_repos(bare))
+    return entries
 
 
 def discover_repositories(project_root: str) -> Dict[str, List[Dict[str, str]]]:
@@ -7951,11 +8215,14 @@ def discover_repositories(project_root: str) -> Dict[str, List[Dict[str, str]]]:
         settings_dep_entries: List[Dict[str, str]] = []  # dependencyResolutionManagement { repositories {} }
         project_dep_entries: List[Dict[str, str]] = []  # bare top-level repositories {}
         repos_mode = _DEFAULT_REPOSITORIES_MODE
+        settings_blobs: List[str] = []
         for fname in GRADLE_SETTINGS_FILES + GRADLE_BUILD_FILES:
             path = os.path.join(project_root, fname)
             if not os.path.exists(path):
                 continue
             content = _read_build_file(path)
+            if fname in GRADLE_SETTINGS_FILES:
+                settings_blobs.append(content)
             consumed: List[Tuple[int, int]] = []
             for header in _GRADLE_PLUGIN_CONTAINERS + (_GRADLE_DEP_CONTAINER,):
                 found = _find_block(content, header)
@@ -7982,6 +8249,8 @@ def discover_repositories(project_root: str) -> Dict[str, List[Dict[str, str]]]:
             bare = _extract_block(stripped, "repositories")
             if bare is not None:
                 project_dep_entries.extend(_parse_gradle_repos(bare))
+        for blob in settings_blobs:
+            project_dep_entries.extend(_gradle_included_module_repos(project_root, blob))
         result["plugin"] = _dedup_repos(plugin_entries)
         if repos_mode == "FAIL_ON_PROJECT_REPOS":
             # A real Gradle build would fail outright if the project also
@@ -8013,8 +8282,9 @@ def discover_repositories(project_root: str) -> Dict[str, List[Dict[str, str]]]:
             # parent POM and/or an active profile instead (#319).
             profile_deps, profile_plugins = _parse_maven_active_profile_repos(content)
             parent_deps, parent_plugins = _resolve_parent_chain_repos(pom_path)
-            result["dependency"] = _dedup_repos(deps + profile_deps + parent_deps)
-            result["plugin"] = _dedup_repos(plugins + profile_plugins + parent_plugins)
+            settings_deps, settings_plugins = _load_settings_xml_profile_repos()
+            result["dependency"] = _dedup_repos(deps + profile_deps + parent_deps + settings_deps)
+            result["plugin"] = _dedup_repos(plugins + profile_plugins + parent_plugins + settings_plugins)
 
     for scope, repos in result.items():
         for entry in repos:
@@ -8179,7 +8449,11 @@ _gradle_run = subprocess.run
 
 
 def _find_gradle_wrapper(project_root: str) -> Optional[str]:
-    for name in ("gradlew", "gradlew.bat"):
+    # On Windows both files exist in a Gradle-generated project. The POSIX
+    # script is not a Win32 executable (WinError 193), so the .bat form wins
+    # there. Everywhere else the POSIX script stays first.
+    names = ("gradlew.bat", "gradlew") if os.name == "nt" else ("gradlew", "gradlew.bat")
+    for name in names:
         path = os.path.join(project_root, name)
         if os.path.isfile(path):
             return path
@@ -8210,6 +8484,10 @@ def _run_gradle_command(
         )
     except subprocess.TimeoutExpired:
         return 124, "", f"Gradle command timed out after {timeout}s"
+    except OSError as e:
+        # WinError 193 and other launch failures name the wrapper that was
+        # executed. A bare OSError message does not, so the path is added here.
+        return 1, "", f"Failed to launch Gradle wrapper {gradlew}: {e}"
     return result.returncode, result.stdout or "", result.stderr or ""
 
 
@@ -10682,9 +10960,31 @@ TOOLS = [
             },
             "required": ["groupId", "artifactId", "fromVersion", "toVersion"],
         },
-        # No outputSchema: `changes[]` entries vary by changelog provider
-        # (AndroidX/AGP HTML-derived notes vs. GitHub release JSON have
-        # different fields) — see #398 follow-ups in CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "groupId": {"type": "string"},
+                "artifactId": {"type": "string"},
+                "fromVersion": {"type": "string"},
+                "toVersion": {"type": "string"},
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "version": {"type": "string"},
+                            "body": {"type": "string"},
+                            "releaseUrl": {"type": "string"},
+                        },
+                        "required": ["version"],
+                    },
+                },
+                "repositoryUrl": {"type": "string"},
+                "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                "changelogUrl": {"type": "string"},
+            },
+            "required": ["groupId", "artifactId", "fromVersion", "toVersion", "changes"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
@@ -10697,10 +10997,33 @@ TOOLS = [
                 "projectPath": {"type": "string", "description": "Path to the project root. Defaults to current working directory."},
             },
         },
-        # No outputSchema: per-dependency entries vary considerably between
-        # Gradle-resolved and Maven-parsed scans (isPlatform/platformKind/
-        # managedBy/effectiveVersion/resolvedBy/usages and more, conditionally
-        # present) — see #398 follow-ups in CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "buildSystem": {"type": "string"},
+                "dependencies": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "version": {"type": "string"},
+                            "configuration": {"type": "string"},
+                            "module": {"type": ["string", "null"]},
+                            "source": {"type": "string"},
+                            "sourceKind": {"type": "string"},
+                        },
+                        "required": [
+                            "groupId", "artifactId", "version", "configuration",
+                            "module", "source", "sourceKind",
+                        ],
+                    },
+                },
+                "deadRepositoryHints": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["buildSystem", "dependencies", "deadRepositoryHints"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
@@ -11018,10 +11341,60 @@ TOOLS = [
             },
             "required": ["dependencies"],
         },
-        # No outputSchema: per-dependency result has many optional nested
-        # sections (github block, scorecard.checks[], signals[], several
-        # degrade branches) too sprawling to schema confidently in one pass —
-        # see #398 follow-ups in CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "versionCount": {"type": "integer"},
+                            "repository": {"type": ["object", "null"]},
+                            "scm": {"type": ["object", "null"]},
+                            "github": {
+                                "type": ["object", "null"],
+                                "properties": {
+                                    "stars": {"type": "integer"},
+                                    "forks": {"type": "integer"},
+                                    "openIssues": {"type": "integer"},
+                                    "archived": {"type": "boolean"},
+                                    "ownerType": {"type": "string"},
+                                    "lastCommit": {"type": ["string", "null"]},
+                                    "lastRelease": {"type": ["string", "null"]},
+                                    "releaseCount": {"type": "integer"},
+                                    "releaseCadenceDays": {"type": ["integer", "null"]},
+                                    "license": {"type": ["string", "null"]},
+                                    "createdAt": {"type": ["string", "null"]},
+                                    "issues": {"type": ["object", "null"]},
+                                },
+                            },
+                            "signals": {"type": "array", "items": {"type": "string"}},
+                            "latestVersion": {"type": ["string", "null"]},
+                            "stability": {"type": ["string", "null"]},
+                            "lastPublishedToMaven": {"type": ["string", "null"]},
+                            "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "scorecard": {
+                                "type": "object",
+                                "properties": {
+                                    "overallScore": {"type": "number"},
+                                    "date": {"type": ["string", "null"]},
+                                    "checks": {"type": "array"},
+                                    "generatedBy": {"type": "string"},
+                                },
+                            },
+                        },
+                        "required": [
+                            "groupId", "artifactId", "versionCount",
+                            "repository", "scm", "github", "signals",
+                        ],
+                    },
+                },
+            },
+            "required": ["results"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
@@ -11157,10 +11530,26 @@ TOOLS = [
             },
             "required": ["query"],
         },
-        # No outputSchema: result rows are not confirmed uniform across the
-        # three search backends (Central Solr / Nexus / Artifactory each have
-        # their own row-mapping function) — see #398 follow-ups in
-        # CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "latestVersion": {"type": "string"},
+                            "versionCount": {"type": "integer"},
+                        },
+                        "required": ["groupId", "artifactId", "latestVersion", "versionCount"],
+                    },
+                },
+                "searchBackend": {"type": "string", "enum": ["central", "nexus", "artifactory"]},
+            },
+            "required": ["results"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
@@ -11177,11 +11566,47 @@ TOOLS = [
                 "onlyIssues": {"type": "boolean", "description": "Return only dependencies with a signal (error, upgrade available, vulnerability, or license flag) plus a compact summary. Default false (unchanged full output). Reduces response size on large projects."},
             },
         },
-        # No outputSchema: the most variable tool in the server -- onlyIssues
-        # and includeLicenses each reshape the top level, and per-dependency
-        # entries carry the same sprawl as scan_project_dependencies plus a
-        # vulnerabilities/license overlay — see #398 follow-ups in
-        # CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "buildSystem": {"type": "string"},
+                "dependencies": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "currentVersion": {"type": "string"},
+                            "latestVersion": {"type": ["string", "null"]},
+                            "upgradeType": {"type": "string"},
+                            "source": {"type": "object"},
+                            "usages": {"type": "array"},
+                            "module": {"type": ["string", "null"]},
+                            "configuration": {"type": ["string", "null"]},
+                            "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "vulnerabilities": {"type": "array", "items": {"type": "object"}},
+                        },
+                        "required": [
+                            "groupId", "artifactId", "source", "usages", "module", "configuration",
+                        ],
+                    },
+                },
+                "summary": {
+                    "type": "object",
+                    "properties": {
+                        "total": {"type": "integer"},
+                        "upgradeable": {"type": "integer"},
+                        "vulnerable": {"type": "integer"},
+                        "major": {"type": "integer"},
+                        "minor": {"type": "integer"},
+                        "patch": {"type": "integer"},
+                    },
+                    "required": ["total", "upgradeable", "vulnerable", "major", "minor", "patch"],
+                },
+            },
+            "required": ["buildSystem", "dependencies", "summary"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
     {
@@ -11239,12 +11664,19 @@ TOOLS = [
             },
             "required": ["mode"],
         },
-        # No outputSchema: generate vs. validate return structurally different
-        # shapes (generate's "entry" sub-object also varies by kind:
-        # library/plugin), plus a distinct early-error shape — a single
-        # accurate schema needs a union the current outputSchema spec
-        # restriction (type: object at the root) doesn't cleanly fit; see
-        # #398 follow-ups in CLAUDE.md.
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "alias": {"type": "string"},
+                "accessor": {"type": "string"},
+                "entry": {"type": "object"},
+                "suggestedDiff": {"type": "string"},
+                "violations": {"type": "array", "items": {"type": "object"}},
+                "catalogPath": {"type": "string"},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["violations"],
+        },
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     {

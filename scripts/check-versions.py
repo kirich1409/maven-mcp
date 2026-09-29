@@ -29,9 +29,18 @@ def main() -> int:
     server = (ROOT / "plugin/server/server.py").read_text()
     server_version = re.search(r'^SERVER_VERSION = "([^"]+)"', server, re.M)
     user_agent = re.search(r'^USER_AGENT = "maven-mcp/([^"]+)"', server, re.M)
+    project_text = (ROOT / "pyproject.toml").read_text()
+    project_block = re.search(r"(?m)^\[project\]\s*$([\s\S]*?)(?=^\[|\Z)", project_text)
+    project_version = None
+    if project_block:
+        found = re.search(r'(?m)^version\s*=\s*"([^"]+)"', project_block.group(1))
+        if found:
+            project_version = found.group(1)
     errors: list[str] = []
 
     version = plugin["version"]
+    if project_version != version:
+        errors.append(f"pyproject.toml version {project_version} != plugin.json {version}")
     if entry["version"] != version:
         errors.append(
             f"marketplace.json {entry['version']} != plugin.json {version}"
