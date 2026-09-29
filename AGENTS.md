@@ -306,5 +306,5 @@ Fires before `Edit`/`Write`/`MultiEdit` on build files; extracts coordinates fro
 - No XML parser dependency — all XML parsing is regex-based.
 - Network seam is `urllib.request.urlopen`; tests mock it with `unittest.mock.patch("urllib.request.urlopen", ...)`.
 - Tests live dev-only at `tests/` (outside `plugin/`, so they are not shipped). They import `server` via a `__file__`-resolved `sys.path` shim in `tests/_helpers.py`; filesystem-touching parsers are exercised against real files written into a `TemporaryDirectory`. `tests/test_http_transport.py` covers the HTTP transport end-to-end over loopback (`("127.0.0.1", 0)` on a daemon thread).
-- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`. The monorepo `scripts/validate.sh --check-tag` enforced the marketplace copy as well; this repository does not publish through that script.
+- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL.
 - `import server` is side-effect-free (the `if __name__ == "__main__": main()` guard at the tail).

@@ -16,6 +16,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+      - run: python3 scripts/check-versions.py
       - run: python3 -m unittest discover -s tests -v
       - run: python -m compileall plugin/server
       - name: Shellcheck hooks

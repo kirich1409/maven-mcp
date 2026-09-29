@@ -12,14 +12,14 @@ Created: 2026-09-29
 
 - In:
   - Устанавливаемый entry point `maven-mcp` → существующий `main()` в `plugin/server/server.py`. Runtime-зависимостей нет.
-  - Четвёртая точка версии в `pyproject.toml`, проверка в `scripts/validate.sh --check-tag`.
+  - Четвёртая точка версии в `pyproject.toml`, проверка в `scripts/check-versions.py`.
   - README: матрица клиентов, исправление команды Claude Code, `uv` вместо абсолютного пути в монорепо, HTTP для клиентов без локального stdio.
   - Smoke: MCP `initialize` через установленную команду, без checkout.
   - Windows: `gradlew.bat` раньше POSIX `gradlew`, `OSError`/`WinError` не маскируется под успех (#457).
   - В README явно перечислены ограничения, которые 1.0 не закрывает.
   - Релизный коммит `1.0.0` и чеклист тега. Push тега и публикация на PyPI — только после подтверждения.
 - Out:
-  - Вырезать плагин из `krozov-ai-tools` и переносить закрытую историю issues. Marketplace entry там пока остаётся.
+  - Перенос закрытой истории issues из предыдущего репозитория. Marketplace этого репозитория — `.claude-plugin/marketplace.json`.
   - npm-обёртка и Homebrew как канал поставки.
   - MCPB-бандл. `scripts/pack-mcpb.sh` завязан на youtube-transcript; для Claude Code и Grok канал — marketplace.
   - `outputSchema` у шести content-only tools, fallback `CHANGELOG.md` в `get_dependency_changes`, резолв репозиториев #318–#320.
@@ -30,8 +30,8 @@ Created: 2026-09-29
 
 - Исследование: сессия `01a0ec7e`, отчёт deep-research (Partial). Поставка сейчас `0.27.2`.
 - Решения этой сессии: сервер остаётся Python; для не-plugin клиентов — `uv`/`uvx`, не npm и не brew. Локально Python 3.9+ не гарантирован (Claude Code, Codex, Grok его не ставят). В облачной VM Claude Code Python 3.10–3.13 и `uv` уже есть.
-- Версии: `plugins/maven-mcp/plugin/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `SERVER_VERSION` в `server.py` (`USER_AGENT` от него). Гейт: `bash scripts/validate.sh --check-tag maven-mcp--vX.Y.Z`. Голый тег `v1.0.0` релиз не запускает (`release.yml` на `*--v*`, `legacy-tag-guard.yml` валит `v*`). Чеклист: `docs/PLUGIN-STANDARDS.md` §10.
-- Клиенты сейчас: `.mcp.json` — `python3` + `${CLAUDE_PLUGIN_ROOT}/server/server.py`. README для остальных указывает абсолютный путь внутрь монорепо. Команда `claude plugin add` в README не существует; нужны `claude plugin marketplace add` / `claude plugin install`.
+- Версии: `plugin/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `SERVER_VERSION` в `server.py` (`USER_AGENT` от него). Гейт: `python3 scripts/check-versions.py`.
+- Клиенты: `.mcp.json` — `python3` + `${CLAUDE_PLUGIN_ROOT}/server/server.py`. Marketplace — `kirich1409/maven-mcp`, установка `maven-mcp@maven-mcp`. Локально: `claude plugin marketplace add` / `claude plugin install` на корень этого репозитория.
 - `main()` уже есть (`server.py`, transport из `MAVEN_MCP_TRANSPORT`).
 - `pyproject.toml` плагина — только tool-конфиг. Комментарий INP001 запрещает пакетную раскладку для ruff/unittest, не запрещает console script.
 - #457: `_find_gradle_wrapper` пробует `gradlew` раньше `gradlew.bat`; `_run_gradle_command` ловит только `TimeoutExpired`. PR #458 — открытый draft; configuration-cache и Gradle 9 из того PR в 1.0 не входят, пока нет отдельного repro.
@@ -57,8 +57,8 @@ Windows-фикс — отдельный багфикс с красным тес�
 
 | Level | Required | How | Skip reason |
 |-------|----------|-----|-------------|
-| L0 | yes на код | `python3 -m unittest discover -s plugins/maven-mcp/tests` из корня монорепо; для упаковки — `uv build` / `uv tool install --from` этого проекта и процесс стартует | |
-| L1a | yes на код | ruff + mypy так, как задано в `plugins/maven-mcp/AGENTS.md`; `bash scripts/validate.sh` и `--check-tag` после четвёртой точки версии | |
+| L0 | yes на код | `python3 -m unittest discover -s tests` из корня репозитория; для упаковки — `uv build` / `uv tool install --from` этого проекта и процесс стартует | |
+| L1a | yes на код | ruff + mypy так, как задано в `AGENTS.md`; `python3 scripts/check-versions.py` | |
 | L1b | yes на product-diff | agent `reviewer` на diff слайса | docs-only T3/T6 — skip |
 | L2 | yes на T1 и T5 | unittest: entry point резолвится в `main`; Windows-порядок кандидатов и `OSError` — красный тест до фикса | docs — skip |
 | L3 | no | | нет UI |
@@ -77,7 +77,7 @@ Red-green required: yes, только T5. Остальное — тесты вм
 - TC-2: stdin `initialize` (JSON-RPC) → ответ с именем сервера и `SERVER_VERSION`, процесс не требует `server.py` по абсолютному пути монорепо.
 - TC-3: `MAVEN_MCP_TRANSPORT=http` на `127.0.0.1` со свободным портом отвечает на тот же `initialize` по HTTP и завершается. Порт не 8765, если занят.
 - TC-4: Claude/Grok путь не сломан: `.mcp.json` по-прежнему `python3` и `${CLAUDE_PLUGIN_ROOT}/server/server.py`.
-- TC-5: `bash scripts/validate.sh --check-tag maven-mcp--v1.0.0` зелёный только когда четыре точки версии равны `1.0.0`. Сдвиг одной точки — красный.
+- TC-5: `python3 scripts/check-versions.py` зелёный, когда `plugin.json`, `marketplace.json`, `SERVER_VERSION` и `USER_AGENT` равны. Сдвиг одной точки — красный. `check-versions.py 1.0.0` красный, пока версия не `1.0.0`.
 
 ### Feature
 
@@ -92,9 +92,7 @@ Red-green required: yes, только T5. Остальное — тесты вм
 
 ## Где лежат задачи
 
-Код и открытые issues — в `kirich1409/maven-mcp`. Из `krozov-ai-tools` перенесены и там больше не резолвятся. Закрытая история (#318 и остальные уже смерженные) осталась в монорепо. Draft PR [#458](https://github.com/kirich1409/krozov-ai-tools/pull/458) не переносился.
-
-Marketplace (`marketplace.json`) и `scripts/validate.sh --check-tag` по-прежнему в монорепо. Этот репозиторий их не содержит.
+Код, marketplace и открытые issues — в этом репозитории. Закрытая история старых номеров и draft PR #458 предыдущего репозитория сюда не переносились.
 
 | Задача | Где | Зачем |
 |---|---|---|
@@ -108,12 +106,12 @@ Marketplace (`marketplace.json`) и `scripts/validate.sh --check-tag` по-пр�
 ## Tasks
 
 - [ ] T1: Installable entry point. Трекер: #2. В `pyproject.toml` — `[project]` (`requires-python >=3.9`, без runtime-deps) и script `maven-mcp` → `main`. Проверить имя на PyPI до публикации; команду не переименовывать. Раскладка остаётся одним `server.py` (unittest discover не ломать). → verify: TC-1, TC-2, TC-3, TC-4, TC-10, L1a, L1b
-- [ ] T2: Четвёртая версия. `pyproject.toml` `version` равен `plugin.json` и `SERVER_VERSION`. Проверка в этом репозитории (монорепный `scripts/validate.sh --check-tag` сюда не скопирован; `marketplace.json` всё ещё в krozov-ai-tools). → verify: TC-5, L1a
+- [ ] T2: Четвёртая версия. `pyproject.toml` `version` равен `plugin.json`, `marketplace.json` и `SERVER_VERSION`. `scripts/check-versions.py` падает при рассинхроне. → verify: TC-5, L1a
 - [ ] T3: README «Use with any MCP client» и Installation. Убрать `claude plugin add`. Матрица: Claude Code marketplace, Grok `--trust`, Codex/Cursor/Claude Desktop/Gemini/Kimi через `uvx maven-mcp`, веб-ChatGPT только HTTP, облако Claude Code без доустановки Python. Предусловия хуков: `jq`, на macOS `gtimeout`. → verify: TC-6, TC-7, TC-9
 - [ ] T4: Smoke установленного stdio в CI или в скрипте рядом с существующими `scripts/smoke-*.sh`: временный `uv tool install`, `initialize`, удаление tool. Не ходить в сеть Maven. → verify: TC-2, L5
 - [ ] T5: #1. Сначала красный тест на порядок `gradlew.bat` и на `OSError`. Затем минимальная правка `_find_gradle_wrapper` и `except`. Configuration-cache / Gradle 9 из draft PR #458 не брать без отдельного repro. → verify: TC-8 red→green, L1b
 - [ ] T6: В README или `CLAUDE.md` список «не в 1.0» со ссылками на #3, #4, #5: шесть tools без `outputSchema`, нет fallback на `CHANGELOG.md`, residuals резолва, нет MCPB, нет npm/brew. → verify: ревью текста, код не меняется
-- [ ] T7: Релизный коммит `1.0.0`: версии в `plugin.json`, `SERVER_VERSION` и `pyproject.toml` совпадают. Тег и PyPI не пушить без явного подтверждения. Marketplace-тег `maven-mcp--v*` и `validate.sh` всё ещё живут в krozov-ai-tools — их надо либо перенести, либо обновить отдельно. → verify: TC-5 на релизном коммите
+- [ ] T7: Релизный коммит `1.0.0`: `plugin.json`, `marketplace.json`, `SERVER_VERSION` и `pyproject.toml` совпадают, `python3 scripts/check-versions.py 1.0.0` зелёный. Тег и PyPI не пушить без явного подтверждения. → verify: TC-5 на релизном коммите
 
 Порядок: T1 → T2 → T4. T3 после T1 (нужно финальное имя пакета). T5 параллельно с T1, отдельным коммитом. T6 в любой момент. T7 последним.
 
@@ -128,10 +126,10 @@ Marketplace (`marketplace.json`) и `scripts/validate.sh --check-tag` по-пр�
 ## Open questions / decisions
 
 - Q: npm или brew вместо Python? → decision: нет. Сервер Python, поставка для не-plugin клиентов — `uv`/`uvx`. Brew и npm в 1.0 не делаем.
-- Q: выносить код в `kirich1409/maven-mcp`? → decision: код залит, открытые issues перенесены (2026-09-29). Релизный marketplace и `validate.sh` пока в монорепо.
+- Q: где source of truth? → decision: этот репозиторий. Marketplace — `.claude-plugin/marketplace.json`, проверка версий — `scripts/check-versions.py`.
 - Q: MCPB как у youtube-transcript? → decision: нет в 1.0. Упаковщик захардкожен на другой плагин. Отдельным issue не заводим.
 - Q: закрывать #318–#320, schema и changelog fallback до тега? → decision: нет. Хвосты — #3, #4, #5. T6 только ссылается на них.
-- Q: Windows wrapper в 1.0? → decision: да, #1. Порядок `gradlew.bat` и `OSError`. Configuration-cache / Gradle 9 из draft PR krozov-ai-tools#458 не входят.
+- Q: Windows wrapper в 1.0? → decision: да, #1. Порядок `gradlew.bat` и `OSError`. Configuration-cache и Gradle 9 из неотправленного draft PR не входят.
 - Q: новая runtime-зависимость? → decision: нет. hatchling только в `build-system.requires`.
 - Q: кто пушит тег и PyPI? → decision: не этот план. Нужно явное подтверждение на push тега и на публикацию.
 
@@ -139,6 +137,6 @@ Marketplace (`marketplace.json`) и `scripts/validate.sh --check-tag` по-пр�
 
 Implement: main в `https://github.com/kirich1409/maven-mcp`. Issues: #1 Windows, #2 uv/1.0, #3 schema, #4 changelog, #5 repo residuals.
 
-После каждого product-слайса: `code-simplifier`, затем `verify-change`. State: `.grok-report/maven-mcp-1-0-state.md` в монорепо.
+После каждого product-слайса: `code-simplifier`, затем `verify-change`. State: `.grok-report/maven-mcp-1-0-state.md` в этом репозитории.
 
 T7 push тега и PyPI — confirm, не часть «план готов, можно релизовать молча до конца».

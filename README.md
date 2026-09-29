@@ -112,15 +112,15 @@ Repositories are selected by static group-prefix routing (Gradle Plugin Portal f
 ### Claude Code (marketplace)
 
 ```
-/plugin marketplace add kirich1409/krozov-ai-tools
-/plugin install maven-mcp@krozov-ai-tools
+/plugin marketplace add kirich1409/maven-mcp
+/plugin install maven-mcp@maven-mcp
 ```
 
 ### Grok Build (marketplace)
 
 ```bash
-grok plugin marketplace add kirich1409/krozov-ai-tools
-grok plugin install maven-mcp --trust
+grok plugin marketplace add kirich1409/maven-mcp
+grok plugin install maven-mcp@maven-mcp --trust
 ```
 
 `--trust` is required for the bundled MCP server and write-guard hooks to run. Reload plugins (`r` in the Plugins tab) or start a new session after install.
@@ -129,10 +129,12 @@ grok plugin install maven-mcp --trust
 
 ```bash
 # Claude Code
-claude plugin add /path/to/maven-mcp/plugin
+claude plugin marketplace add /path/to/maven-mcp
+claude plugin install maven-mcp@maven-mcp
 
 # Grok Build
-grok plugin install /path/to/maven-mcp/plugin --trust
+grok plugin marketplace add /path/to/maven-mcp
+grok plugin install maven-mcp@maven-mcp --trust
 ```
 
 The plugin registers the bundled server via `.mcp.json` automatically; no separate install or build step is required.
