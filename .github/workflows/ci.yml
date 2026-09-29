@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python3 -m unittest discover -s tests -v
+      - run: python -m compileall plugin/server
+      - name: Shellcheck hooks
+        run: shellcheck plugin/hooks/*.sh
+
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.15.22
+      - run: ruff check plugin/server tests
+
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      # mypy 1.20.2 is the newest release that still accepts python_version 3.9
+      # as a check target. mypy 2.0 rejects 3.9.
+      - run: pip install mypy==1.20.2
+      - run: mypy --config-file pyproject.toml
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install coverage==7.15.2
+      - name: Run tests under coverage
+        run: coverage run --rcfile=pyproject.toml -m unittest discover -s tests -v
+      - name: Coverage report
+        run: coverage report --rcfile=pyproject.toml
