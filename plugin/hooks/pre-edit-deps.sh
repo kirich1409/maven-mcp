@@ -31,14 +31,46 @@ TOOL_NAME=""
 # Claude Code: tool_name / tool_input (snake_case). Grok Build: toolName / toolInput (camelCase).
 TOOL_NAME=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // .toolName // empty' 2>/dev/null) || TOOL_NAME=""
 
-# ── Fast gate: Claude Edit/Write/MultiEdit and Grok search_replace/write ─────
+# Cursor sends a camelCase hook_event_name ("preToolUse") and expects a
+# {"permission": ...} reply instead of Claude's hookSpecificOutput envelope.
+HOOK_EVENT=""
+HOOK_EVENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null) || HOOK_EVENT=""
+
+# ── Fast gate: Claude Edit/Write/MultiEdit, Grok search_replace/write, ──────
+# ── Cursor Write/Edit, Codex apply_patch ─────────────────────────────────────
 case "$TOOL_NAME" in
   Edit|Write|MultiEdit|search_replace|write) ;;
+  apply_patch) ;;
   *) exit 0 ;;
 esac
 
+# Codex apply_patch carries a patch text instead of file_path/new_string:
+#   *** Begin Patch / *** Add File: <path> | *** Update File: <path> / +line ...
+# The first build file in the patch is checked; its "+" lines are the new content.
+PATCH_TEXT=""
+if [ "$TOOL_NAME" = "apply_patch" ]; then
+  PATCH_TEXT=$(printf '%s' "$HOOK_INPUT" | jq -r '
+    (.tool_input.command // .tool_input.patch // .tool_input.input // empty)
+    | if type == "array" then .[-1] else . end
+    | if type == "string" then . else empty end' 2>/dev/null) || PATCH_TEXT=""
+  [ -n "$PATCH_TEXT" ] || exit 0
+fi
+
 FILE_PATH=""
-FILE_PATH=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path // .toolInput.file_path // empty' 2>/dev/null) || FILE_PATH=""
+if [ -n "$PATCH_TEXT" ]; then
+  while IFS= read -r _patch_path; do
+    case "$(basename "$_patch_path" 2>/dev/null)" in
+      build.gradle|build.gradle.kts|settings.gradle|settings.gradle.kts|pom.xml|*.versions.toml)
+        FILE_PATH="$_patch_path"
+        break
+        ;;
+    esac
+  done <<EOF_PATCH_PATHS
+$(printf '%s\n' "$PATCH_TEXT" | sed -E -n 's/^\*\*\* (Add|Update) File: //p' 2>/dev/null)
+EOF_PATCH_PATHS
+else
+  FILE_PATH=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path // .toolInput.file_path // empty' 2>/dev/null) || FILE_PATH=""
+fi
 BASENAME=""
 BASENAME=$(basename "$FILE_PATH" 2>/dev/null) || BASENAME=""
 
@@ -63,7 +95,22 @@ case "$TOOL_NAME" in
   MultiEdit)
     NEW_CONTENT=$(printf '%s' "$HOOK_INPUT" | jq -r '[((.tool_input.edits // .toolInput.edits // [])[]?.new_string // empty)] | join("\n")' 2>/dev/null) || NEW_CONTENT=""
     ;;
+  apply_patch)
+    # "+" lines of the selected file's section, prefix stripped.
+    NEW_CONTENT=$(printf '%s\n' "$PATCH_TEXT" | awk -v target="$FILE_PATH" '
+      /^\*\*\* (Add|Update|Delete) File: / {
+        p = $0; sub(/^\*\*\* (Add|Update|Delete) File: /, "", p); inside = (p == target); next
+      }
+      /^\*\*\* End Patch/ { inside = 0; next }
+      inside && /^\+/ { print substr($0, 2) }
+    ' 2>/dev/null) || NEW_CONTENT=""
+    ;;
 esac
+
+# Cursor's Write/Edit payload shape is not pinned; fall back across known fields.
+if [ -z "$NEW_CONTENT" ] && [ "$TOOL_NAME" != "apply_patch" ]; then
+  NEW_CONTENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.content // .tool_input.new_string // .tool_input.contents // empty' 2>/dev/null) || NEW_CONTENT=""
+fi
 
 [ -n "$NEW_CONTENT" ] || exit 0
 
@@ -301,10 +348,19 @@ fi
 # python3 must be present
 command -v python3 >/dev/null 2>&1 || exit 0
 
+# Plugin root: Claude Code / Grok / Codex set CLAUDE_PLUGIN_ROOT, Agent Plugins
+# clients set PLUGIN_ROOT, Cursor sets neither, so fall back to this script's
+# own location (<plugin>/hooks/pre-edit-deps.sh).
+PLUGIN_DIR="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+if [ -z "$PLUGIN_DIR" ]; then
+  PLUGIN_DIR=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || PLUGIN_DIR=""
+fi
+[ -n "$PLUGIN_DIR" ] || exit 0
+
 # ── Build JSON-RPC requests ───────────────────────────────────────────────────
 # CWD from hook input for projectPath
 CWD=""
-CWD=$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // empty' 2>/dev/null) || CWD=""
+CWD=$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // (.workspace_roots // [])[0] // empty' 2>/dev/null) || CWD=""
 
 # Build dependency array for verify_coordinates (all coords, GA or versioned)
 DEPS_VERIFY=""
@@ -509,7 +565,7 @@ SERVER_OUTPUT=""
 SERVER_OUTPUT=$(
   printf '%s\n' "$REQUESTS" | \
     env -u GITHUB_TOKEN \
-    "$TIMEOUT_CMD" 8 python3 "${CLAUDE_PLUGIN_ROOT}/server/server.py" 2>/dev/null
+    "$TIMEOUT_CMD" 8 python3 "${PLUGIN_DIR}/server/server.py" 2>/dev/null
 ) || SERVER_OUTPUT=""
 
 [ -n "$SERVER_OUTPUT" ] || exit 0
@@ -800,8 +856,17 @@ COMBINED_REASON=""
 COMBINED_REASON=$(jq -Rs '.' "$REASONS_FILE" 2>/dev/null) || COMBINED_REASON='""'
 
 # Emit hook decision JSON (single printf, nothing else to stdout)
-printf '%s' "$(jq -c -n \
-  --arg decision "$DECISION" \
-  --argjson reason "$COMBINED_REASON" \
-  '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":$decision,"permissionDecisionReason":$reason}}' \
-  2>/dev/null)"
+if [ "$HOOK_EVENT" = "preToolUse" ]; then
+  # Cursor hook reply shape
+  printf '%s' "$(jq -c -n \
+    --arg decision "$DECISION" \
+    --argjson reason "$COMBINED_REASON" \
+    '{"permission":$decision,"user_message":$reason,"agent_message":$reason}' \
+    2>/dev/null)"
+else
+  printf '%s' "$(jq -c -n \
+    --arg decision "$DECISION" \
+    --argjson reason "$COMBINED_REASON" \
+    '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":$decision,"permissionDecisionReason":$reason}}' \
+    2>/dev/null)"
+fi

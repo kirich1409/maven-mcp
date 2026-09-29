@@ -1,0 +1,28 @@
+{
+  "name": "maven-mcp",
+  "version": "1.0.0",
+  "description": "Maven dependency intelligence — dependency updates, vulnerability and license scanning, transitive dependency graphs, version compatibility checks, artifact search, and version-catalog management, exposed as skills and an MCP server.",
+  "author": {
+    "name": "kirich1409"
+  },
+  "homepage": "https://github.com/kirich1409/maven-mcp",
+  "repository": "https://github.com/kirich1409/maven-mcp",
+  "license": "MIT",
+  "keywords": [
+    "maven",
+    "gradle",
+    "dependencies",
+    "android",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./mcp.json",
+  "interface": {
+    "displayName": "Maven MCP",
+    "shortDescription": "Maven and Gradle dependency intelligence",
+    "longDescription": "Maven dependency intelligence — dependency updates, vulnerability and license scanning, transitive dependency graphs, version compatibility checks, artifact search, and version-catalog management, exposed as skills and an MCP server.",
+    "developerName": "kirich1409",
+    "category": "Coding"
+  }
+}

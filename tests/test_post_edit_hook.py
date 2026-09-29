@@ -283,5 +283,29 @@ class TestPostEditGrokEnvelope(unittest.TestCase):
         self.assertEqual(out.get("systemMessage"), _REMINDER_MSG)
 
 
+
+@_require_jq()
+class TestPostEditCodexApplyPatch(unittest.TestCase):
+    """Codex apply_patch envelopes reach the same reminder gate."""
+
+    def test_build_file_in_patch_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: app/build.gradle.kts\n@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_non_build_file_in_patch_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n*** Add File: src/Main.kt\n"
+            "+val s = \"com.example:lib:1.0\"\n*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
