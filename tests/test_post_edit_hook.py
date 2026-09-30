@@ -297,6 +297,18 @@ class TestPostEditCodexApplyPatch(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
 
+    def test_coordinates_only_in_second_build_file_emit_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle.kts\n@@\n+// formatting only\n"
+            "*** Update File: gradle/libs.versions.toml\n@@\n"
+            "+lib = { module = \"com.example:lib\", version = \"1.0\" }\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
     def test_non_build_file_in_patch_no_reminder(self):
         patch = (
             "*** Begin Patch\n*** Add File: src/Main.kt\n"

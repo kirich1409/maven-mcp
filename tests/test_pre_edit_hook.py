@@ -1766,6 +1766,38 @@ class CodexApplyPatchTest(unittest.TestCase):
         decision = _parse_decision(proc.stdout)
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_every_build_file_in_patch_is_verified(self):
+        # A dependency added to the second build file must not bypass the check.
+        _make_fixture(self.tmp, {
+            1: {"results": [
+                _verify_entry("exists", "com.example", "lib"),
+                _verify_entry("absent", "com.fake", "nonexistent", hallucination=True),
+            ]},
+        })
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: app/build.gradle.kts\n"
+            "@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n"
+            "*** Update File: core/pom.xml\n"
+            "@@\n"
+            "+<dependency>\n"
+            "+  <groupId>com.fake</groupId>\n"
+            "+  <artifactId>nonexistent</artifactId>\n"
+            "+  <version>9.9</version>\n"
+            "+</dependency>\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.example", "lib"), ("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_patch_without_build_file_skips_server(self):
         _make_fixture(self.tmp, _HALLUCINATED)
         patch = (

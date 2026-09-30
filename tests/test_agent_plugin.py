@@ -1,9 +1,13 @@
 """Pin the non-Claude plugin manifests shipped from plugin/.
 
-- plugin/plugin.json + plugin/mcp.json — Agent Plugins 1.0 portable format
-  (closed manifest schema, ${PLUGIN_ROOT} expansion only in args/env/cwd).
-- plugin/.codex-plugin/plugin.json — Codex native manifest.
+- plugin/.codex-plugin/plugin.json — Codex native manifest (hooks from hooks.json).
 - plugin/.cursor-plugin/plugin.json + plugin/hooks/cursor-hooks.json — Cursor.
+- plugin/mcp.json — MCP config in the Agent Plugins 1.0 shape, read by Codex and
+  Cursor (${PLUGIN_ROOT} expansion only in args/env/cwd).
+
+There is deliberately NO root plugin/plugin.json (Agent Plugins manifest):
+Codex then loads the package through its Agent Plugins loader, ignores
+.codex-plugin/plugin.json and silently drops every hook (openai/codex#39895).
 
 The Claude Code / Grok Build files (.claude-plugin/, .mcp.json, hooks.json)
 stay the reference; these tests keep the other formats from drifting away
@@ -20,15 +24,7 @@ import unittest
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN_DIR = os.path.normpath(os.path.join(_TESTS_DIR, "..", "plugin"))
 
-_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
 _MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
-_ALLOWED_PLUGIN_KEYS = {
-    "$schema", "name", "version", "description", "author", "homepage",
-    "repository", "license", "keywords", "extensions",
-}
-# Agent Plugins 1.0: 1-64 chars, lowercase alnum / hyphen / period, alnum at
-# both ends, no consecutive hyphens or periods.
-_PLUGIN_NAME_RE = re.compile(r"^(?!.*[-.]{2})[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$")
 # Agent Skills: lowercase alnum and single hyphens, max 64 chars.
 _SKILL_NAME_RE = re.compile(r"^(?!.*--)[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 
@@ -58,27 +54,15 @@ def _skill_frontmatter(path):
     return fields
 
 
-class AgentPluginManifestTest(unittest.TestCase):
-    def test_plugin_json_is_closed_schema(self):
-        data = _load("plugin.json")
-        self.assertEqual(data["$schema"], _PLUGIN_SCHEMA)
-        self.assertLessEqual(set(data), _ALLOWED_PLUGIN_KEYS)
-        self.assertRegex(data["name"], _PLUGIN_NAME_RE)
-
-    def test_plugin_json_matches_claude_manifest(self):
-        portable = _load("plugin.json")
-        claude = _load(".claude-plugin/plugin.json")
-        for key in ("name", "version", "homepage", "repository", "license"):
-            with self.subTest(key=key):
-                self.assertEqual(portable[key], claude[key])
+class McpJsonTest(unittest.TestCase):
+    def test_no_root_agent_plugins_manifest(self):
+        # A root plugin.json makes Codex ignore .codex-plugin/plugin.json and
+        # disable all hooks (openai/codex#39895). Re-add it only once fixed.
+        self.assertFalse(os.path.exists(os.path.join(_PLUGIN_DIR, "plugin.json")))
 
     def test_mcp_json_shape(self):
         mcp = _load("mcp.json")
         self.assertEqual(mcp["$schema"], _MCP_SCHEMA)
-        self.assertEqual(
-            mcp["$schema"].split("/")[-2], _load("plugin.json")["$schema"].split("/")[-2],
-            "mcp.json and plugin.json must share the schema version",
-        )
         self.assertTrue(mcp["mcpServers"])
         for server_id, cfg in mcp["mcpServers"].items():
             with self.subTest(server=server_id):

@@ -12,10 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 REPO_URL = "https://github.com/kirich1409/maven-mcp"
 OLD_SLUG = "krozov-" + "ai-tools"
 
-# Manifests of the other plugin formats shipped from plugin/ (Agent Plugins,
-# Codex, Cursor); each must carry the same version and repository URL.
+# Manifests of the other plugin formats shipped from plugin/ (Codex, Cursor);
+# each must carry the same version and repository URL.
 EXTRA_MANIFESTS = (
-    "plugin/plugin.json",
     "plugin/.codex-plugin/plugin.json",
     "plugin/.cursor-plugin/plugin.json",
 )
@@ -25,7 +24,6 @@ TRACKED = (
     "CLAUDE.md",
     "AGENTS.md",
     "plugin/.claude-plugin/plugin.json",
-    "plugin/plugin.json",
     "plugin/.codex-plugin/plugin.json",
     "plugin/.cursor-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
