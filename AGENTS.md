@@ -26,6 +26,10 @@ python3 -m unittest discover -s tests -v    # Verbose
 python3 -m compileall plugin/server         # Zero-dep syntax gate
 ```
 
+`tests/test_wheel.py` builds a wheel, so that interpreter needs hatchling
+(`pip install 'hatchling>=1.26.3'`). CI installs it in `python-tests` and
+`coverage`. The server runtime stays dependency-free.
+
 Run a single test module:
 
 ```bash
@@ -365,5 +369,5 @@ Fires before `Edit`/`Write`/`MultiEdit` on build files; extracts coordinates fro
 - No XML parser dependency — all XML parsing is regex-based.
 - Network seam is `urllib.request.urlopen`; tests mock it with `unittest.mock.patch("urllib.request.urlopen", ...)`.
 - Tests live dev-only at `tests/` (outside `plugin/`, so they are not shipped). They import `server` via a `__file__`-resolved `sys.path` shim in `tests/_helpers.py`; filesystem-touching parsers are exercised against real files written into a `TemporaryDirectory`. `tests/test_http_transport.py` covers the HTTP transport end-to-end over loopback (`("127.0.0.1", 0)` on a daemon thread).
-- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/.cursor-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only).
+- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/.cursor-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only). The wheel's `force-include` puts `compat-matrices.json` beside the installed `server.py`; `tests/test_wheel.py` builds that wheel.
 - `import server` is side-effect-free (the `if __name__ == "__main__": main()` guard at the tail).

@@ -1,11 +1,16 @@
 [build-system]
-requires = ["hatchling"]
+# 1.26.3 is the first hatchling that writes a SPDX license expression and still
+# installs on the 3.9 CI job. Newer 3.10+ releases resolve on every other interpreter.
+requires = ["hatchling>=1.26.3"]
 build-backend = "hatchling.build"
 
 [project]
 name = "maven-mcp"
 version = "1.0.0"
 description = "MCP server for Maven and Gradle dependency intelligence"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = []
 
@@ -17,6 +22,13 @@ only-include = ["plugin/server/server.py"]
 
 [tool.hatch.build.targets.wheel.sources]
 "plugin/server" = ""
+
+# The loader opens compat-matrices.json beside the installed server module
+# (dirname of server.py). only-include ships the module; this map puts the
+# matrix in that same directory. A wheel of server.py alone breaks
+# check_version_compatibility for every uvx install.
+[tool.hatch.build.targets.wheel.force-include]
+"plugin/server/compat-matrices.json" = "compat-matrices.json"
 
 [tool.coverage.run]
 # Repo-root-relative: CI invokes `coverage run --rcfile=pyproject.toml`
