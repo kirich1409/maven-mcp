@@ -37,7 +37,7 @@ python_version = "3.9"
 # NOTE: unlike ruff's [tool.ruff.lint.per-file-ignores] below (resolved relative to
 # THIS file's directory, verified empirically), mypy resolves `files`/`mypy_path`
 # relative to the invocation CWD. CI runs mypy from the repo root (matching
-# CLAUDE.md), so these are repo-root-relative.
+# AGENTS.md), so these are repo-root-relative.
 files = ["plugin/server", "tests"]
 mypy_path = ["plugin/server"]
 warn_unused_configs = true

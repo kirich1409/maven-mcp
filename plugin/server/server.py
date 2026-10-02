@@ -5025,7 +5025,7 @@ def _gradle_plugin_marker_plugin_id(group_id: str, artifact_id: str) -> Optional
     """Returns the plugin id if (group_id, artifact_id) is a Gradle plugin marker
     coordinate (`{pluginId}:{pluginId}.gradle.plugin`), else None. Stricter than the
     `.gradle.plugin`-suffix-only check used for repo-scope routing (_repos_for) —
-    that check stays suffix-only by design (see CLAUDE.md); this one additionally
+    that check stays suffix-only by design (see AGENTS.md); this one additionally
     requires group_id == pluginId, which is the actual marker shape, since it
     drives POM-dependency resolution, not just repo routing."""
     suffix = ".gradle.plugin"
@@ -7750,7 +7750,7 @@ def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
     `includeGroupByRegex(...)`, and the `exclusiveContent { forRepository { maven
     {...} | google() | mavenCentral() }; filter {...} }` form, are both captured
     onto the entry as an optional `group_filters` list (#320 — see *Repository
-    resolution* in CLAUDE.md). Deduped by URL, declaration order preserved."""
+    resolution* in AGENTS.md). Deduped by URL, declaration order preserved."""
     entries: List[Dict[str, Any]] = []
 
     # exclusiveContent is parsed first and its span is excised before the bare
@@ -7930,9 +7930,9 @@ def _parse_maven_active_profile_repos(
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     """Extract `<repositories>`/`<pluginRepositories>` declared inside
     `<profiles><profile>` blocks whose `<activation><activeByDefault>true</...>`
-    is set (#319). Only `activeByDefault` is evaluated — property/JDK/OS
-    activation conditions are a much larger scope and are deferred (see
-    CLAUDE.md Documented limitations)."""
+    is set (#319). Only `activeByDefault` is evaluated for POM profiles —
+    property, JDK, and OS activation are not (see *Maven parent-POM and
+    profile repository inheritance* in AGENTS.md)."""
     xml = _strip_xml_comments(pom_xml)
     profiles_m = re.search(r"<profiles>([\s\S]*?)</profiles>", xml)
     if not profiles_m:

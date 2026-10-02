@@ -28,6 +28,7 @@ TRACKED = (
     "plugin/.cursor-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     "docs/plans/maven-mcp-1-0/plan.md",
+    "docs/configuration.md",
 )
 
 
