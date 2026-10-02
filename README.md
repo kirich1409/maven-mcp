@@ -224,4 +224,4 @@ The implementation contract for coding agents is [AGENTS.md](AGENTS.md).
 
 ## License
 
-MIT, as declared in `plugin/.claude-plugin/plugin.json`.
+MIT. See [LICENSE](LICENSE).
