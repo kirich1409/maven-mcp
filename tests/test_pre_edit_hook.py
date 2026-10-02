@@ -1866,6 +1866,62 @@ class CodexApplyPatchTest(unittest.TestCase):
             {("com.example", "lib")},
         )
 
+    def test_same_source_renames_stay_in_their_own_section(self):
+        # Two hunks may share a source path. Only the one whose Move to is a
+        # build file is checked, and only its own additions.
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.other:skipped:1.0\")\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_crlf_rename_into_build_file_denies(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\r\n"
+            "*** Update File: dependency.template\r\n"
+            "*** Move to: build.gradle\r\n"
+            "@@\r\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\r\n"
+            "*** End Patch\r\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_move_to_trailing_space_still_classifies_destination(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle \n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_rename_to_non_build_path_skips_guard(self):
         _make_fixture(self.tmp, _HALLUCINATED)
         patch = (

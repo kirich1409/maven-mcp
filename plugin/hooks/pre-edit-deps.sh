@@ -58,31 +58,40 @@ if [ "$TOOL_NAME" = "apply_patch" ]; then
   [ -n "$PATCH_TEXT" ] || exit 0
 fi
 
-# Prints the "+" lines (prefix stripped) of one file's section in $PATCH_TEXT.
-# $1 is the Add/Update source header, not a Move to destination.
+# Prints the "+" lines (prefix stripped) of Add/Update section $1.
+# $1 is that section's 1-based index. Two hunks may share a source path;
+# matching the path would merge their additions.
 _patch_section_lines() {
-  printf '%s\n' "$PATCH_TEXT" | awk -v target="$1" '
-    /^\*\*\* (Add|Update|Delete) File: / {
-      p = $0; sub(/^\*\*\* (Add|Update|Delete) File: /, "", p); inside = (p == target); next
+  printf '%s\n' "$PATCH_TEXT" | awk -v nth="$1" '
+    /^\*\*\* (Add|Update) File: / { n++; inside = (n == nth); next }
+    /^\*\*\* (Delete File:|End Patch)/ { inside = 0; next }
+    inside && /^\+/ {
+      line = substr($0, 2)
+      sub(/\r$/, "", line)
+      print line
     }
-    /^\*\*\* End Patch/ { inside = 0; next }
-    inside && /^\+/ { print substr($0, 2) }
   ' 2>/dev/null
 }
 
-# One row per Add/Update section: source path, TAB, effective path.
-# *** Move to: is the effective path (Codex rename). Without it, both match.
+# One row per Add/Update section: index, TAB, effective path.
+# *** Move to: is the effective path (Codex rename). Trailing whitespace is
+# dropped so it matches Codex trim_end; otherwise basename misses the file.
 _patch_effective_rows() {
   printf '%s\n' "$PATCH_TEXT" | awk '
+    function trim_end(s) {
+      sub(/[ \t\r]+$/, "", s)
+      return s
+    }
     function flush() {
-      if (src != "") print src "\t" eff
+      if (src != "") print n "\t" eff
       src = ""
     }
     /^\*\*\* (Add|Update) File: / {
       flush()
+      n++
       src = $0
       sub(/^\*\*\* (Add|Update) File: /, "", src)
-      sub(/\r$/, "", src)
+      src = trim_end(src)
       eff = src
       next
     }
@@ -90,7 +99,7 @@ _patch_effective_rows() {
       if (src != "") {
         eff = $0
         sub(/^\*\*\* Move to: /, "", eff)
-        sub(/\r$/, "", eff)
+        eff = trim_end(eff)
       }
       next
     }
@@ -102,12 +111,12 @@ _patch_effective_rows() {
 FILE_PATH=""
 PATCH_BUILD_PATHS=""
 if [ -n "$PATCH_TEXT" ]; then
-  while IFS="$(printf '\t')" read -r _patch_src _patch_eff; do
+  while IFS="$(printf '\t')" read -r _patch_idx _patch_eff; do
     [ -n "${_patch_eff:-}" ] || continue
     case "$(basename "$_patch_eff" 2>/dev/null)" in
       build.gradle|build.gradle.kts|settings.gradle|settings.gradle.kts|pom.xml|*.versions.toml)
         # Newline stays outside $(...): command substitution strips trailing newlines.
-        PATCH_BUILD_PATHS="${PATCH_BUILD_PATHS}$(printf '%s\t%s' "$_patch_src" "$_patch_eff")
+        PATCH_BUILD_PATHS="${PATCH_BUILD_PATHS}$(printf '%s\t%s' "$_patch_idx" "$_patch_eff")
 "
         [ -n "$FILE_PATH" ] || FILE_PATH="$_patch_eff"
         ;;
@@ -145,9 +154,9 @@ case "$TOOL_NAME" in
   apply_patch)
     # "+" lines of every build-file section; per-file extraction happens below,
     # the combined text feeds the compatibility check (id:3).
-    while IFS="$(printf '\t')" read -r _patch_src _patch_path; do
-      [ -n "${_patch_src:-}" ] || continue
-      _section=$(_patch_section_lines "$_patch_src") || _section=""
+    while IFS="$(printf '\t')" read -r _patch_idx _patch_path; do
+      [ -n "${_patch_idx:-}" ] || continue
+      _section=$(_patch_section_lines "$_patch_idx") || _section=""
       if [ -n "$_section" ]; then
         NEW_CONTENT="${NEW_CONTENT}${_section}
 "
@@ -343,10 +352,10 @@ if [ -n "$COORDS_FILE" ]; then
     # Codex apply_patch: each build file with its own basename and "+" lines.
     # The combined text is restored afterwards for the compatibility check.
     _ALL_NEW_CONTENT="$NEW_CONTENT"
-    while IFS="$(printf '\t')" read -r _patch_src _patch_path; do
+    while IFS="$(printf '\t')" read -r _patch_idx _patch_path; do
       [ -n "${_patch_path:-}" ] || continue
       BASENAME=$(basename "$_patch_path" 2>/dev/null) || continue
-      NEW_CONTENT=$(_patch_section_lines "$_patch_src") || NEW_CONTENT=""
+      NEW_CONTENT=$(_patch_section_lines "$_patch_idx") || NEW_CONTENT=""
       [ -n "$NEW_CONTENT" ] || continue
       _extract_coords
     done <<EOF_PATCH_EXTRACT

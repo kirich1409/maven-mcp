@@ -347,6 +347,49 @@ class TestPostEditCodexApplyPatch(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIsNone(_parse_stdout(proc.stdout))
 
+    def test_same_source_comment_only_rename_ignores_other_hunk(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+// formatting only\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+    def test_crlf_rename_into_pom_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\r\n"
+            "*** Update File: dependency.template\r\n"
+            "*** Move to: core/pom.xml\r\n"
+            "@@\r\n"
+            "+<groupId>com.example</groupId>\r\n"
+            "*** End Patch\r\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_move_to_trailing_space_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle \n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
     def test_rename_to_non_build_path_no_reminder(self):
         patch = (
             "*** Begin Patch\n"
