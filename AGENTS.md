@@ -50,6 +50,30 @@ coverage run --rcfile=pyproject.toml -m unittest discover -s tests
 coverage report --rcfile=pyproject.toml   # fail_under=75, ~90% measured
 ```
 
+## Work and releases
+
+Ordinary changes keep the version already on `main`. A release is a separate cut, and only when the user asks for one. `1.0.0` is published: git tag `v1.0.0` is `02fa8f5` on `main`, and PyPI project `maven-mcp` serves that version. Do not rebuild, retag, or re-upload it.
+
+### Day-to-day
+
+- Issues belong in `kirich1409/maven-mcp`.
+- Branch from `main` as `feature/…`, `fix/…`, or `chore/…` (kebab-case English). `main` rejects a direct push: rulesets Main Protect (no deletion, no non-fast-forward, linear history) and Pull Request Only.
+- Open a pull request. Required checks are `python-tests (3.9)`, `python-tests (3.13)`, `ruff`, and `mypy`. Coverage runs in CI and is not required. Review count is 0; review threads must be resolved; Copilot reviews on push. Squash-merge and delete the branch. Merge and rebase are allowed; squash is the history this repo keeps.
+- When the user asks for a PR, push the branch, open it, wait until the required checks are green, and squash-merge. Do not leave the PR open.
+- Leave `SERVER_VERSION`, `USER_AGENT`, the three plugin manifests, `.claude-plugin/marketplace.json`, and `[project].version` on the current release until the release cut below. `python3 scripts/check-versions.py` must exit 0.
+- A new runtime dependency needs an explicit yes. hatchling stays a build-system dependency. The wheel's `force-include` keeps `compat-matrices.json` beside the installed `server.py`.
+- Do not commit `.grok-report/`, build artifacts, or credentials.
+
+### Cutting a release
+
+1. One PR sets a new `X.Y.Z` in every place `scripts/check-versions.py` compares, then lands on `main` with the required checks green. Patch for a fix, minor for compatible behavior. `python3 scripts/check-versions.py` exits 0 on that commit.
+2. `tests/test_wheel.py` still passes: the wheel contains `server.py` and `compat-matrices.json` at install root, `License-Expression: MIT`, the README text, `Requires-Python: >=3.9`, and no `Requires-Dist`. PyPI JSON then reports `license_expression` `MIT` and leaves legacy `license` null.
+3. Tag that merge commit `vX.Y.Z` and create the GitHub Release on the same commit. The monorepo-era name `maven-mcp--vX.Y.Z` is retired. Do not move a tag that already points at a published commit.
+4. From a clean checkout of that tag, run `uv build --sdist --wheel` and `uv publish`. Treat the release as published only after `https://pypi.org/pypi/maven-mcp/X.Y.Z/json` returns HTTP 200 with that version, `license_expression` MIT, and `requires_python` `>=3.9`. Release notes may name `uvx maven-mcp` only after that response.
+5. Upload with `UV_PUBLISH_TOKEN` or a PyPI trusted publisher already registered for `kirich1409/maven-mcp`. The first upload of a project that does not exist yet needs an account-scoped token. Do not commit, log, or paste the token. There is no publish workflow in this repo. A version already on PyPI cannot be replaced; a bad wheel is the next version number.
+
+Marketplace installs read `main` and do not wait for PyPI. `uvx maven-mcp` installs the PyPI release.
+
 ## Architecture
 
 `server.py` is one file organised into logical sections (no package tree):
