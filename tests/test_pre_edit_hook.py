@@ -1821,6 +1821,66 @@ class CodexApplyPatchTest(unittest.TestCase):
         decision = _parse_decision(proc.stdout)
         self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_rename_into_build_file_denies_added_coordinate(self):
+        # Codex rename: source is not a build file; Move to is. Additions stay
+        # on the update section and must be checked under the destination name.
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** Update File: notes.txt\n"
+            "+implementation(\"com.other:skipped:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_rename_into_build_file_clean_coordinate_allows(self):
+        _make_fixture(self.tmp, {
+            1: {"results": [_verify_entry("exists", "com.example", "lib")]},
+        })
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: app/build.gradle.kts\n"
+            "@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.example", "lib")},
+        )
+
+    def test_rename_to_non_build_path_skips_guard(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(_stub_args(self.tmp), [])
+
 
 @_require_jq_and_timeout()
 class CursorEnvelopeTest(unittest.TestCase):

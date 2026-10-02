@@ -318,6 +318,48 @@ class TestPostEditCodexApplyPatch(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIsNone(_parse_stdout(proc.stdout))
 
+    def test_rename_into_build_file_emits_reminder(self):
+        # Destination basename selects the matcher; "+" lines stay on the
+        # update section (pom tags would not match a non-pom source).
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: core/pom.xml\n"
+            "@@\n"
+            "+<dependency><groupId>com.example</groupId>"
+            "<artifactId>lib</artifactId></dependency>\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_rename_into_build_file_without_coordinates_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+// formatting only\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+    def test_rename_to_non_build_path_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
 
 if __name__ == "__main__":
     unittest.main()
