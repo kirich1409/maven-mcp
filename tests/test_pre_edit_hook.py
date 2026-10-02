@@ -1715,5 +1715,307 @@ class GrokEnvelopeTest(unittest.TestCase):
         self.assertIn("com.fake", hook_out["permissionDecisionReason"])
 
 
+
+def _codex_patch_stdin(patch):
+    """Codex PreToolUse envelope for apply_patch (patch text in tool_input.command)."""
+    return {"tool_name": "apply_patch", "tool_input": {"command": patch}}
+
+
+def _cursor_stdin(filename, content, tool="Write"):
+    """Cursor preToolUse envelope (camelCase event name, workspace_roots)."""
+    return {
+        "hook_event_name": "preToolUse",
+        "tool_name": tool,
+        "tool_input": {"file_path": f"/project/{filename}", "content": content},
+        "workspace_roots": ["/project"],
+    }
+
+
+_HALLUCINATED = {
+    1: {"results": [_verify_entry("absent", "com.fake", "nonexistent", hallucination=True)]},
+}
+
+
+@_require_jq_and_timeout()
+class CodexApplyPatchTest(unittest.TestCase):
+    """Codex apply_patch: build file picked from patch headers, "+" lines checked."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_added_lines_of_build_file_are_verified(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: README.md\n"
+            "+implementation(\"com.readme:ignored:1.0\")\n"
+            "*** Update File: app/build.gradle.kts\n"
+            "@@\n"
+            "-    implementation(\"com.removed:old:1.0\")\n"
+            "+    implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        groups = {d["groupId"] for d in deps}
+        self.assertEqual(groups, {"com.fake"})
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_every_build_file_in_patch_is_verified(self):
+        # A dependency added to the second build file must not bypass the check.
+        _make_fixture(self.tmp, {
+            1: {"results": [
+                _verify_entry("exists", "com.example", "lib"),
+                _verify_entry("absent", "com.fake", "nonexistent", hallucination=True),
+            ]},
+        })
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: app/build.gradle.kts\n"
+            "@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n"
+            "*** Update File: core/pom.xml\n"
+            "@@\n"
+            "+<dependency>\n"
+            "+  <groupId>com.fake</groupId>\n"
+            "+  <artifactId>nonexistent</artifactId>\n"
+            "+  <version>9.9</version>\n"
+            "+</dependency>\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.example", "lib"), ("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_patch_without_build_file_skips_server(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n*** Add File: src/Main.kt\n"
+            "+val s = \"com.fake:nonexistent:9.9\"\n*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(_stub_args(self.tmp), [])
+
+    def test_array_command_form(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n*** Add File: build.gradle\n"
+            "+implementation 'com.fake:nonexistent:9.9'\n*** End Patch\n"
+        )
+        proc = _run_hook(
+            self.tmp, {"tool_name": "apply_patch", "tool_input": {"command": ["apply_patch", patch]}}
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_rename_into_build_file_denies_added_coordinate(self):
+        # Codex rename: source is not a build file; Move to is. Additions stay
+        # on the update section and must be checked under the destination name.
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** Update File: notes.txt\n"
+            "+implementation(\"com.other:skipped:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_rename_into_build_file_clean_coordinate_allows(self):
+        _make_fixture(self.tmp, {
+            1: {"results": [_verify_entry("exists", "com.example", "lib")]},
+        })
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: app/build.gradle.kts\n"
+            "@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.example", "lib")},
+        )
+
+    def test_same_source_renames_stay_in_their_own_section(self):
+        # Two hunks may share a source path. Only the one whose Move to is a
+        # build file is checked, and only its own additions.
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.other:skipped:1.0\")\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        deps = _stub_args(self.tmp)[0]["arguments"]["dependencies"]
+        self.assertEqual(
+            {(d["groupId"], d["artifactId"]) for d in deps},
+            {("com.fake", "nonexistent")},
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_crlf_rename_into_build_file_denies(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\r\n"
+            "*** Update File: dependency.template\r\n"
+            "*** Move to: build.gradle\r\n"
+            "@@\r\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\r\n"
+            "*** End Patch\r\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_move_to_trailing_space_still_classifies_destination(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle \n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_rename_to_non_build_path_skips_guard(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.fake:nonexistent:9.9\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook(self.tmp, _codex_patch_stdin(patch))
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(_stub_args(self.tmp), [])
+
+
+@_require_jq_and_timeout()
+class CursorEnvelopeTest(unittest.TestCase):
+    """Cursor preToolUse gets a {"permission": ...} reply, not hookSpecificOutput."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_hallucinated_coordinate_denies_in_cursor_shape(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        proc = _run_hook(
+            self.tmp,
+            _cursor_stdin("build.gradle.kts", 'implementation("com.fake:nonexistent:9.9")\n'),
+        )
+        decision = _parse_decision(proc.stdout)
+        self.assertEqual(decision["permission"], "deny")
+        self.assertIn("com.fake", decision["user_message"])
+        self.assertEqual(decision["agent_message"], decision["user_message"])
+        self.assertNotIn("hookSpecificOutput", decision)
+        args = _stub_args(self.tmp)
+        self.assertEqual(args[0]["arguments"]["projectPath"], "/project")
+
+    def test_clean_coordinate_emits_nothing(self):
+        _make_fixture(self.tmp, {
+            1: {"results": [_verify_entry("exists", "com.example", "lib")]},
+        })
+        proc = _run_hook(
+            self.tmp, _cursor_stdin("build.gradle", 'implementation "com.example:lib:1.0"\n')
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+        self.assertGreaterEqual(len(_stub_args(self.tmp)), 1)
+
+
+@_require_jq_and_timeout()
+class PluginRootResolutionTest(unittest.TestCase):
+    """The server is found without CLAUDE_PLUGIN_ROOT (Agent Plugins, Cursor)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _env_without_claude_root(self, **extra):
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT")}
+        env.update(extra)
+        return env
+
+    def _run(self, script, env):
+        return subprocess.run(
+            ["bash", script],
+            input=json.dumps(_edit_stdin("build.gradle", 'implementation "com.fake:nonexistent:9.9"\n')).encode(),
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_plugin_root_env(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        proc = self._run(_HOOK_PATH, self._env_without_claude_root(PLUGIN_ROOT=self.tmp))
+        self.assertEqual(
+            _parse_decision(proc.stdout)["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+
+    def test_script_location_fallback(self):
+        _make_fixture(self.tmp, _HALLUCINATED)
+        hooks_dir = os.path.join(self.tmp, "hooks")
+        os.makedirs(hooks_dir)
+        script = os.path.join(hooks_dir, "pre-edit-deps.sh")
+        shutil.copy(_HOOK_PATH, script)
+        proc = self._run(script, self._env_without_claude_root())
+        self.assertEqual(
+            _parse_decision(proc.stdout)["hookSpecificOutput"]["permissionDecision"], "deny"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

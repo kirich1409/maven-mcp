@@ -247,9 +247,23 @@ A write-time **anti-slopsquatting** primitive: batch existence check plus a fuzz
 
 **Suggestion source = Maven Central Solr only** → a recall limit for androidx / Google-Maven / Gradle-plugin-marker coordinates (no suggestion backend for those scopes; documented, relates to #295). Existence checking still reuses the project-first resolution layer (declared repos are honored); only the did-you-mean fallback is Central-only.
 
+## Plugin packaging (three manifests, one `plugin/`)
+
+`plugin/` is one directory shipped in three formats that share `skills/`, `server/`, `mcp.json`, and `hooks/*.sh`:
+
+- **Claude Code / Grok Build** — `.claude-plugin/plugin.json`, `.mcp.json` (`${CLAUDE_PLUGIN_ROOT}`), `hooks/hooks.json`. Reference format; never remove it in favor of the others.
+- **Codex** — `.codex-plugin/plugin.json` pointing at `./skills/`, `./hooks/hooks.json` (Codex reads the Claude hook format and sets `CLAUDE_PLUGIN_ROOT`), and `./mcp.json`. Edits arrive as `apply_patch` with the patch text in `tool_input.command`; Codex does not yet enforce `deny` for `apply_patch` and may not surface the reason (openai/codex#27833), so there the guard runs but does not block and can go unnoticed.
+- **Cursor** — `.cursor-plugin/plugin.json` (no unknown fields such as `displayName`; Cursor's validation rejects them) + `hooks/cursor-hooks.json` (`version: 1`, `preToolUse`, relative `./hooks/...` commands: Cursor has no plugin-root variable). MCP comes from the root `mcp.json`.
+
+**No root `plugin.json` (Agent Plugins 1.0 manifest), on purpose.** With one present, Codex loads the package through its Agent Plugins loader, ignores `.codex-plugin/plugin.json`, and silently drops every hook (openai/codex#39895). `tests/test_agent_plugin.py` fails if it reappears; add it back only once that issue is fixed. `mcp.json` already has the Agent Plugins 1.0 shape (`$schema`, `type: "stdio"`, `${PLUGIN_ROOT}` in `args`).
+
+All server entries use the id `maven-mcp` so a client reading two formats sees one server. `scripts/check-versions.py` pins name/version/homepage/repository across all three; `tests/test_agent_plugin.py` pins the rest (no root `plugin.json`, `.mcp.json` ↔ `mcp.json` parity, relative paths, Agent Skills frontmatter, and a launch of the server exactly as `mcp.json` describes).
+
+**Hook scripts are multi-client.** `pre-edit-deps.sh` / `post-edit-deps.sh` accept Claude (`tool_name`/`tool_input`), Grok (`toolName`/`toolInput`), Cursor (`hook_event_name: "preToolUse"`, `workspace_roots`) and Codex (`apply_patch`: every build file in the `*** Add/Update File:` headers is checked, each with its own basename rules and its own `+` lines; `pre-edit-deps.sh` runs `_extract_coords` once per section). Cursor gets `{"permission", "user_message", "agent_message"}` back; everyone else gets `hookSpecificOutput`. The server path is `${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-<script dir>/..}}`. The tool gate keeps `Edit|Write|MultiEdit|search_replace|write) ;;` as its first arm (pinned by `tests/test_hooks_json.py`) and `apply_patch) ;;` as its second arm; `hooks.json` matchers end in `|apply_patch`.
+
 ## Hooks
 
-These hooks ship with the Claude Code plugin bundle (`plugin/hooks/`) and are not Cursor hooks.
+These hooks ship in `plugin/hooks/` and are wired for Claude Code / Grok Build (`hooks.json`), Codex (same `hooks.json`), and Cursor (`cursor-hooks.json`); see *Plugin packaging* above.
 
 ### `pre-edit-deps.sh` (PreToolUse write-time guard)
 
@@ -305,5 +319,5 @@ Fires before `Edit`/`Write`/`MultiEdit` on build files; extracts coordinates fro
 - No XML parser dependency — all XML parsing is regex-based.
 - Network seam is `urllib.request.urlopen`; tests mock it with `unittest.mock.patch("urllib.request.urlopen", ...)`.
 - Tests live dev-only at `tests/` (outside `plugin/`, so they are not shipped). They import `server` via a `__file__`-resolved `sys.path` shim in `tests/_helpers.py`; filesystem-touching parsers are exercised against real files written into a `TemporaryDirectory`. `tests/test_http_transport.py` covers the HTTP transport end-to-end over loopback (`("127.0.0.1", 0)` on a daemon thread).
-- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only).
+- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/.cursor-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only).
 - `import server` is side-effect-free (the `if __name__ == "__main__": main()` guard at the tail).

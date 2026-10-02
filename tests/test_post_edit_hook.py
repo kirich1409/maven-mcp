@@ -283,5 +283,126 @@ class TestPostEditGrokEnvelope(unittest.TestCase):
         self.assertEqual(out.get("systemMessage"), _REMINDER_MSG)
 
 
+
+@_require_jq()
+class TestPostEditCodexApplyPatch(unittest.TestCase):
+    """Codex apply_patch envelopes reach the same reminder gate."""
+
+    def test_build_file_in_patch_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\n*** Update File: app/build.gradle.kts\n@@\n"
+            "+    implementation(\"com.example:lib:1.0\")\n*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_coordinates_only_in_second_build_file_emit_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle.kts\n@@\n+// formatting only\n"
+            "*** Update File: gradle/libs.versions.toml\n@@\n"
+            "+lib = { module = \"com.example:lib\", version = \"1.0\" }\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_non_build_file_in_patch_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n*** Add File: src/Main.kt\n"
+            "+val s = \"com.example:lib:1.0\"\n*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+    def test_rename_into_build_file_emits_reminder(self):
+        # Destination basename selects the matcher; "+" lines stay on the
+        # update section (pom tags would not match a non-pom source).
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: core/pom.xml\n"
+            "@@\n"
+            "+<dependency><groupId>com.example</groupId>"
+            "<artifactId>lib</artifactId></dependency>\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_rename_into_build_file_without_coordinates_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+// formatting only\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+    def test_same_source_comment_only_rename_ignores_other_hunk(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle\n"
+            "@@\n"
+            "+// formatting only\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+    def test_crlf_rename_into_pom_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\r\n"
+            "*** Update File: dependency.template\r\n"
+            "*** Move to: core/pom.xml\r\n"
+            "@@\r\n"
+            "+<groupId>com.example</groupId>\r\n"
+            "*** End Patch\r\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_move_to_trailing_space_emits_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: dependency.template\n"
+            "*** Move to: build.gradle \n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("/check-deps", _parse_stdout(proc.stdout)["systemMessage"])
+
+    def test_rename_to_non_build_path_no_reminder(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: build.gradle\n"
+            "*** Move to: README.md\n"
+            "@@\n"
+            "+implementation(\"com.example:lib:1.0\")\n"
+            "*** End Patch\n"
+        )
+        proc = _run_hook({"tool_name": "apply_patch", "tool_input": {"command": patch}})
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(_parse_stdout(proc.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
