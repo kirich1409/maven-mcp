@@ -22,8 +22,8 @@ Call **`audit_project_dependencies`** with:
 - `includeVulnerabilities` — `true` by default; set `false` if the user only wants updates
 - `productionOnly` — `true` by default; set `false` to include test-scoped deps
 
-This single call resolves production dependencies through Gradle (`./gradlew dependencies` /
-`buildEnvironment`), merges build-file provenance (catalogs, module paths, plugin DSL), looks
+This single call resolves production dependencies through the project's Gradle wrapper
+(one invocation), merges build-file provenance (catalogs, module paths, plugin DSL), looks
 up latest versions against project repos, and optionally queries OSV. Requires `gradlew` at
 the project root.
 
@@ -113,7 +113,7 @@ Surface failures immediately. Attempt trivial fixes; otherwise revert that entry
 ## Constraints and non-goals
 
 - Major version bumps require explicit per-entry confirmation.
-- Direct production dependencies only — Gradle `dependencies` tree roots, not full transitive closure.
+- Direct production dependencies only — first-level Gradle resolutions, not the full transitive closure.
 - This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
 - Requires a Gradle wrapper (`gradlew`); Maven-only projects are out of scope for this scan path.
 
