@@ -102,10 +102,17 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
 
    **No `gradlew`.** Do not apply the `runtimeClasspath` predicate. Maven `compile` is
    stored as `implementation` and Maven `runtime` as `runtimeOnly`; neither is
-   `runtimeClasspath`, and those rows stay in the batch. Drop test scopes
-   (`testImplementation`, a name that starts with `test`, or matches `[a-z]Test`) and
-   `compileOnly` / `provided`. Do not print `implementation` or `runtimeOnly` as
-   `not closure-checked`.
+   `runtimeClasspath`, and a row with either usage stays in the batch. Still drop,
+   as `not closure-checked` and not as `none`:
+   - test scopes (`testImplementation`, a name that starts with `test`, or matches
+     `[a-z]Test`) and `compileOnly` / `provided`;
+   - `classpath`, including a row whose usages are only `classpath` (buildscript
+     classpath);
+   - a non-marker plugin coordinate that is only on `classpath` or plugin DSL
+     (`source.kind` `plugins-dsl` or `buildscript-classpath`, and no usage is
+     `implementation` or `runtimeOnly`).
+   Do not print `implementation` or `runtimeOnly` as `not closure-checked`. Do not
+   send a dropped row, and do not later call it `none`.
 
    If no library upgrade remains, do not call. Print the not-closure-checked lines
    only. An empty `upgrades` list is rejected; do not quote that error as `unknown`.
