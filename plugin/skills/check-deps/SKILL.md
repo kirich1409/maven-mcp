@@ -69,9 +69,106 @@ Present the full report and **ask before making any edits**. Default proposal: u
 catalog entries first. Ask separately for non-catalog groups. Flag every MAJOR upgrade
 explicitly.
 
+Do not call `compare_upgrade_closure` in step 1 or step 2. The audit stays direct.
+
+## Closure preview — after confirm, before any edit
+
+After the user confirms a concrete set, and before editing a build file, preview that
+batch once with **`compare_upgrade_closure`**. Do not diff graphs yourself. Do not union
+several deps.dev calls. The pre-edit and post-edit hooks do not call this tool.
+
+`fromVersion` is the audited current version. `toVersion` is the version the user just
+confirmed. Pass `projectPath` when the project is not the working directory. Leave
+`substitution` unset (`exact`) unless the user accepts the retry below.
+
+1. **Drop rows that this tool does not compare.** Print an explicit `not closure-checked`
+   line for each, name the coordinate, and do not send it. Do not later describe that
+   line as `advisory: none`. Drop a row when either is true:
+   - Gradle plugin marker: `artifactId` ends with `.gradle.plugin` and `groupId` is
+     that plugin id.
+   - Every `usages[].configuration` is `classpath`, or the row is not on a
+     configuration whose name ends with `RuntimeClasspath`. That includes
+     buildscript-only rows and a plugin coordinate that is not a marker and is not
+     on the runtime classpath (AGP and KGP included).
+
+2. **No `gradlew`** (Maven project, or Gradle files without a wrapper). Do not call
+   the tool once per coordinate. `auto` would select deps.dev.
+   - Exactly one library upgrade left: one call with `graphSource: "depsdev"`.
+   - More than one: say "a batch closure needs a Gradle wrapper" and do not call.
+   - If that audit row has `isPlatform` or `managedBy`, add the BOM caveat on this
+     call. The server has no `isPlatform` input; do not pass one. An empty
+     public-graph diff is not "no coordinate change" for a platform or a managed
+     row: deps.dev does not show versions that BOM moves elsewhere.
+
+3. **`gradlew` exists.** One call. Omit `graphSource` (`auto`). At most 20 library
+   upgrades. The server rejects a longer list; it does not truncate. If more than 20
+   remain, send majors first (`upgradeType` `major`), then rows whose direct audit
+   entry already has `vulnerabilities`. Say the rest were `not closure-checked`.
+   Do not loop.
+
+4. **Render that single result.** Lead with `advisory`, `graphSource`, `diffReliable`,
+   and every `not closure-checked` line from the split. Then the block for `advisory`.
+   Do not re-rank. A decision row is specified under [Decision row](#decision-row).
+   Do not paraphrase a CVE `summary`. Skip a field only when the payload omitted it.
+
+   - **`stop`** — one decision row per `MAL-` id (target `vulnerabilities`, and
+     `vulnerabilities.introduced` / `remaining` / `uncompared`), including `path`
+     when present. Do not edit. Do not call an `uncompared` `MAL-` "introduced".
+   - **`review`** — one decision row per introduced id (include an id with no
+     severity; do not drop it), per target `CRITICAL`/`HIGH`, and per remaining
+     `CRITICAL`/`HIGH` still labeled remaining. Then license rows whose `verdict`
+     is `violation`, and every matrix reason that is set: `diffReliable` false,
+     `fixesIncomplete`, a target not `landed`, `rewroteVersionless`,
+     `capabilityUnavailable`. When `targets[].safeUpgrade.version` is above
+     `toVersion`, say the confirmed direct version does not clear every known CVE
+     and name that candidate. Ask again before editing. Writing that higher version
+     is a new confirm and a new preview, not an in-place edit of this result.
+   - **`info`** — `added` / `changed` / `removed` counts and the first rows, then
+     a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and each
+     introduced `MEDIUM`/`LOW`. License rows whose `verdict` is `review` or `ok`.
+     Do not call the bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
+   - **`unknown`** — the closure was not compared. Quote `error`. Do not fill the
+     gap, and do not describe empty buckets as "no change".
+   - **`none` after a compare** (`diffReliable: true`, and the target has a
+     `vulnerabilities` list, empty when nothing came back) — no coordinate change
+     outside the target, then the target OSV result. Quote the non-guarantee note
+     from `notes`. Do not say safe. On a deps.dev platform or `managedBy` row, do
+     not use that closure sentence: an empty public-graph diff is not "no
+     coordinate change".
+   - **`none` from all-identity** (`vulnerabilities` omitted on the target, not
+     `[]`) — nothing was requested to change and the current coordinate was not
+     re-queried. Do not say the graphs were compared. Do not invent an empty OSV
+     result.
+
+   `targets[].safeUpgrade` is one extra line on the direct coordinate, labeled
+   advisory: `fixesAllKnown` and `version`, or `fixesAllKnown: false` plus
+   `reason`. It is not a row per CVE. Do not present it as the version to write.
+
+   If `landed` is false, you may offer one retry of that coordinate with
+   `substitution: "module"`. The server does not launch that second pair. Do not
+   send it unless the user accepts. An accepted retry is a new preview, not an edit.
+
+`stop` ends the edit. `review` waits for the new answer. `info`, compared `none`,
+and `unknown` do not mean safe; they also do not by themselves cancel a set the
+user already confirmed. Step 5 stays a build check. This preview is not a build.
+
+### Decision row
+
+One CVE, in this order. Same row as `/upgrade-closure`. Do not paraphrase `summary`.
+
+1. `relation` — introduced, remaining, fixed, uncompared, or target.
+2. `vulnerableNode` as `groupId:artifactId:version`.
+3. `id`, linked with `url`. When `url` is empty, use `https://osv.dev/vulnerability/{id}`.
+4. `severity`, or `severity unknown` when hydration left it off.
+5. `summary`, or the id alone when `summary` is empty.
+6. `fixedVersion`, or `fix unknown` when it was omitted.
+7. `clearedBySelection`: `selected version is at or above the fix`, `selected version is still below the fix`, or omit this clause when there is no `fixedVersion`. For `relation: fixed`, say the bump no longer selects the vulnerable version.
+8. `path` as an arrow chain (`g:a:v → g:a:v`) when present. When `pathOmitted` is present, say the middle was shortened and the leaf is the vulnerable node.
+9. When the node is not the target and `clearedBySelection` is false: this coordinate is not the line being edited; clearing it needs a constraint or a higher root, and this preview does not propose that pin.
+
 ## Step 4 — Edit pass
 
-Apply only the groups the user confirms. Touch only version values:
+Apply only the groups the user confirms, after the preview above. Touch only version values:
 
 - Catalog — `[versions]` or inline version in `[libraries]` / `[plugins]`
 - Module direct / Plugin DSL / Buildscript — inline version string in the build file
@@ -113,9 +210,10 @@ Surface failures immediately. Attempt trivial fixes; otherwise revert that entry
 ## Constraints and non-goals
 
 - Major version bumps require explicit per-entry confirmation.
-- Direct production dependencies only — first-level Gradle resolutions, not the full transitive closure.
+- Step 1 stays direct: `audit_project_dependencies` is first-level production dependencies, not the closure. The closure preview runs only after confirm, for the library batch, and is not a safety verdict.
+- The write hooks do not call `compare_upgrade_closure`. Do not add that call.
 - This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
-- Requires a Gradle wrapper (`gradlew`); Maven-only projects are out of scope for this scan path.
+- The audit requires a Gradle wrapper (`gradlew`). Maven-only projects are out of scope for this scan path. Without a wrapper the preview is one deps.dev call, or no call when the batch is larger.
 
 ## Fallback (MCP unavailable only)
 
@@ -123,4 +221,5 @@ If MCP tools cannot be called: Glob/Read build files, extract GAVs, fetch public
 `maven-metadata.xml` (Central / Google / Plugin Portal), classify versions, and optionally
 POST OSV `/v1/querybatch` then hydrate via `GET /v1/vulns/{id}`. State clearly that
 project-private repos, plugin-marker→implementation resolution, and server-side cache are
-skipped.
+skipped. Do not reconstruct a closure diff on this path, and do not treat
+`mvn dependency:tree` or `./gradlew dependencies` as an OSV result.
