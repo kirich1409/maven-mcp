@@ -164,6 +164,12 @@ MAX_DEPSDEV_ERRORS_REPORTED = 20
 # graph + GetVersion per unique node for SPDX licenses. Caps bound fan-out.
 MAX_LICENSE_COMPLIANCE_ROOTS = 20
 MAX_LICENSE_COMPLIANCE_NODES = 500
+# Upgrade-closure preview. Substitutions are rejected (not truncated) before
+# any resolve; the diff cap only shortens what is returned; the license cap
+# bounds GetVersion fan-out to the changed set, not the whole tree.
+MAX_UPGRADE_SUBSTITUTIONS = 20
+MAX_UPGRADE_DIFF_ROWS = 100
+MAX_UPGRADE_LICENSE_NODES = 40
 
 # Bounded parallel fan-out (#400): the batch tools below resolve N coordinates
 # (and, for a few, M repos/roots per coordinate) over the network. Each such
@@ -3166,6 +3172,1142 @@ def get_vulnerability_paths(group_id: str, artifact_id: str, version: str) -> Di
     if unreachable:
         result["unreachableVulnerabilities"] = unreachable
         result["partial"] = True
+    return result
+
+
+# Display cap for a closure path. Longer paths keep the first three GAVs and
+# the leaf; the leaf is the classified coordinate and is never dropped.
+_UPGRADE_PATH_GAVS = 8
+_UPGRADE_PATH_NONE = 10 ** 9
+
+
+def _is_closure_gav(node: Dict[str, Any]) -> bool:
+    """True for a module coordinate. Project components and synthetic roots are not."""
+    if node.get("synthetic") or node.get("project"):
+        return False
+    return bool(node.get("groupId") and node.get("artifactId") and node.get("version"))
+
+
+def _cmp_versions(left: Any, right: Any) -> int:
+    return compare_versions(str(left), str(right))
+
+
+def _sorted_versions(versions: List[str]) -> List[str]:
+    seen = set()
+    uniq: List[str] = []
+    for version in versions:
+        if not version or version in seen:
+            continue
+        seen.add(version)
+        uniq.append(version)
+    return sorted(uniq, key=functools.cmp_to_key(_cmp_versions))
+
+
+def _dedup_usages(usages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for usage in usages:
+        key = (usage.get("module"), usage.get("configuration"), usage.get("version"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "module": usage.get("module"),
+            "configuration": usage.get("configuration"),
+            "version": usage.get("version"),
+        })
+    return out
+
+
+def _empty_upgrade_dependencies() -> Dict[str, List[Any]]:
+    return {"added": [], "changed": [], "removed": []}
+
+
+def _empty_upgrade_summary() -> Dict[str, int]:
+    return {"added": 0, "changed": 0, "removed": 0, "unchanged": 0}
+
+
+def _empty_vuln_buckets() -> Dict[str, List[Any]]:
+    return {"introduced": [], "remaining": [], "fixed": [], "uncompared": []}
+
+
+def _normalise_closure_graph(trees: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge per-configuration trees into one graph keyed by GAV.
+
+    Edges address ``node["index"]`` when that field is set, otherwise the
+    list position. A ``project: true`` node (or a node with no GAV) is dropped;
+    its children attach to the nearest kept ancestor, or to a synthetic
+    ``{synthetic, module, configuration}`` root when every ancestor is a
+    project component. The same GAV in two trees is one node; each tree adds
+    a ``{module, configuration, version}`` usage. Duplicate edges collapse.
+    """
+    nodes_out: List[Dict[str, Any]] = []
+    edges_out: List[Dict[str, int]] = []
+    gav_index: Dict[Tuple[str, str, str], int] = {}
+    synthetic_index: Dict[Tuple[str, str], int] = {}
+    edge_seen = set()
+
+    def ensure_gav(node: Dict[str, Any], module: Any, configuration: Any) -> int:
+        key = (node["groupId"], node["artifactId"], node["version"])
+        if key not in gav_index:
+            gav_index[key] = len(nodes_out)
+            nodes_out.append({
+                "groupId": key[0],
+                "artifactId": key[1],
+                "version": key[2],
+                "usages": [],
+            })
+        usage = {"module": module, "configuration": configuration, "version": key[2]}
+        usages = nodes_out[gav_index[key]]["usages"]
+        if usage not in usages:
+            usages.append(usage)
+        return gav_index[key]
+
+    def ensure_synthetic(module: Any, configuration: Any) -> int:
+        key = (module, configuration)
+        if key not in synthetic_index:
+            synthetic_index[key] = len(nodes_out)
+            nodes_out.append({
+                "synthetic": True,
+                "module": module,
+                "configuration": configuration,
+            })
+        return synthetic_index[key]
+
+    def add_edge(src: int, dst: int) -> None:
+        if src == dst or (src, dst) in edge_seen:
+            return
+        edge_seen.add((src, dst))
+        edges_out.append({"from": src, "to": dst})
+
+    for tree in trees or []:
+        module = tree.get("module")
+        configuration = tree.get("configuration")
+        local_nodes = list(tree.get("nodes") or [])
+        local_edges = list(tree.get("edges") or [])
+        index_to_pos: Dict[int, int] = {}
+        for pos, node in enumerate(local_nodes):
+            raw_index = node.get("index")
+            idx = raw_index if isinstance(raw_index, int) else pos
+            index_to_pos[idx] = pos
+        parents: Dict[int, List[int]] = {}
+        positioned: List[Tuple[int, int]] = []
+        for edge in local_edges:
+            src_raw = edge.get("from")
+            dst_raw = edge.get("to")
+            if not isinstance(src_raw, int) or not isinstance(dst_raw, int):
+                continue
+            src_pos = index_to_pos.get(src_raw)
+            dst_pos = index_to_pos.get(dst_raw)
+            if src_pos is None or dst_pos is None:
+                continue
+            positioned.append((src_pos, dst_pos))
+            parents.setdefault(dst_pos, []).append(src_pos)
+
+        memo: Dict[int, int] = {}
+
+        def kept(idx: int, trail: Tuple[int, ...]) -> int:
+            # Walk project components to the nearest module, or the synthetic
+            # configuration root when the parent is the project itself.
+            if idx in memo:
+                return memo[idx]
+            if idx in trail:
+                memo[idx] = ensure_synthetic(module, configuration)
+                return memo[idx]
+            node = local_nodes[idx]
+            if node.get("synthetic"):
+                merged = ensure_synthetic(
+                    node.get("module", module), node.get("configuration", configuration),
+                )
+                memo[idx] = merged
+                return merged
+            if _is_closure_gav(node):
+                merged = ensure_gav(node, module, configuration)
+                memo[idx] = merged
+                return merged
+            for parent in parents.get(idx, []):
+                merged = kept(parent, trail + (idx,))
+                memo[idx] = merged
+                return merged
+            merged = ensure_synthetic(module, configuration)
+            memo[idx] = merged
+            return merged
+
+        for pos, node in enumerate(local_nodes):
+            if _is_closure_gav(node):
+                kept(pos, ())
+        for src_pos, dst_pos in positioned:
+            if not _is_closure_gav(local_nodes[dst_pos]):
+                continue
+            add_edge(kept(src_pos, ()), kept(dst_pos, ()))
+
+    return {"nodes": nodes_out, "edges": edges_out}
+
+
+def _display_closure_path(full: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Shorten a root-first path to GAV nodes. Synthetics are not displayed.
+
+    More than ``_UPGRADE_PATH_GAVS`` GAVs keeps the first three and the leaf.
+    ``pathOmitted`` counts dropped middle GAVs plus synthetic hops. ``pathLength``
+    stays the full node count so ranking does not use the shortened list.
+    """
+    gavs: List[Dict[str, str]] = []
+    skipped = 0
+    for node in full:
+        if node.get("synthetic") or not node.get("groupId"):
+            skipped += 1
+            continue
+        gavs.append({
+            "groupId": node["groupId"],
+            "artifactId": node["artifactId"],
+            "version": node["version"],
+        })
+    omitted = skipped
+    if len(gavs) > _UPGRADE_PATH_GAVS:
+        omitted += len(gavs) - 4
+        shown = gavs[:3] + [gavs[-1]]
+    else:
+        shown = gavs
+    out: Dict[str, Any] = {"path": shown, "pathLength": len(full)}
+    if omitted:
+        out["pathOmitted"] = omitted
+    return out
+
+
+def _closure_paths(
+    graph: Dict[str, Any],
+    upgrades: List[Dict[str, Any]],
+    *,
+    project_graph: bool = True,
+) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """Shortest path from a substituted GA to each GAV node.
+
+    One ``_bfs_predecessors`` per substituted root (no multi-source mode).
+    A synthetic configuration root that can reach a substituted GA is a
+    fallback root: a project hop collapses onto that root, so the child is
+    still in the upgraded configuration and is not a side effect. Nodes no
+    substituted GA and no such root can reach are side effects. ``sideEffect``
+    is omitted when ``project_graph`` is false (deps.dev has no cross-tree
+    effects).
+    """
+    nodes = list(graph.get("nodes") or [])
+    edges = list(graph.get("edges") or [])
+    sub_indexes: List[int] = []
+    seen_sub = set()
+    for upgrade in upgrades or []:
+        ga = (upgrade.get("groupId"), upgrade.get("artifactId"))
+        if not ga[0] or not ga[1]:
+            continue
+        for idx, node in enumerate(nodes):
+            if idx in seen_sub:
+                continue
+            if (node.get("groupId"), node.get("artifactId")) == ga:
+                sub_indexes.append(idx)
+                seen_sub.add(idx)
+
+    best: Dict[int, List[int]] = {}
+
+    def consider(roots: List[int], *, only_missing: bool) -> None:
+        for root in roots:
+            predecessor = _bfs_predecessors(edges, root)
+            for idx, node in enumerate(nodes):
+                if node.get("synthetic") or not _is_closure_gav(node):
+                    continue
+                if only_missing and idx in best:
+                    continue
+                path = _reconstruct_path(predecessor, root, idx)
+                if path is None:
+                    continue
+                previous = best.get(idx)
+                if previous is None or len(path) < len(previous):
+                    best[idx] = path
+
+    consider(sub_indexes, only_missing=False)
+    if project_graph and sub_indexes:
+        upgrade_synthetics: List[int] = []
+        for idx, node in enumerate(nodes):
+            if not node.get("synthetic"):
+                continue
+            predecessor = _bfs_predecessors(edges, idx)
+            # Reachable substituted nodes are in the predecessor map (the root is not).
+            if any(sub in predecessor for sub in sub_indexes):
+                upgrade_synthetics.append(idx)
+        consider(upgrade_synthetics, only_missing=True)
+
+    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for idx, node in enumerate(nodes):
+        if not _is_closure_gav(node):
+            continue
+        key = (node["groupId"], node["artifactId"], node["version"])
+        info: Dict[str, Any] = {}
+        path_idx = best.get(idx)
+        if path_idx is not None:
+            displayed = _display_closure_path([nodes[i] for i in path_idx])
+            info["path"] = displayed["path"]
+            info["pathLength"] = displayed["pathLength"]
+            if displayed.get("pathOmitted"):
+                info["pathOmitted"] = displayed["pathOmitted"]
+        if project_graph:
+            info["sideEffect"] = path_idx is None
+        if info:
+            out[key] = info
+    return out
+
+
+def _ga_versions_and_usages(
+    graph: Dict[str, Any],
+    exclude: set,
+) -> Tuple[Dict[Tuple[str, str], List[str]], Dict[Tuple[str, str], List[Dict[str, Any]]]]:
+    versions: Dict[Tuple[str, str], List[str]] = {}
+    usages: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for node in graph.get("nodes") or []:
+        if not _is_closure_gav(node):
+            continue
+        ga = (node["groupId"], node["artifactId"])
+        if ga in exclude:
+            continue
+        versions.setdefault(ga, []).append(node["version"])
+        usages.setdefault(ga, []).extend(node.get("usages") or [])
+    return versions, usages
+
+
+def _attach_path(
+    row: Dict[str, Any],
+    side_effect_versions: List[Optional[Dict[str, Any]]],
+    *,
+    project_graph: bool,
+) -> int:
+    """Copy the shortest full path onto a diff row. Returns that length for sorting."""
+    best: Optional[Dict[str, Any]] = None
+    for candidate in side_effect_versions:
+        if not candidate or "pathLength" not in candidate:
+            continue
+        if best is None or candidate["pathLength"] < best["pathLength"]:
+            best = candidate
+    if best and best.get("path"):
+        row["path"] = best["path"]
+        if best.get("pathOmitted"):
+            row["pathOmitted"] = best["pathOmitted"]
+    length = best["pathLength"] if best and "pathLength" in best else _UPGRADE_PATH_NONE
+    if project_graph:
+        reached = any(
+            candidate is not None and candidate.get("sideEffect") is False
+            for candidate in side_effect_versions
+        )
+        row["sideEffect"] = not reached
+    return length
+
+
+def _diff_closure(
+    before_side: Dict[str, Any],
+    after_side: Dict[str, Any],
+    upgrades: List[Dict[str, Any]],
+    *,
+    project_graph: bool = True,
+) -> Dict[str, Any]:
+    """Classify the closure delta by GA. One row per coordinate family.
+
+    Upgraded direct GAs are removed from both sets before classification and
+    are not added, changed, or removed rows; they stay in the graphs so path
+    search can start there. Either side ``ok: false`` yields empty buckets —
+    that is not an empty project. ``ok: true`` with ``diffReliable: false``
+    still fills the buckets.
+    """
+    empty: Dict[str, Any] = {
+        "added": [],
+        "changed": [],
+        "removed": [],
+        "summary": _empty_upgrade_summary(),
+        "dependenciesTruncated": False,
+        "diffReliable": False,
+        "compared": False,
+    }
+    if not before_side.get("ok") or not after_side.get("ok"):
+        return empty
+
+    exclude = set()
+    for upgrade in upgrades or []:
+        group_id = upgrade.get("groupId")
+        artifact_id = upgrade.get("artifactId")
+        if group_id and artifact_id:
+            exclude.add((group_id, artifact_id))
+
+    before_graph = before_side.get("graph") or {"nodes": [], "edges": []}
+    after_graph = after_side.get("graph") or {"nodes": [], "edges": []}
+    before_versions, before_usages = _ga_versions_and_usages(before_graph, exclude)
+    after_versions, after_usages = _ga_versions_and_usages(after_graph, exclude)
+    before_paths = _closure_paths(before_graph, upgrades, project_graph=project_graph)
+    after_paths = _closure_paths(after_graph, upgrades, project_graph=project_graph)
+
+    added: List[Dict[str, Any]] = []
+    changed: List[Dict[str, Any]] = []
+    removed: List[Dict[str, Any]] = []
+    unchanged = 0
+    for ga in set(before_versions) | set(after_versions):
+        before_set = _sorted_versions(before_versions.get(ga, []))
+        after_set = _sorted_versions(after_versions.get(ga, []))
+        group_id, artifact_id = ga
+        if not before_set and after_set:
+            infos = [after_paths.get((group_id, artifact_id, v)) for v in after_set]
+            row: Dict[str, Any] = {
+                "groupId": group_id,
+                "artifactId": artifact_id,
+                "versions": after_set,
+            }
+            usages = _dedup_usages(after_usages.get(ga, []))
+            if usages:
+                row["usages"] = usages
+            length = _attach_path(row, infos, project_graph=project_graph)
+            row["_pathLength"] = length
+            added.append(row)
+        elif before_set and not after_set:
+            infos = [before_paths.get((group_id, artifact_id, v)) for v in before_set]
+            row = {
+                "groupId": group_id,
+                "artifactId": artifact_id,
+                "versions": before_set,
+            }
+            usages = _dedup_usages(before_usages.get(ga, []))
+            if usages:
+                row["usages"] = usages
+            length = _attach_path(row, infos, project_graph=False)
+            row["_pathLength"] = length
+            removed.append(row)
+        elif set(before_set) == set(after_set):
+            unchanged += 1
+        else:
+            infos = [after_paths.get((group_id, artifact_id, v)) for v in after_set]
+            row = {
+                "groupId": group_id,
+                "artifactId": artifact_id,
+                "fromVersions": before_set,
+                "toVersions": after_set,
+            }
+            usages = _dedup_usages(after_usages.get(ga, []) + before_usages.get(ga, []))
+            if usages:
+                row["usages"] = usages
+            length = _attach_path(row, infos, project_graph=project_graph)
+            row["_pathLength"] = length
+            changed.append(row)
+
+    def sort_key(row: Dict[str, Any]) -> Tuple[int, int, str, str]:
+        side = 1 if row.get("sideEffect") else 0
+        raw_length = row.get("_pathLength", _UPGRADE_PATH_NONE)
+        length = raw_length if isinstance(raw_length, int) else _UPGRADE_PATH_NONE
+        return (side, length, str(row.get("groupId") or ""), str(row.get("artifactId") or ""))
+
+    added.sort(key=sort_key)
+    changed.sort(key=sort_key)
+    removed.sort(key=sort_key)
+    summary = {
+        "added": len(added),
+        "changed": len(changed),
+        "removed": len(removed),
+        "unchanged": unchanged,
+    }
+    truncated = False
+
+    def cap(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        nonlocal truncated
+        if len(rows) > MAX_UPGRADE_DIFF_ROWS:
+            truncated = True
+            rows = rows[:MAX_UPGRADE_DIFF_ROWS]
+        for row in rows:
+            row.pop("_pathLength", None)
+        return rows
+
+    reliable = bool(before_side.get("diffReliable", True)) and bool(after_side.get("diffReliable", True))
+    return {
+        "added": cap(added),
+        "changed": cap(changed),
+        "removed": cap(removed),
+        "summary": summary,
+        "dependenciesTruncated": truncated,
+        "diffReliable": reliable,
+        "compared": True,
+    }
+
+
+def _select_delta_gavs(
+    upgrades: List[Dict[str, Any]],
+    diff: Dict[str, Any],
+    *,
+    cap: int = MAX_VULN_DEPENDENCIES,
+    include_targets: bool = True,
+) -> Dict[str, Any]:
+    """Order GAVs for one OSV or license pass.
+
+    Targets (every ``toVersion``, then every ``fromVersion``) are reserved and
+    never dropped. The closure delta fills the remaining slots: added,
+    changed-after, changed-before, removed. ``truncated`` is true when a
+    closure GAV did not fit. ``include_targets`` false is the license order
+    (the caller applies ``MAX_UPGRADE_LICENSE_NODES``).
+    """
+    ordered: List[Dict[str, str]] = []
+
+    def push(group_id: Any, artifact_id: Any, version: Any) -> None:
+        if not group_id or not artifact_id or not version:
+            return
+        ordered.append({
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "version": version,
+        })
+
+    if include_targets:
+        for upgrade in upgrades or []:
+            push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("toVersion"))
+        for upgrade in upgrades or []:
+            push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("fromVersion"))
+    for row in diff.get("added") or []:
+        for version in row.get("versions") or []:
+            push(row.get("groupId"), row.get("artifactId"), version)
+    for row in diff.get("changed") or []:
+        for version in row.get("toVersions") or []:
+            push(row.get("groupId"), row.get("artifactId"), version)
+    for row in diff.get("changed") or []:
+        for version in row.get("fromVersions") or []:
+            push(row.get("groupId"), row.get("artifactId"), version)
+    for row in diff.get("removed") or []:
+        for version in row.get("versions") or []:
+            push(row.get("groupId"), row.get("artifactId"), version)
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for gav in ordered:
+        key = (gav["groupId"], gav["artifactId"], gav["version"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(gav)
+
+    if not include_targets:
+        return {"gavs": deduped[:cap], "truncated": len(deduped) > cap}
+
+    target_keys = set()
+    for upgrade in upgrades or []:
+        for version_key in ("toVersion", "fromVersion"):
+            version = upgrade.get(version_key)
+            if upgrade.get("groupId") and upgrade.get("artifactId") and version:
+                target_keys.add((upgrade.get("groupId"), upgrade.get("artifactId"), version))
+    prefix: List[Dict[str, str]] = []
+    rest: List[Dict[str, str]] = []
+    for gav in deduped:
+        key = (gav["groupId"], gav["artifactId"], gav["version"])
+        if key in target_keys:
+            prefix.append(gav)
+            target_keys.discard(key)
+        else:
+            rest.append(gav)
+    room = max(0, cap - len(prefix))
+    return {"gavs": prefix + rest[:room], "truncated": len(rest) > room}
+
+
+def _diff_path_fields(diff: Dict[str, Any], group_id: str, artifact_id: str) -> Dict[str, Any]:
+    for bucket in ("added", "changed", "removed"):
+        for row in diff.get(bucket) or []:
+            if row.get("groupId") == group_id and row.get("artifactId") == artifact_id:
+                fields: Dict[str, Any] = {}
+                if row.get("path"):
+                    fields["path"] = row["path"]
+                if row.get("pathOmitted"):
+                    fields["pathOmitted"] = row["pathOmitted"]
+                return fields
+    return {}
+
+
+def _upgrade_vuln_item(
+    raw: Dict[str, Any],
+    *,
+    relation: str,
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    selected_version: Optional[str],
+    path_fields: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    vuln_id = raw.get("id") or ""
+    if "malicious" in raw:
+        malicious = bool(raw.get("malicious"))
+    else:
+        malicious = _is_malicious_id(vuln_id)
+    item: Dict[str, Any] = {
+        "id": vuln_id,
+        "summary": raw.get("summary") or "",
+        "url": raw.get("url") or "",
+        "malicious": malicious,
+        "relation": relation,
+        "vulnerableNode": {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "version": version,
+        },
+    }
+    if raw.get("severity"):
+        item["severity"] = raw["severity"]
+    fixed = raw.get("fixedVersion")
+    if isinstance(fixed, str) and fixed.strip():
+        item["fixedVersion"] = fixed
+        if relation in ("introduced", "remaining", "target") and selected_version:
+            item["clearedBySelection"] = compare_versions(selected_version, fixed) >= 0
+    if relation == "uncompared":
+        item["reason"] = "before-version not queried"
+    if relation != "target" and path_fields:
+        if path_fields.get("path"):
+            item["path"] = path_fields["path"]
+        if path_fields.get("pathOmitted"):
+            item["pathOmitted"] = path_fields["pathOmitted"]
+    return item
+
+
+def _lowest_version_hit(
+    hits: List[Tuple[str, Dict[str, Any]]],
+) -> Tuple[str, Dict[str, Any]]:
+    best = hits[0]
+    for candidate in hits[1:]:
+        if compare_versions(candidate[0], best[0]) < 0:
+            best = candidate
+    return best
+
+
+def _vulns_by_version(
+    records_by_version: Dict[str, Dict[str, Any]],
+    versions: List[str],
+) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
+    found: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    for version in versions:
+        record = records_by_version.get(version)
+        if not record:
+            continue
+        for vuln in record.get("vulnerabilities") or []:
+            vuln_id = vuln.get("id") or ""
+            if not vuln_id:
+                continue
+            found.setdefault(vuln_id, []).append((version, vuln))
+    return found
+
+
+def _classify_vuln_delta(
+    upgrades: List[Dict[str, Any]],
+    diff: Dict[str, Any],
+    records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Classify already-fetched OSV records. Does not query the network.
+
+    A before-version that was not queried does not produce ``introduced`` or
+    ``fixed``; the after-version ids go to ``uncompared`` and
+    ``fixesIncomplete`` is set. A ``MAL-`` on a queried after-version stays
+    ``malicious`` and is not labeled introduced. ``safeUpgrade`` is computed
+    only for a target ``toVersion`` list, and omitted when that list is empty.
+    """
+    queried: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    capability: Optional[str] = None
+    for record in records or []:
+        group_id = record.get("groupId")
+        artifact_id = record.get("artifactId")
+        version = record.get("version")
+        if not group_id or not artifact_id or not version:
+            continue
+        key = (group_id, artifact_id, version)
+        if key not in queried:
+            queried[key] = record
+        if record.get("capabilityUnavailable") and capability is None:
+            capability = record["capabilityUnavailable"]
+
+    by_ga: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    for (group_id, artifact_id, version), record in queried.items():
+        by_ga.setdefault((group_id, artifact_id), {})[version] = record
+
+    introduced: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    fixed: List[Dict[str, Any]] = []
+    uncompared: List[Dict[str, Any]] = []
+    fixes_incomplete = False
+    input_truncated = False
+
+    def missing(group_id: str, artifact_id: str, versions: List[str]) -> List[str]:
+        return [
+            version for version in versions
+            if (group_id, artifact_id, version) not in queried
+        ]
+
+    def classify_pair(
+        group_id: str,
+        artifact_id: str,
+        before_versions: List[str],
+        after_versions: List[str],
+        *,
+        target: bool,
+    ) -> List[Dict[str, Any]]:
+        """Return introduced/remaining/fixed items. Closure buckets are filled
+        only when ``target`` is false."""
+        nonlocal fixes_incomplete, input_truncated
+        delta: List[Dict[str, Any]] = []
+        before_missing = missing(group_id, artifact_id, before_versions)
+        after_missing = missing(group_id, artifact_id, after_versions)
+        if after_missing and after_versions:
+            input_truncated = True
+        path_fields = None if target else _diff_path_fields(diff, group_id, artifact_id)
+        versions = by_ga.get((group_id, artifact_id), {})
+        if before_missing and before_versions:
+            fixes_incomplete = True
+            if not target and not after_missing:
+                after_hits = _vulns_by_version(versions, after_versions)
+                for vuln_id in sorted(after_hits):
+                    version, raw = _lowest_version_hit(after_hits[vuln_id])
+                    uncompared.append(_upgrade_vuln_item(
+                        raw,
+                        relation="uncompared",
+                        group_id=group_id,
+                        artifact_id=artifact_id,
+                        version=version,
+                        selected_version=version,
+                        path_fields=path_fields,
+                    ))
+            return delta
+        if after_missing and after_versions:
+            # Cannot tell introduced from remaining, or that a before-only id left.
+            return delta
+        before_hits = _vulns_by_version(versions, before_versions)
+        after_hits = _vulns_by_version(versions, after_versions)
+        for vuln_id in sorted(set(before_hits) | set(after_hits)):
+            on_before = vuln_id in before_hits
+            on_after = vuln_id in after_hits
+            if on_before and on_after:
+                relation = "remaining"
+                version, raw = _lowest_version_hit(after_hits[vuln_id])
+            elif on_after:
+                relation = "introduced"
+                version, raw = _lowest_version_hit(after_hits[vuln_id])
+            else:
+                relation = "fixed"
+                version, raw = _lowest_version_hit(before_hits[vuln_id])
+                if after_versions:
+                    # GA still selected: point at the after coordinate.
+                    version = _sorted_versions(after_versions)[0]
+            item = _upgrade_vuln_item(
+                raw,
+                relation=relation,
+                group_id=group_id,
+                artifact_id=artifact_id,
+                version=version,
+                selected_version=version if relation != "fixed" else None,
+                path_fields=path_fields,
+            )
+            delta.append(item)
+            if not target:
+                {"introduced": introduced, "remaining": remaining, "fixed": fixed}[relation].append(item)
+        return delta
+
+    targets: List[Dict[str, Any]] = []
+    for upgrade in upgrades or []:
+        group_id = upgrade.get("groupId") or ""
+        artifact_id = upgrade.get("artifactId") or ""
+        from_version = upgrade.get("fromVersion") or ""
+        to_version = upgrade.get("toVersion") or ""
+        target: Dict[str, Any] = {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "fromVersion": from_version,
+            "toVersion": to_version,
+        }
+        for field in (
+            "selectedVersions", "landed", "substitutionMatched",
+            "rewroteVersionless", "targetPresent",
+        ):
+            if field in upgrade:
+                target[field] = upgrade[field]
+        to_key = (group_id, artifact_id, to_version)
+        to_record = queried.get(to_key)
+        if to_record is not None:
+            raw_vulns = [
+                raw for raw in (to_record.get("vulnerabilities") or []) if raw.get("id")
+            ]
+            target["vulnerabilities"] = [
+                _upgrade_vuln_item(
+                    raw,
+                    relation="target",
+                    group_id=group_id,
+                    artifact_id=artifact_id,
+                    version=to_version,
+                    selected_version=to_version,
+                )
+                for raw in raw_vulns
+            ]
+            if to_record.get("capabilityUnavailable"):
+                target["capabilityUnavailable"] = to_record["capabilityUnavailable"]
+            if raw_vulns:
+                safe = _compute_safe_upgrade(raw_vulns)
+                if safe is not None:
+                    target["safeUpgrade"] = safe
+        else:
+            input_truncated = True
+        if from_version and to_version:
+            delta = classify_pair(
+                group_id, artifact_id, [from_version], [to_version], target=True,
+            )
+            if (group_id, artifact_id, from_version) in queried and to_record is not None:
+                target["vulnerabilityDelta"] = delta
+        targets.append(target)
+
+    for row in diff.get("added") or []:
+        classify_pair(
+            row["groupId"], row["artifactId"], [], list(row.get("versions") or []), target=False,
+        )
+    for row in diff.get("changed") or []:
+        classify_pair(
+            row["groupId"],
+            row["artifactId"],
+            list(row.get("fromVersions") or []),
+            list(row.get("toVersions") or []),
+            target=False,
+        )
+    for row in diff.get("removed") or []:
+        classify_pair(
+            row["groupId"], row["artifactId"], list(row.get("versions") or []), [], target=False,
+        )
+
+    def sort_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return sorted(items, key=lambda item: (
+            item["vulnerableNode"]["groupId"],
+            item["vulnerableNode"]["artifactId"],
+            item["vulnerableNode"]["version"],
+            item["id"],
+        ))
+
+    result: Dict[str, Any] = {
+        "targets": targets,
+        "vulnerabilities": {
+            "introduced": sort_items(introduced),
+            "remaining": sort_items(remaining),
+            "fixed": sort_items(fixed),
+            "uncompared": sort_items(uncompared),
+        },
+        "fixesIncomplete": fixes_incomplete,
+        "inputTruncated": input_truncated,
+    }
+    if capability:
+        result["capabilityUnavailable"] = capability
+    return result
+
+
+def _ordered_license_gavs(diff: Dict[str, Any]) -> List[Tuple[str, str, str, str]]:
+    """Added, changed-after, changed-before, removed. Targets are not in ``diff``."""
+    ordered: List[Tuple[str, str, str, str]] = []
+    for row in diff.get("added") or []:
+        for version in row.get("versions") or []:
+            ordered.append((row["groupId"], row["artifactId"], version, "added"))
+    for row in diff.get("changed") or []:
+        for version in row.get("toVersions") or []:
+            ordered.append((row["groupId"], row["artifactId"], version, "changed-to"))
+    for row in diff.get("changed") or []:
+        for version in row.get("fromVersions") or []:
+            ordered.append((row["groupId"], row["artifactId"], version, "changed-from"))
+    for row in diff.get("removed") or []:
+        for version in row.get("versions") or []:
+            ordered.append((row["groupId"], row["artifactId"], version, "removed"))
+    return ordered
+
+
+def _license_delta(
+    diff: Dict[str, Any],
+    fetched: List[Dict[str, Any]],
+    *,
+    project_license: Optional[str] = None,
+    disallow: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """License posture for an already-fetched closure delta. No network.
+
+    ``categoriesIntroduced`` is omitted unless every selected GAV, including
+    changed-before and removed, was fetched with ``ok: true``. A verdict is
+    attached to appeared rows only.
+    """
+    policy = resolve_license_policy(project_license, disallow)
+    by_gav: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    capability: Optional[str] = None
+    for record in fetched or []:
+        group_id = record.get("groupId")
+        artifact_id = record.get("artifactId")
+        version = record.get("version")
+        if not group_id or not artifact_id or not version:
+            continue
+        key = (group_id, artifact_id, version)
+        if key not in by_gav:
+            by_gav[key] = record
+        if record.get("capabilityUnavailable") and capability is None:
+            capability = record["capabilityUnavailable"]
+
+    appeared: List[Dict[str, Any]] = []
+    disappeared: List[Dict[str, Any]] = []
+    selected = _ordered_license_gavs(diff)
+    complete = True
+    for group_id, artifact_id, version, kind in selected:
+        hit = by_gav.get((group_id, artifact_id, version))
+        if not hit or not hit.get("ok"):
+            complete = False
+            continue
+        primary = _primary_license_from_depsdev(list(hit.get("licenses") or []))
+        raw_spdx = primary.get("spdxId")
+        spdx_id = raw_spdx if isinstance(raw_spdx, str) else None
+        raw_category = primary.get("category")
+        category = raw_category if isinstance(raw_category, str) and raw_category else "unknown"
+        base: Dict[str, Any] = {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "version": version,
+            "spdxId": spdx_id,
+            "category": category,
+        }
+        if kind in ("added", "changed-to"):
+            verdict = license_compliance_verdict(
+                spdx_id=spdx_id,
+                category=category,
+                policy=policy,
+                missing_license=not spdx_id,
+            )
+            row = dict(base)
+            row["verdict"] = verdict["verdict"]
+            row["reason"] = verdict["reason"]
+            appeared.append(row)
+        else:
+            disappeared.append(base)
+
+    result: Dict[str, Any] = {"appeared": appeared, "disappeared": disappeared}
+    if complete and selected:
+        gone = {row["category"] for row in disappeared}
+        introduced: List[str] = []
+        for row in appeared:
+            category = row["category"]
+            if category not in gone and category not in introduced:
+                introduced.append(category)
+        result["categoriesIntroduced"] = introduced
+    if capability:
+        result["capabilityUnavailable"] = capability
+    return result
+
+
+_ADVISORY_NONE_NOTE = (
+    "Unchanged transitives were not queried, OSV coverage is incomplete, "
+    "and an empty closure delta is not a safety guarantee."
+)
+_ADVISORY_IDENTITY_NOTE = (
+    "Nothing was requested to change and the current coordinate was not re-queried."
+)
+_HIGH_SEVERITIES = frozenset({"CRITICAL", "HIGH"})
+_INFO_SEVERITIES = frozenset({"MEDIUM", "LOW"})
+
+
+def _severity_label(item: Dict[str, Any]) -> Optional[str]:
+    severity = item.get("severity")
+    if not severity:
+        return None
+    return str(severity).upper()
+
+
+def _advisory_for_upgrade(
+    *,
+    all_identity: bool = False,
+    targets: Optional[List[Dict[str, Any]]] = None,
+    before_ok: bool = True,
+    after_ok: bool = True,
+    diff_reliable: bool = True,
+    diff: Optional[Dict[str, Any]] = None,
+    vulnerabilities: Optional[Dict[str, Any]] = None,
+    license_delta: Optional[Dict[str, Any]] = None,
+    fixes_incomplete: bool = False,
+    capability_unavailable: Optional[str] = None,
+    input_truncated: bool = False,
+) -> Dict[str, Any]:
+    """Rank one upgrade preview. Not a permission and not a safety verdict.
+
+    ``all_identity`` is the only ``none`` that does not read ``diff_reliable``
+    or any OSV payload. Targets on that path omit ``vulnerabilities`` (absent,
+    not an empty list). Any other call with ``diff_reliable`` false or no OSV
+    payload does not return ``none``.
+    """
+    if all_identity:
+        # Return before consulting diff reliability or vulnerability records.
+        echoed: List[Dict[str, Any]] = []
+        for target in targets or []:
+            echoed.append({
+                "groupId": target.get("groupId"),
+                "artifactId": target.get("artifactId"),
+                "fromVersion": target.get("fromVersion"),
+                "toVersion": target.get("toVersion"),
+            })
+        return {
+            "advisory": "none",
+            "diffReliable": False,
+            "partial": False,
+            "notes": [_ADVISORY_IDENTITY_NOTE],
+            "targets": echoed,
+            "dependencies": _empty_upgrade_dependencies(),
+            "summary": _empty_upgrade_summary(),
+            "vulnerabilities": _empty_vuln_buckets(),
+        }
+
+    if not before_ok or not after_ok:
+        return {
+            "advisory": "unknown",
+            "diffReliable": False,
+            "partial": True,
+            "notes": ["The closure was not compared because a graph side failed."],
+            "targets": list(targets or []),
+            "dependencies": _empty_upgrade_dependencies(),
+            "summary": _empty_upgrade_summary(),
+            "vulnerabilities": _empty_vuln_buckets(),
+        }
+
+    dependencies = {
+        "added": list((diff or {}).get("added") or []),
+        "changed": list((diff or {}).get("changed") or []),
+        "removed": list((diff or {}).get("removed") or []),
+    }
+    summary = dict((diff or {}).get("summary") or _empty_upgrade_summary())
+    vuln_buckets = {
+        "introduced": list((vulnerabilities or {}).get("introduced") or []),
+        "remaining": list((vulnerabilities or {}).get("remaining") or []),
+        "fixed": list((vulnerabilities or {}).get("fixed") or []),
+        "uncompared": list((vulnerabilities or {}).get("uncompared") or []),
+    }
+    has_osv_payload = vulnerabilities is not None
+    dependencies_truncated = bool(diff and diff.get("dependenciesTruncated"))
+    license_capability = (license_delta or {}).get("capabilityUnavailable")
+    target_capability = None
+    for target in targets or []:
+        if target.get("capabilityUnavailable"):
+            target_capability = target["capabilityUnavailable"]
+            break
+    capability = capability_unavailable or license_capability or target_capability
+
+    appeared = list((license_delta or {}).get("appeared") or [])
+    disappeared = list((license_delta or {}).get("disappeared") or [])
+    review_notes: List[str] = []
+    info_notes: List[str] = []
+
+    def target_vulns() -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for target in targets or []:
+            rows.extend(target.get("vulnerabilities") or [])
+        return rows
+
+    stop = False
+    for item in target_vulns() + vuln_buckets["introduced"] + vuln_buckets["remaining"] + vuln_buckets["uncompared"]:
+        if item.get("malicious"):
+            stop = True
+            break
+
+    if not diff_reliable:
+        review_notes.append("diffReliable is false; the diff is not a complete closure.")
+    if fixes_incomplete or vuln_buckets["uncompared"]:
+        review_notes.append("A before-version was not queried; fixes are incomplete.")
+    if capability:
+        review_notes.append("A required OSV or license fetch was unavailable.")
+    if input_truncated or dependencies_truncated:
+        review_notes.append("The closure diff or the OSV input was truncated.")
+    for target in targets or []:
+        if target.get("landed") is False:
+            review_notes.append("A target did not land on toVersion.")
+            break
+    for target in targets or []:
+        if target.get("rewroteVersionless"):
+            review_notes.append("A versionless request was rewritten.")
+            break
+    for item in target_vulns():
+        severity = _severity_label(item)
+        if severity in _HIGH_SEVERITIES or severity is None:
+            review_notes.append("A target toVersion has a critical, high, or unranked vulnerability.")
+            break
+    for item in vuln_buckets["introduced"]:
+        severity = _severity_label(item)
+        if severity in _HIGH_SEVERITIES or severity is None:
+            review_notes.append("An introduced vulnerability is critical, high, or unranked.")
+            break
+    for item in vuln_buckets["remaining"]:
+        severity = _severity_label(item)
+        if severity in _HIGH_SEVERITIES or severity is None:
+            review_notes.append("A remaining vulnerability is critical, high, or unranked.")
+            break
+    if any(row.get("verdict") == "violation" for row in appeared):
+        review_notes.append("An appeared coordinate violates the license policy.")
+
+    delta_rows = bool(dependencies["added"] or dependencies["changed"] or dependencies["removed"])
+    if delta_rows:
+        info_notes.append("The closure added, changed, or removed coordinates.")
+    if vuln_buckets["fixed"]:
+        info_notes.append("A vulnerability is no longer on the selected coordinate.")
+    if any(_severity_label(item) in _INFO_SEVERITIES for item in vuln_buckets["remaining"]):
+        info_notes.append("A remaining vulnerability is medium or low.")
+    if any(_severity_label(item) in _INFO_SEVERITIES for item in vuln_buckets["introduced"]):
+        info_notes.append("An introduced vulnerability is medium or low.")
+    if any(_severity_label(item) in _INFO_SEVERITIES for item in target_vulns()):
+        info_notes.append("A target toVersion vulnerability is medium or low.")
+    if any(row.get("verdict") in ("ok", "review") for row in appeared):
+        info_notes.append("A license row is ok or needs review.")
+
+    targets_clean = has_osv_payload
+    if targets_clean:
+        for target in targets or []:
+            if "vulnerabilities" not in target or target.get("vulnerabilities") or target.get("capabilityUnavailable"):
+                targets_clean = False
+                break
+    licenses_quiet = license_delta is None or (not appeared and not disappeared)
+    can_be_none = (
+        diff_reliable
+        and not review_notes
+        and not info_notes
+        and targets_clean
+        and licenses_quiet
+        and not capability
+        and not fixes_incomplete
+        and not input_truncated
+        and not dependencies_truncated
+        and not delta_rows
+    )
+
+    if stop:
+        advisory = "stop"
+        notes = ["A queried after-coordinate is flagged malicious."]
+    elif review_notes:
+        advisory = "review"
+        notes = review_notes
+    elif info_notes:
+        advisory = "info"
+        notes = info_notes
+    elif can_be_none:
+        advisory = "none"
+        notes = [
+            "No coordinate change outside the target.",
+            _ADVISORY_NONE_NOTE,
+        ]
+    else:
+        # Missing OSV payload, or some other gap, must not look like a clean compare.
+        advisory = "review"
+        notes = ["OSV was not queried for the target, so this is not a clean compare."]
+
+    partial = advisory == "unknown" or bool(
+        not diff_reliable or fixes_incomplete or capability or input_truncated or dependencies_truncated
+    )
+    result: Dict[str, Any] = {
+        "advisory": advisory,
+        "diffReliable": diff_reliable,
+        "partial": partial,
+        "notes": notes,
+        "targets": list(targets or []),
+        "dependencies": dependencies,
+        "summary": summary,
+        "vulnerabilities": vuln_buckets if has_osv_payload else _empty_vuln_buckets(),
+    }
+    if fixes_incomplete:
+        result["fixesIncomplete"] = True
+    if dependencies_truncated:
+        result["dependenciesTruncated"] = True
+    if input_truncated:
+        result["inputTruncated"] = True
+    if capability:
+        result["capabilityUnavailable"] = capability
+    if license_delta is not None:
+        result["license"] = license_delta
     return result
 
 
