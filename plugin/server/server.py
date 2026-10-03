@@ -4329,6 +4329,473 @@ def _advisory_for_upgrade(
     return result
 
 
+# deps.dev-only until a Gradle wrapper fixture accepts auto/gradle. A public
+# graph must not be described as the project classpath.
+_UPGRADE_GA_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_UPGRADE_VERSION_RE = re.compile(r"^[A-Za-z0-9_.+\-]+$")
+_UPGRADE_CHANGED_ONLY_LICENSE_NOTE = (
+    "Only the changed coordinates were licensed, not the unchanged closure."
+)
+
+
+def _select_upgrade_graph_source(args: Dict) -> str:
+    """Return ``depsdev`` or reject the request.
+
+    ``auto`` and ``gradle`` are not accepted yet: there is no wrapper fixture,
+    and a marketplace install of this revision must not pretend to resolve
+    the project.
+    """
+    requested = args.get("graphSource") or "depsdev"
+    if requested != "depsdev":
+        raise ValueError(
+            "graphSource must be depsdev; auto and gradle are not accepted"
+        )
+    return "depsdev"
+
+
+def _parse_upgrade_requests(raw: Any) -> List[Dict[str, str]]:
+    """Validate upgrade coordinates before any network or process launch."""
+    if not isinstance(raw, list):
+        raise ValueError("upgrades must be a list of coordinates")
+    upgrades: List[Dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each upgrade must be an object")
+        group_id = item.get("groupId")
+        artifact_id = item.get("artifactId")
+        from_version = item.get("fromVersion")
+        to_version = item.get("toVersion")
+        if (
+            not isinstance(group_id, str)
+            or not isinstance(artifact_id, str)
+            or not isinstance(from_version, str)
+            or not isinstance(to_version, str)
+        ):
+            raise ValueError(
+                "groupId, artifactId, fromVersion, and toVersion are required"
+            )
+        if not _UPGRADE_GA_RE.fullmatch(group_id) or not _UPGRADE_GA_RE.fullmatch(artifact_id):
+            raise ValueError("groupId and artifactId must match ^[A-Za-z0-9_.\\-]+$")
+        if (
+            not _UPGRADE_VERSION_RE.fullmatch(from_version)
+            or not _UPGRADE_VERSION_RE.fullmatch(to_version)
+        ):
+            raise ValueError("fromVersion and toVersion must match ^[A-Za-z0-9_.+\\-]+$")
+        upgrades.append({
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "fromVersion": from_version,
+            "toVersion": to_version,
+        })
+    if len(upgrades) > MAX_UPGRADE_SUBSTITUTIONS:
+        raise ValueError(
+            f"at most {MAX_UPGRADE_SUBSTITUTIONS} upgrades; the list was not truncated"
+        )
+    seen = set()
+    for upgrade in upgrades:
+        key = (upgrade["groupId"], upgrade["artifactId"])
+        if key in seen:
+            raise ValueError("duplicate groupId and artifactId")
+        seen.add(key)
+    identities = [upgrade["fromVersion"] == upgrade["toVersion"] for upgrade in upgrades]
+    if identities and any(identities) and not all(identities):
+        raise ValueError("cannot mix an unchanged version with a real bump")
+    if len(upgrades) != 1:
+        raise ValueError("deps.dev compares exactly one upgrade")
+    return upgrades
+
+
+def _depsdev_closure_notes(include_licenses: bool) -> List[str]:
+    """Isolation paragraph, plus license caveats when that fetch is in scope."""
+    def pick(prefix: str) -> str:
+        for note in _LICENSE_COMPLIANCE_NOTES:
+            if note.startswith(prefix):
+                return note
+        return prefix
+
+    notes = [pick("Graphs are resolved per root in isolation")]
+    if include_licenses:
+        notes.append(pick("License data comes from deps.dev"))
+        notes.append(pick("Verdicts are heuristic"))
+        notes.append(pick("deps.dev may return SPDX"))
+        notes.append(_UPGRADE_CHANGED_ONLY_LICENSE_NOTE)
+    return notes
+
+
+def _log_upgrade_closure(result: Dict[str, Any]) -> None:
+    upgrades = result.get("upgrades") or []
+    first = upgrades[0] if upgrades else {}
+    _logger.info(
+        "compare_upgrade_closure graphSource=%s advisory=%s partial=%s "
+        "diffReliable=%s upgrades=%d first=%s:%s",
+        result.get("graphSource"),
+        result.get("advisory"),
+        result.get("partial"),
+        result.get("diffReliable"),
+        len(upgrades),
+        first.get("groupId") or "-",
+        first.get("artifactId") or "-",
+    )
+
+
+def _with_upgrade_source(
+    graph_source: str,
+    upgrades_out: List[Dict[str, Any]],
+    ranked: Dict[str, Any],
+    *,
+    error: Optional[str] = None,
+    capability: Optional[str] = None,
+    truncated: bool = False,
+    notes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    result = dict(ranked)
+    result["graphSource"] = graph_source
+    result["upgrades"] = upgrades_out
+    if notes:
+        merged = list(result.get("notes") or [])
+        for note in notes:
+            if note not in merged:
+                merged.append(note)
+        result["notes"] = merged
+    if not result.get("notes"):
+        result["notes"] = ["The upgrade closure check produced no notes."]
+    if error:
+        result["error"] = error
+    if capability and not result.get("capabilityUnavailable"):
+        result["capabilityUnavailable"] = capability
+    if truncated:
+        result["truncated"] = True
+    return result
+
+
+def _marker_upgrade_result(graph_source: str, upgrade: Dict[str, str]) -> Dict[str, Any]:
+    echoed = dict(upgrade)
+    echoed["error"] = "plugin marker; closure not compared"
+    return {
+        "graphSource": graph_source,
+        "advisory": "unknown",
+        "partial": True,
+        "diffReliable": False,
+        "upgrades": [echoed],
+        "summary": _empty_upgrade_summary(),
+        "dependencies": _empty_upgrade_dependencies(),
+        "vulnerabilities": _empty_vuln_buckets(),
+        "targets": [],
+        "notes": ["Plugin marker; closure not compared."],
+    }
+
+
+def _depsdev_graph_tree(fetched: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = []
+    for index, node in enumerate(fetched.get("nodes") or []):
+        copied = dict(node)
+        copied["index"] = index
+        nodes.append(copied)
+    edges = []
+    for edge in fetched.get("edges") or []:
+        src = edge.get("from")
+        dst = edge.get("to")
+        if isinstance(src, int) and isinstance(dst, int):
+            edges.append({"from": src, "to": dst})
+    return {"module": None, "configuration": None, "nodes": nodes, "edges": edges}
+
+
+def _node_errors_from_depsdev(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for node in nodes:
+        raw = node.get("errors") or []
+        if not isinstance(raw, list):
+            raw = [raw]
+        errors = [str(item) for item in raw if item]
+        if not errors:
+            continue
+        out.append({
+            "gav": {
+                "groupId": node.get("groupId") or "",
+                "artifactId": node.get("artifactId") or "",
+                "version": node.get("version") or "",
+            },
+            "errors": errors,
+        })
+    return out
+
+
+def _depsdev_graph_unavailable(error: str, capability: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "truncated": False,
+        "diffReliable": False,
+        "error": error,
+        "graphError": None,
+        "nodeErrors": [],
+        "capabilityUnavailable": capability,
+        "exitCode": None,
+        "trees": [],
+        "graph": {"nodes": [], "edges": []},
+    }
+
+
+def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a GetDependencies payload onto the shared side shape.
+
+    ``ok`` stays true when the graph is truncated or carries ``graphError``;
+    those bits only clear ``diffReliable``. A capability flag is a hard failure.
+    """
+    raw_cap = fetched.get("capabilityUnavailable")
+    capability = raw_cap if isinstance(raw_cap, str) and raw_cap else None
+    ok = bool(fetched.get("ok")) and capability is None
+    truncated = bool(fetched.get("truncated"))
+    raw_graph_error = fetched.get("graphError")
+    graph_error = raw_graph_error.strip() if isinstance(raw_graph_error, str) else None
+    if graph_error == "":
+        graph_error = None
+    nodes = [node for node in (fetched.get("nodes") or []) if isinstance(node, dict)]
+    node_errors = _node_errors_from_depsdev(nodes)
+    trees: List[Dict[str, Any]] = []
+    graph: Dict[str, Any] = {"nodes": [], "edges": []}
+    if ok:
+        trees = [_depsdev_graph_tree(fetched)]
+        graph = _normalise_closure_graph(trees)
+    raw_error = fetched.get("error")
+    error = None
+    if not ok:
+        error = raw_error if isinstance(raw_error, str) and raw_error else "deps.dev graph unavailable"
+    return {
+        "ok": ok,
+        "truncated": truncated,
+        "diffReliable": ok and not truncated and graph_error is None and not node_errors,
+        "error": error,
+        "graphError": graph_error,
+        "nodeErrors": node_errors,
+        "capabilityUnavailable": capability,
+        "exitCode": None,
+        "trees": trees,
+        "graph": graph,
+    }
+
+
+def _fetch_depsdev_closure_sides(
+    upgrade: Dict[str, str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    versions = [upgrade["fromVersion"], upgrade["toVersion"]]
+
+    def fetch(version: str) -> Dict[str, Any]:
+        try:
+            return fetch_depsdev_dependencies(
+                upgrade["groupId"], upgrade["artifactId"], version,
+            )
+        except Exception:
+            # Do not interpolate exception text: urlopen errors can embed userinfo.
+            return {
+                "ok": False,
+                "error": "deps.dev graph fetch failed",
+                "capabilityUnavailable": "unreachable",
+                "nodes": [],
+                "edges": [],
+                "truncated": False,
+                "graphError": None,
+                "partial": True,
+            }
+
+    rows, _partial = _map_parallel(versions, fetch, deadline=_now() + TOOL_DEADLINE)
+    sides: List[Dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            sides.append(_side_from_depsdev_graph(row))
+        else:
+            sides.append(_depsdev_graph_unavailable(
+                "deps.dev graph fetch did not finish before the deadline",
+                "unreachable",
+            ))
+    return sides[0], sides[1]
+
+
+def _license_row_for_gav(gav: Dict[str, str], row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    base: Dict[str, Any] = {
+        "groupId": gav["groupId"],
+        "artifactId": gav["artifactId"],
+        "version": gav["version"],
+        "ok": False,
+        "licenses": [],
+    }
+    if row is None:
+        base["error"] = "deps.dev license fetch did not finish before the deadline"
+        base["capabilityUnavailable"] = "unreachable"
+        return base
+    base["ok"] = bool(row.get("ok"))
+    base["licenses"] = list(row.get("licenses") or [])
+    raw_error = row.get("error")
+    if raw_error:
+        base["error"] = raw_error if isinstance(raw_error, str) else "deps.dev license fetch failed"
+    if row.get("capabilityUnavailable"):
+        base["capabilityUnavailable"] = row["capabilityUnavailable"]
+    return base
+
+
+def _fetch_one_upgrade_license(gav: Dict[str, str]) -> Dict[str, Any]:
+    try:
+        row = fetch_depsdev_licenses(gav["groupId"], gav["artifactId"], gav["version"])
+    except Exception:
+        row = {
+            "ok": False,
+            "licenses": [],
+            "error": "deps.dev license fetch failed",
+            "capabilityUnavailable": "unreachable",
+        }
+    return _license_row_for_gav(gav, row if isinstance(row, dict) else None)
+
+
+def _fetch_upgrade_license_delta(
+    diff: Dict[str, Any],
+    upgrades: List[Dict[str, str]],
+    *,
+    project_license: Optional[str],
+    disallow: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    """GetVersion for the closure delta only. One GAV skips ``_map_parallel``."""
+    selected = _select_delta_gavs(
+        upgrades,
+        diff,
+        include_targets=False,
+        cap=MAX_UPGRADE_LICENSE_NODES,
+    )
+    gavs = selected["gavs"]
+    if not gavs:
+        return None
+    if len(gavs) == 1:
+        fetched = [_fetch_one_upgrade_license(gavs[0])]
+    else:
+        rows, _partial = _map_parallel(
+            gavs,
+            _fetch_one_upgrade_license,
+            deadline=_now() + TOOL_DEADLINE,
+        )
+        fetched = []
+        for gav, row in zip(gavs, rows):
+            if isinstance(row, dict):
+                fetched.append(row)
+            else:
+                fetched.append(_license_row_for_gav(gav, None))
+    return _license_delta(
+        diff,
+        fetched,
+        project_license=project_license,
+        disallow=disallow,
+    )
+
+
+def _upgrade_include_licenses(args: Dict) -> bool:
+    raw = args.get("includeLicenses", True)
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def _upgrade_license_policy_args(
+    args: Dict,
+) -> Tuple[Optional[str], Optional[List[str]]]:
+    project_license = args.get("projectLicense")
+    if not isinstance(project_license, str):
+        project_license = None
+    disallow = args.get("disallow")
+    if disallow is None:
+        return project_license, None
+    if not isinstance(disallow, list):
+        disallow = [str(disallow)]
+    return project_license, [str(item) for item in disallow]
+
+
+def _graph_failure_fields(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> Tuple[str, Optional[str]]:
+    error = None
+    capability = None
+    for side in (before, after):
+        if side.get("ok"):
+            continue
+        if error is None and isinstance(side.get("error"), str) and side.get("error"):
+            error = side["error"]
+        cap = side.get("capabilityUnavailable")
+        if capability is None and isinstance(cap, str) and cap:
+            capability = cap
+    return error or "deps.dev graph unavailable", capability
+
+
+def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
+    """Compare one direct upgrade on an isolated deps.dev graph pair.
+
+    Not a project resolve. ``advisory`` is not a safety verdict. Gradle is
+    not launched. ``get_transitive_graph`` is not used (it drops ``relation``).
+    """
+    graph_source = _select_upgrade_graph_source(args)
+    upgrades = _parse_upgrade_requests(args.get("upgrades"))
+    upgrade = upgrades[0]
+    if _gradle_plugin_marker_plugin_id(upgrade["groupId"], upgrade["artifactId"]):
+        result = _marker_upgrade_result(graph_source, upgrade)
+        _log_upgrade_closure(result)
+        return result
+    if upgrade["fromVersion"] == upgrade["toVersion"]:
+        ranked = _advisory_for_upgrade(all_identity=True, targets=upgrades)
+        result = _with_upgrade_source(graph_source, [dict(upgrade)], ranked)
+        _log_upgrade_closure(result)
+        return result
+
+    include_licenses = _upgrade_include_licenses(args)
+    project_license, disallow = _upgrade_license_policy_args(args)
+    before, after = _fetch_depsdev_closure_sides(upgrade)
+    if not before["ok"] or not after["ok"]:
+        ranked = _advisory_for_upgrade(
+            targets=[dict(upgrade)],
+            before_ok=bool(before["ok"]),
+            after_ok=bool(after["ok"]),
+        )
+        error, capability = _graph_failure_fields(before, after)
+        result = _with_upgrade_source(
+            graph_source,
+            [dict(upgrade)],
+            ranked,
+            error=error,
+            capability=capability,
+        )
+        _log_upgrade_closure(result)
+        return result
+
+    diff = _diff_closure(before, after, upgrades, project_graph=False)
+    selected = _select_delta_gavs(upgrades, diff)
+    records = query_osv_batch(selected["gavs"]) if selected["gavs"] else []
+    classified = _classify_vuln_delta(upgrades, diff, records)
+    license_delta = None
+    if include_licenses:
+        license_delta = _fetch_upgrade_license_delta(
+            diff,
+            upgrades,
+            project_license=project_license,
+            disallow=disallow,
+        )
+    ranked = _advisory_for_upgrade(
+        targets=classified["targets"],
+        before_ok=True,
+        after_ok=True,
+        diff_reliable=bool(diff.get("diffReliable")),
+        diff=diff,
+        vulnerabilities=classified["vulnerabilities"],
+        license_delta=license_delta,
+        fixes_incomplete=bool(classified.get("fixesIncomplete")),
+        capability_unavailable=classified.get("capabilityUnavailable"),
+        input_truncated=bool(classified.get("inputTruncated") or selected.get("truncated")),
+    )
+    result = _with_upgrade_source(
+        graph_source,
+        [dict(upgrade)],
+        ranked,
+        truncated=bool(before.get("truncated") or after.get("truncated")),
+        notes=_depsdev_closure_notes(include_licenses),
+    )
+    _log_upgrade_closure(result)
+    return result
+
+
 def _detect_conflicts_from_gradle_scan(scan: Dict[str, Any]) -> Dict[str, Any]:
     """Detect version conflicts from Gradle-resolved scan usages (highest-wins)."""
     strategy = strategy_for_build_system("gradle")
@@ -6986,7 +7453,9 @@ def query_osv_batch(deps: List[Dict]) -> List[Dict]:
 
     When OSV is offline/unreachable (#296), every entry still returns with an
     empty ``vulnerabilities`` list PLUS ``capabilityUnavailable`` so an empty
-    result is never mistaken for "verified clean".
+    result is never mistaken for "verified clean". An HTTP non-200 querybatch
+    chunk sets the same ``unreachable`` flag on that chunk's entries only. A
+    200 with an empty vuln list is not flagged.
     """
     if not deps:
         return []
@@ -7000,18 +7469,16 @@ def query_osv_batch(deps: List[Dict]) -> List[Dict]:
             }
             for d in deps
         ]
-    # Phase 1: querybatch chunks → (dep, bare vulns_raw) pairs.
-    bare_pairs: List[Tuple[Dict, List[Dict]]] = []
-    chunk_unreachable = False
+    # Phase 1: querybatch chunks → (dep, bare vulns_raw, chunk unreachable).
+    bare_pairs: List[Tuple[Dict, List[Dict], bool]] = []
     for start in range(0, len(deps), OSV_QUERYBATCH_MAX):
         chunk = deps[start:start + OSV_QUERYBATCH_MAX]
         pairs, unreachable = _query_osv_batch_chunk_bare(chunk)
-        bare_pairs.extend(pairs)
-        if unreachable:
-            chunk_unreachable = True
+        for dep, vulns_raw in pairs:
+            bare_pairs.append((dep, vulns_raw, unreachable))
     # Phase 2: hydrate unique IDs across the whole batch (one GET per id).
     ids_ordered: List[str] = []
-    for _, vulns_raw in bare_pairs:
+    for _, vulns_raw, _unreachable in bare_pairs:
         for v in vulns_raw:
             vid = v.get("id") or ""
             if vid:
@@ -7019,7 +7486,7 @@ def query_osv_batch(deps: List[Dict]) -> List[Dict]:
     hydrated = _hydrate_osv_vulns(ids_ordered)
     # Phase 3: merge hydrated records and extract public fields.
     out: List[Dict] = []
-    for dep, vulns_raw in bare_pairs:
+    for dep, vulns_raw, unreachable in bare_pairs:
         vulns = []
         for v in vulns_raw:
             vid = v.get("id") or ""
@@ -7031,7 +7498,7 @@ def query_osv_batch(deps: List[Dict]) -> List[Dict]:
                 full = {**full, "id": vid}
             vulns.append(_vuln_info_from_osv(full))
         entry = {**dep, "vulnerabilities": vulns}
-        if chunk_unreachable and not vulns:
+        if unreachable and not vulns:
             entry["capabilityUnavailable"] = "unreachable"
         out.append(entry)
     return out
@@ -7044,7 +7511,8 @@ def _query_osv_batch_chunk_bare(
 
     On non-200 / error every dep gets an empty vulns_raw list. Does not hydrate
     or filter withdrawn — that happens after /v1/vulns/{id} merge.
-    ``unreachable`` is True on transport failure (not on HTTP non-200).
+    ``unreachable`` is True on transport failure and on HTTP non-200. A 200
+    whose vuln list is empty leaves it False.
     """
     queries = [
         {"package": {"name": f"{d['groupId']}:{d['artifactId']}", "ecosystem": "Maven"}, "version": d["version"]}
@@ -7055,7 +7523,7 @@ def _query_osv_batch_chunk_bare(
             _osv_querybatch_url(), {"queries": queries}, timeout=HTTP_TIMEOUT_EXTERNAL
         )
         if status != 200:
-            return [(d, []) for d in deps], False
+            return [(d, []) for d in deps], True
         data = json.loads(body)
         results = data.get("results", [])
         out: List[Tuple[Dict, List[Dict]]] = []
@@ -11866,6 +12334,11 @@ def handle_get_eol_status(args: Dict) -> Any:
     )
 
 
+def handle_compare_upgrade_closure(args: Dict) -> Any:
+    """MCP handler for ``compare_upgrade_closure``. deps.dev only."""
+    return compare_upgrade_closure(args)
+
+
 # ---------------------------------------------------------------------------
 # Shared outputSchema fragments (#398)
 # ---------------------------------------------------------------------------
@@ -12971,6 +13444,154 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
+    {
+        "name": "compare_upgrade_closure",
+        "description": (
+            "Compare the published deps.dev closure of exactly one direct upgrade "
+            "(fromVersion to toVersion). This is an isolated public graph, not a "
+            "project resolve: consumer dependencyManagement, ResolutionStrategy, "
+            "strict versions, enforcedPlatform, exclusions, and private artifacts "
+            "are not visible. graphSource must be depsdev. advisory is not a safety "
+            "verdict; none and unknown do not mean the coordinate is safe, and an "
+            "empty closure diff is not a guarantee."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "upgrades": {
+                    "type": "array",
+                    "maxItems": MAX_UPGRADE_SUBSTITUTIONS,
+                    "description": (
+                        "Exactly one upgrade. More than one is rejected. "
+                        "deps.dev does not union several roots into a project classpath."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "groupId": {"type": "string", "description": "Maven group ID"},
+                            "artifactId": {"type": "string", "description": "Maven artifact ID"},
+                            "fromVersion": {"type": "string", "description": "Version selected before the upgrade"},
+                            "toVersion": {"type": "string", "description": "Candidate version"},
+                        },
+                        "required": ["groupId", "artifactId", "fromVersion", "toVersion"],
+                    },
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Unused. This call does not read the project or launch Gradle.",
+                },
+                "graphSource": {
+                    "type": "string",
+                    "enum": ["depsdev"],
+                    "description": (
+                        "Only depsdev is accepted. The result is an isolated public "
+                        "graph, not a project resolve."
+                    ),
+                },
+                "includeLicenses": {
+                    "type": "boolean",
+                    "description": "License the changed coordinates. Default true. Targets are not licensed.",
+                },
+                "projectLicense": {
+                    "type": "string",
+                    "description": "SPDX id or name. Same posture rules as check_license_compliance.",
+                },
+                "disallow": {
+                    "type": "array",
+                    "description": "SPDX ids and/or category names. Replaces the default disallow set.",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["upgrades"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "graphSource": {"type": "string", "enum": ["depsdev"]},
+                "advisory": {
+                    "type": "string",
+                    "enum": ["stop", "review", "info", "none", "unknown"],
+                },
+                "partial": {"type": "boolean"},
+                "diffReliable": {"type": "boolean"},
+                "upgrades": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "fromVersion": {"type": "string"},
+                            "toVersion": {"type": "string"},
+                            "error": {"type": "string"},
+                        },
+                        "required": ["groupId", "artifactId", "fromVersion", "toVersion"],
+                    },
+                },
+                "summary": {
+                    "type": "object",
+                    "properties": {
+                        "added": {"type": "integer"},
+                        "changed": {"type": "integer"},
+                        "removed": {"type": "integer"},
+                        "unchanged": {"type": "integer"},
+                    },
+                    "required": ["added", "changed", "removed", "unchanged"],
+                },
+                "dependencies": {
+                    "type": "object",
+                    "properties": {
+                        "added": {"type": "array", "items": {"type": "object"}},
+                        "changed": {"type": "array", "items": {"type": "object"}},
+                        "removed": {"type": "array", "items": {"type": "object"}},
+                    },
+                    "required": ["added", "changed", "removed"],
+                },
+                "vulnerabilities": {
+                    "type": "object",
+                    "properties": {
+                        "introduced": {"type": "array", "items": {"type": "object"}},
+                        "remaining": {"type": "array", "items": {"type": "object"}},
+                        "fixed": {"type": "array", "items": {"type": "object"}},
+                        "uncompared": {"type": "array", "items": {"type": "object"}},
+                    },
+                    "required": ["introduced", "remaining", "fixed", "uncompared"],
+                },
+                "targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "fromVersion": {"type": "string"},
+                            "toVersion": {"type": "string"},
+                            "vulnerabilities": {"type": "array", "items": {"type": "object"}},
+                            "vulnerabilityDelta": {"type": "array", "items": {"type": "object"}},
+                            "capabilityUnavailable": {"type": "string"},
+                            "safeUpgrade": {"type": "object"},
+                        },
+                        "required": ["groupId", "artifactId", "fromVersion", "toVersion"],
+                    },
+                },
+                "notes": {"type": "array", "items": {"type": "string"}},
+                "license": {"type": "object"},
+                "capabilityUnavailable": {"type": "string"},
+                "error": {"type": "string"},
+                "fixesIncomplete": {"type": "boolean"},
+                "dependenciesTruncated": {"type": "boolean"},
+                "truncated": {"type": "boolean"},
+                "inputTruncated": {"type": "boolean"},
+            },
+            "required": [
+                "graphSource", "advisory", "partial", "diffReliable", "upgrades",
+                "summary", "dependencies", "vulnerabilities", "targets", "notes",
+            ],
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -12994,6 +13615,7 @@ TOOL_HANDLERS = {
     "catalog_entry": handle_catalog_entry,
     "verify_coordinates": handle_verify_coordinates,
     "get_eol_status": handle_get_eol_status,
+    "compare_upgrade_closure": handle_compare_upgrade_closure,
 }
 
 # Name -> inputSchema, for the dispatcher's own required-argument pre-check
