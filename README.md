@@ -34,7 +34,7 @@ Version lookups use the repositories the build file declares. Maven Central, Goo
 | `catalog_entry` | Generate/validate Gradle version-catalog entries (`libs.versions.toml`) with rule-correct aliases and minimal diffs |
 | `verify_coordinates` | Tri-state existence check + did-you-mean for hallucinated coordinates |
 | `get_eol_status` | End-of-life / support status for JDK (vendor-specific), Kotlin, Gradle, and Spring Boot via endoflife.date |
-| `compare_upgrade_closure` | Compare one direct upgrade on an isolated public deps.dev graph (not a project resolve) |
+| `compare_upgrade_closure` | Compare an upgrade's closure. Gradle when a wrapper exists; deps.dev is the single-upgrade fallback |
 
 ### Skills
 
@@ -76,7 +76,7 @@ capability through the MCP tool above:
 | `/license-compliance` | Aggregate transitive licenses vs a project license policy; flag copyleft/violations |
 | `/search-artifacts` | Search Maven Central (or Nexus/Artifactory in closed mode) by keyword |
 | `/eol-status` | Check end-of-life / support status for JDK, Kotlin, Gradle, or Spring Boot |
-| `/upgrade-closure` | Compare one direct upgrade on an isolated public deps.dev graph; advisory only, not a project resolve |
+| `/upgrade-closure` | Compare an upgrade closure (Gradle when a wrapper exists, otherwise one deps.dev upgrade); advisory only |
 
 ### Supported build systems
 
