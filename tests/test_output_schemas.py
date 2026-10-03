@@ -459,6 +459,45 @@ _FIXTURES = {
             {"product": "kotlin", "requestedVersion": "9.9.9", "error": "no matching release cycle found for version '9.9.9'"},
         ],
     },
+    "compare_upgrade_closure": {
+        "graphSource": "depsdev",
+        "advisory": "info",
+        "partial": False,
+        "diffReliable": True,
+        "upgrades": [{
+            "groupId": "com.squareup.okhttp3",
+            "artifactId": "okhttp",
+            "fromVersion": "4.9.3",
+            "toVersion": "4.12.0",
+        }],
+        "summary": {"added": 1, "changed": 0, "removed": 0, "unchanged": 0},
+        "dependencies": {
+            "added": [{
+                "groupId": "com.example",
+                "artifactId": "extra",
+                "versions": ["1.0.0"],
+            }],
+            "changed": [],
+            "removed": [],
+        },
+        "vulnerabilities": {
+            "introduced": [],
+            "remaining": [],
+            "fixed": [],
+            "uncompared": [],
+        },
+        "targets": [{
+            "groupId": "com.squareup.okhttp3",
+            "artifactId": "okhttp",
+            "fromVersion": "4.9.3",
+            "toVersion": "4.12.0",
+            "vulnerabilities": [],
+        }],
+        "notes": [
+            "The closure added, changed, or removed coordinates.",
+            "Graphs are resolved per root in isolation via deps.dev — not a full Maven/Gradle project resolve.",
+        ],
+    },
 }
 
 
