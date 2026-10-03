@@ -4485,21 +4485,6 @@ def _marker_upgrade_result(graph_source: str, upgrade: Dict[str, str]) -> Dict[s
     }
 
 
-def _depsdev_graph_tree(fetched: Dict[str, Any]) -> Dict[str, Any]:
-    nodes = []
-    for index, node in enumerate(fetched.get("nodes") or []):
-        copied = dict(node)
-        copied["index"] = index
-        nodes.append(copied)
-    edges = []
-    for edge in fetched.get("edges") or []:
-        src = edge.get("from")
-        dst = edge.get("to")
-        if isinstance(src, int) and isinstance(dst, int):
-            edges.append({"from": src, "to": dst})
-    return {"module": None, "configuration": None, "nodes": nodes, "edges": edges}
-
-
 def _node_errors_from_depsdev(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for node in nodes:
@@ -4518,21 +4503,6 @@ def _node_errors_from_depsdev(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any
             "errors": errors,
         })
     return out
-
-
-def _depsdev_graph_unavailable(error: str, capability: Optional[str] = None) -> Dict[str, Any]:
-    return {
-        "ok": False,
-        "truncated": False,
-        "diffReliable": False,
-        "error": error,
-        "graphError": None,
-        "nodeErrors": [],
-        "capabilityUnavailable": capability,
-        "exitCode": None,
-        "trees": [],
-        "graph": {"nodes": [], "edges": []},
-    }
 
 
 def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
@@ -4554,7 +4524,11 @@ def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
     trees: List[Dict[str, Any]] = []
     graph: Dict[str, Any] = {"nodes": [], "edges": []}
     if ok:
-        trees = [_depsdev_graph_tree(fetched)]
+        # Index and non-int edges are already handled by _normalise_closure_graph.
+        trees = [{
+            "nodes": fetched.get("nodes") or [],
+            "edges": fetched.get("edges") or [],
+        }]
         graph = _normalise_closure_graph(trees)
     raw_error = fetched.get("error")
     error = None
@@ -4600,13 +4574,17 @@ def _fetch_depsdev_closure_sides(
     rows, _partial = _map_parallel(versions, fetch, deadline=_now() + TOOL_DEADLINE)
     sides: List[Dict[str, Any]] = []
     for row in rows:
-        if isinstance(row, dict):
-            sides.append(_side_from_depsdev_graph(row))
-        else:
-            sides.append(_depsdev_graph_unavailable(
-                "deps.dev graph fetch did not finish before the deadline",
-                "unreachable",
-            ))
+        if not isinstance(row, dict):
+            row = {
+                "ok": False,
+                "error": "deps.dev graph fetch did not finish before the deadline",
+                "capabilityUnavailable": "unreachable",
+                "nodes": [],
+                "edges": [],
+                "truncated": False,
+                "graphError": None,
+            }
+        sides.append(_side_from_depsdev_graph(row))
     return sides[0], sides[1]
 
 
