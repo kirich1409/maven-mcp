@@ -318,6 +318,53 @@ class ClosureGraphTest(unittest.TestCase):
             ["child", "shared", "other"],
         )
 
+    def test_shared_gav_does_not_clear_another_configuration(self):
+        upgrade = _upgrade("com.acme", "direct", "1.0.0", "2.0.0")
+        app = _tree("app", "runtimeClasspath", [
+            _project(),
+            _gav("com.acme", "direct", "2.0.0"),
+            _gav("com.acme", "sibling", "1.0.0"),
+        ], [{"from": 0, "to": 1}, {"from": 0, "to": 2}])
+        other = _tree("other", "runtimeClasspath", [
+            _project(),
+            _gav("com.acme", "sibling", "1.0.0"),
+            _gav("com.acme", "hidden", "1.0.0"),
+        ], [{"from": 0, "to": 1}, {"from": 1, "to": 2}])
+        graph = server._normalise_closure_graph([app, other])
+        diff = server._diff_closure(_side(_empty_graph()), _side(graph), [upgrade])
+        by_artifact = {row["artifactId"]: row for row in diff["added"]}
+        self.assertFalse(by_artifact["sibling"]["sideEffect"])
+        self.assertTrue(by_artifact["hidden"]["sideEffect"])
+
+    def test_project_component_keeps_both_parents(self):
+        upgrade = _upgrade("com.acme", "direct", "1.0.0", "2.0.0")
+        nodes = [
+            _gav("com.acme", "direct", "2.0.0"),
+            _gav("com.acme", "unrelated", "1.0.0"),
+            _project(),
+            _gav("com.acme", "child", "1.0.0"),
+        ]
+        orders = (
+            [{"from": 1, "to": 2}, {"from": 0, "to": 2}, {"from": 2, "to": 3}],
+            [{"from": 0, "to": 2}, {"from": 1, "to": 2}, {"from": 2, "to": 3}],
+        )
+        for edges in orders:
+            graph = server._normalise_closure_graph([
+                _tree("app", "runtimeClasspath", nodes, edges),
+            ])
+            index = {
+                node.get("artifactId"): i
+                for i, node in enumerate(graph["nodes"])
+                if node.get("artifactId")
+            }
+            self.assertIn({"from": index["direct"], "to": index["child"]}, graph["edges"])
+            self.assertIn({"from": index["unrelated"], "to": index["child"]}, graph["edges"])
+            diff = server._diff_closure(_side(_empty_graph()), _side(graph), [upgrade])
+            child = next(row for row in diff["added"] if row["artifactId"] == "child")
+            self.assertFalse(child["sideEffect"])
+            self.assertEqual(child["path"][0]["artifactId"], "direct")
+            self.assertEqual(child["path"][-1]["artifactId"], "child")
+
     def test_sort_uses_full_path_length(self):
         upgrade = _upgrade("com.acme", "direct", "1.0.0", "2.0.0")
         graph = server._normalise_closure_graph([_tree("app", "runtimeClasspath", [
@@ -733,6 +780,75 @@ class VulnDeltaTest(unittest.TestCase):
         )
         self.assertEqual(ranked["advisory"], "review")
         self.assertNotEqual(ranked["advisory"], "stop")
+
+    def test_partial_after_version_keeps_queried_malicious(self):
+        upgrade = _upgrade("com.acme", "lib", "1.0.0", "2.0.0")
+        mal = _vuln("MAL-2025-9", malicious=True, summary="malicious package")
+        old = _vuln("CVE-OLD", severity="HIGH", summary="only on the before version")
+        diff = {
+            "added": [{
+                "groupId": "com.acme",
+                "artifactId": "widget",
+                "versions": ["1.0.0", "2.0.0"],
+            }],
+            "changed": [{
+                "groupId": "com.acme",
+                "artifactId": "shifted",
+                "fromVersions": ["1.0.0"],
+                "toVersions": ["2.0.0", "3.0.0"],
+            }],
+            "removed": [],
+            "summary": {"added": 1, "changed": 1, "removed": 0, "unchanged": 0},
+        }
+        with self._bomb():
+            classified = server._classify_vuln_delta([upgrade], diff, [
+                _osv("com.acme", "lib", "1.0.0"),
+                _osv("com.acme", "lib", "2.0.0"),
+                _osv("com.acme", "widget", "1.0.0", [mal]),
+                _osv("com.acme", "shifted", "1.0.0", [old]),
+                _osv("com.acme", "shifted", "2.0.0"),
+            ])
+        introduced = classified["vulnerabilities"]["introduced"]
+        self.assertEqual([item["id"] for item in introduced], ["MAL-2025-9"])
+        self.assertTrue(introduced[0]["malicious"])
+        self.assertNotEqual(introduced[0]["relation"], "uncompared")
+        self.assertEqual(classified["vulnerabilities"]["fixed"], [])
+        self.assertTrue(classified["inputTruncated"])
+        ranked = server._advisory_for_upgrade(
+            diff_reliable=True,
+            diff=diff,
+            targets=classified["targets"],
+            vulnerabilities=classified["vulnerabilities"],
+            fixes_incomplete=classified["fixesIncomplete"],
+            input_truncated=classified["inputTruncated"],
+        )
+        self.assertEqual(ranked["advisory"], "stop")
+
+    def test_target_fixed_id_is_info_not_none(self):
+        upgrade = _upgrade("com.acme", "lib", "1.0.0", "2.0.0")
+        before = _side({"nodes": [_gav("com.acme", "lib", "1.0.0")], "edges": []})
+        after = _side({"nodes": [_gav("com.acme", "lib", "2.0.0")], "edges": []})
+        diff = server._diff_closure(before, after, [upgrade])
+        self.assertEqual(diff["summary"]["added"], 0)
+        self.assertEqual(diff["summary"]["changed"], 0)
+        self.assertEqual(diff["summary"]["removed"], 0)
+        with self._bomb():
+            classified = server._classify_vuln_delta([upgrade], diff, [
+                _osv("com.acme", "lib", "1.0.0", [_vuln("CVE-FIXED", severity="CRITICAL")]),
+                _osv("com.acme", "lib", "2.0.0"),
+            ])
+        target = classified["targets"][0]
+        self.assertEqual(target["vulnerabilities"], [])
+        self.assertEqual(target["vulnerabilityDelta"][0]["relation"], "fixed")
+        self.assertEqual(target["vulnerabilityDelta"][0]["id"], "CVE-FIXED")
+        self.assertEqual(classified["vulnerabilities"]["fixed"], [])
+        ranked = server._advisory_for_upgrade(
+            diff_reliable=True,
+            diff=diff,
+            targets=classified["targets"],
+            vulnerabilities=classified["vulnerabilities"],
+        )
+        self.assertEqual(ranked["advisory"], "info")
 
 
 class LicenseAndSelectionTest(unittest.TestCase):

@@ -3188,10 +3188,6 @@ def _is_closure_gav(node: Dict[str, Any]) -> bool:
     return bool(node.get("groupId") and node.get("artifactId") and node.get("version"))
 
 
-def _cmp_versions(left: Any, right: Any) -> int:
-    return compare_versions(str(left), str(right))
-
-
 def _sorted_versions(versions: List[str]) -> List[str]:
     seen = set()
     uniq: List[str] = []
@@ -3200,7 +3196,7 @@ def _sorted_versions(versions: List[str]) -> List[str]:
             continue
         seen.add(version)
         uniq.append(version)
-    return sorted(uniq, key=functools.cmp_to_key(_cmp_versions))
+    return sorted(uniq, key=functools.cmp_to_key(compare_versions))
 
 
 def _dedup_usages(usages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3304,42 +3300,48 @@ def _normalise_closure_graph(trees: List[Dict[str, Any]]) -> Dict[str, Any]:
             positioned.append((src_pos, dst_pos))
             parents.setdefault(dst_pos, []).append(src_pos)
 
-        memo: Dict[int, int] = {}
+        memo: Dict[int, List[int]] = {}
 
-        def kept(idx: int, trail: Tuple[int, ...]) -> int:
-            # Walk project components to the nearest module, or the synthetic
-            # configuration root when the parent is the project itself.
+        def kept_ancestors(idx: int, trail: Tuple[int, ...]) -> List[int]:
+            # A removed project component keeps every parent edge. One memoized
+            # ancestor would drop the other parent and hide the shorter path.
             if idx in memo:
                 return memo[idx]
             if idx in trail:
-                memo[idx] = ensure_synthetic(module, configuration)
-                return memo[idx]
+                return []
             node = local_nodes[idx]
             if node.get("synthetic"):
-                merged = ensure_synthetic(
+                merged = [ensure_synthetic(
                     node.get("module", module), node.get("configuration", configuration),
-                )
+                )]
                 memo[idx] = merged
                 return merged
             if _is_closure_gav(node):
-                merged = ensure_gav(node, module, configuration)
+                merged = [ensure_gav(node, module, configuration)]
                 memo[idx] = merged
                 return merged
+            ancestors: List[int] = []
+            seen_anc = set()
             for parent in parents.get(idx, []):
-                merged = kept(parent, trail + (idx,))
-                memo[idx] = merged
-                return merged
-            merged = ensure_synthetic(module, configuration)
-            memo[idx] = merged
-            return merged
+                for ancestor in kept_ancestors(parent, trail + (idx,)):
+                    if ancestor not in seen_anc:
+                        seen_anc.add(ancestor)
+                        ancestors.append(ancestor)
+            if not ancestors:
+                ancestors = [ensure_synthetic(module, configuration)]
+            memo[idx] = ancestors
+            return ancestors
 
         for pos, node in enumerate(local_nodes):
             if _is_closure_gav(node):
-                kept(pos, ())
+                kept_ancestors(pos, ())
         for src_pos, dst_pos in positioned:
             if not _is_closure_gav(local_nodes[dst_pos]):
                 continue
-            add_edge(kept(src_pos, ()), kept(dst_pos, ()))
+            dst_ids = kept_ancestors(dst_pos, ())
+            for src_id in kept_ancestors(src_pos, ()):
+                for dst_id in dst_ids:
+                    add_edge(src_id, dst_id)
 
     return {"nodes": nodes_out, "edges": edges_out}
 
@@ -3384,11 +3386,10 @@ def _closure_paths(
 
     One ``_bfs_predecessors`` per substituted root (no multi-source mode).
     A synthetic configuration root that can reach a substituted GA is a
-    fallback root: a project hop collapses onto that root, so the child is
-    still in the upgraded configuration and is not a side effect. Nodes no
-    substituted GA and no such root can reach are side effects. ``sideEffect``
-    is omitted when ``project_graph`` is false (deps.dev has no cross-tree
-    effects).
+    fallback root, but only through nodes that have a usage in that same
+    module and configuration. A shared GAV must not carry the walk into
+    another configuration. ``sideEffect`` is omitted when ``project_graph``
+    is false (deps.dev has no cross-tree effects).
     """
     nodes = list(graph.get("nodes") or [])
     edges = list(graph.get("edges") or [])
@@ -3407,9 +3408,9 @@ def _closure_paths(
 
     best: Dict[int, List[int]] = {}
 
-    def consider(roots: List[int], *, only_missing: bool) -> None:
+    def consider(roots: List[int], walk_edges: List[Dict[str, int]], *, only_missing: bool) -> None:
         for root in roots:
-            predecessor = _bfs_predecessors(edges, root)
+            predecessor = _bfs_predecessors(walk_edges, root)
             for idx, node in enumerate(nodes):
                 if node.get("synthetic") or not _is_closure_gav(node):
                     continue
@@ -3422,17 +3423,33 @@ def _closure_paths(
                 if previous is None or len(path) < len(previous):
                     best[idx] = path
 
-    consider(sub_indexes, only_missing=False)
+    def in_config(node: Dict[str, Any], module: Any, configuration: Any) -> bool:
+        if node.get("synthetic"):
+            return node.get("module") == module and node.get("configuration") == configuration
+        for usage in node.get("usages") or []:
+            if usage.get("module") == module and usage.get("configuration") == configuration:
+                return True
+        return False
+
+    def config_edges(module: Any, configuration: Any, root: int) -> List[Dict[str, int]]:
+        allowed = {
+            idx for idx, node in enumerate(nodes) if in_config(node, module, configuration)
+        }
+        return [
+            edge for edge in edges
+            if edge["to"] in allowed and (edge["from"] == root or edge["from"] in allowed)
+        ]
+
+    consider(sub_indexes, edges, only_missing=False)
     if project_graph and sub_indexes:
-        upgrade_synthetics: List[int] = []
         for idx, node in enumerate(nodes):
             if not node.get("synthetic"):
                 continue
-            predecessor = _bfs_predecessors(edges, idx)
+            scoped = config_edges(node.get("module"), node.get("configuration"), idx)
+            predecessor = _bfs_predecessors(scoped, idx)
             # Reachable substituted nodes are in the predecessor map (the root is not).
             if any(sub in predecessor for sub in sub_indexes):
-                upgrade_synthetics.append(idx)
-        consider(upgrade_synthetics, only_missing=True)
+                consider([idx], scoped, only_missing=True)
 
     out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for idx, node in enumerate(nodes):
@@ -3659,18 +3676,8 @@ def _select_delta_gavs(
             push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("toVersion"))
         for upgrade in upgrades or []:
             push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("fromVersion"))
-    for row in diff.get("added") or []:
-        for version in row.get("versions") or []:
-            push(row.get("groupId"), row.get("artifactId"), version)
-    for row in diff.get("changed") or []:
-        for version in row.get("toVersions") or []:
-            push(row.get("groupId"), row.get("artifactId"), version)
-    for row in diff.get("changed") or []:
-        for version in row.get("fromVersions") or []:
-            push(row.get("groupId"), row.get("artifactId"), version)
-    for row in diff.get("removed") or []:
-        for version in row.get("versions") or []:
-            push(row.get("groupId"), row.get("artifactId"), version)
+    for group_id, artifact_id, version, _kind in _ordered_license_gavs(diff):
+        push(group_id, artifact_id, version)
 
     deduped: List[Dict[str, str]] = []
     seen = set()
@@ -3687,9 +3694,9 @@ def _select_delta_gavs(
     target_keys = set()
     for upgrade in upgrades or []:
         for version_key in ("toVersion", "fromVersion"):
-            version = upgrade.get(version_key)
-            if upgrade.get("groupId") and upgrade.get("artifactId") and version:
-                target_keys.add((upgrade.get("groupId"), upgrade.get("artifactId"), version))
+            pinned = upgrade.get(version_key)
+            if upgrade.get("groupId") and upgrade.get("artifactId") and pinned:
+                target_keys.add((upgrade.get("groupId"), upgrade.get("artifactId"), pinned))
     prefix: List[Dict[str, str]] = []
     rest: List[Dict[str, str]] = []
     for gav in deduped:
@@ -3849,10 +3856,16 @@ def _classify_vuln_delta(
             input_truncated = True
         path_fields = None if target else _diff_path_fields(diff, group_id, artifact_id)
         versions = by_ga.get((group_id, artifact_id), {})
+        queried_after = [
+            version for version in after_versions
+            if (group_id, artifact_id, version) in queried
+        ]
         if before_missing and before_versions:
             fixes_incomplete = True
-            if not target and not after_missing:
-                after_hits = _vulns_by_version(versions, after_versions)
+            if not target:
+                # A missing before-version blocks introduced/fixed, but a MAL-
+                # on a queried after-version still has to be visible to the ranker.
+                after_hits = _vulns_by_version(versions, queried_after)
                 for vuln_id in sorted(after_hits):
                     version, raw = _lowest_version_hit(after_hits[vuln_id])
                     uncompared.append(_upgrade_vuln_item(
@@ -3865,11 +3878,8 @@ def _classify_vuln_delta(
                         path_fields=path_fields,
                     ))
             return delta
-        if after_missing and after_versions:
-            # Cannot tell introduced from remaining, or that a before-only id left.
-            return delta
         before_hits = _vulns_by_version(versions, before_versions)
-        after_hits = _vulns_by_version(versions, after_versions)
+        after_hits = _vulns_by_version(versions, queried_after)
         for vuln_id in sorted(set(before_hits) | set(after_hits)):
             on_before = vuln_id in before_hits
             on_after = vuln_id in after_hits
@@ -3879,6 +3889,9 @@ def _classify_vuln_delta(
             elif on_after:
                 relation = "introduced"
                 version, raw = _lowest_version_hit(after_hits[vuln_id])
+            elif after_missing:
+                # Another after-version was not queried, so this id may still be selected.
+                continue
             else:
                 relation = "fixed"
                 version, raw = _lowest_version_hit(before_hits[vuln_id])
@@ -4234,7 +4247,12 @@ def _advisory_for_upgrade(
     delta_rows = bool(dependencies["added"] or dependencies["changed"] or dependencies["removed"])
     if delta_rows:
         info_notes.append("The closure added, changed, or removed coordinates.")
-    if vuln_buckets["fixed"]:
+    target_fixed = any(
+        item.get("relation") == "fixed"
+        for target in targets or []
+        for item in target.get("vulnerabilityDelta") or []
+    )
+    if vuln_buckets["fixed"] or target_fixed:
         info_notes.append("A vulnerability is no longer on the selected coordinate.")
     if any(_severity_label(item) in _INFO_SEVERITIES for item in vuln_buckets["remaining"]):
         info_notes.append("A remaining vulnerability is medium or low.")
