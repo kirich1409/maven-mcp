@@ -82,21 +82,30 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
 `substitution` unset (`exact`) unless the user accepts the retry below.
 
 1. **Drop rows that this tool does not compare.** Print an explicit `not closure-checked`
-   line for each, name the coordinate, and do not send it. Do not later describe that
-   line as `advisory: none`. Drop a row only when either is true:
-   - Gradle plugin marker: `artifactId` ends with `.gradle.plugin` and `groupId` is
-     that plugin id.
-   - No `usages[].configuration` is a production runtime classpath. Read every usage,
-     not only the first `configuration`. A usage counts only when all of these hold:
-     it is not a test configuration (the name starts with `test`, or matches
-     `[a-z]Test`), it is not `classpath`, it is not `compileOnly`, it is not
-     `compileClasspath` and does not end with `CompileClasspath`, and the name is
-     `runtimeClasspath` or ends with `RuntimeClasspath`. The Java plugin name
-     `runtimeClasspath` does not end with `RuntimeClasspath` (the leading `r` is
-     lowercase); the equality arm is required. Keep a row that has at least one
-     such usage. Dropped rows include buildscript-only classpath and a plugin
-     coordinate that is not a marker and is not on that classpath (AGP and KGP
-     included).
+   line for each dropped row, name the coordinate, and do not send it. Do not later
+   describe that line as `advisory: none`.
+
+   Always drop a Gradle plugin marker: `artifactId` ends with `.gradle.plugin` and
+   `groupId` is that plugin id.
+
+   **Gradle configuration names** (`gradlew` exists). The `runtimeClasspath` predicate
+   applies only here. Also drop a row when no `usages[].configuration` is a production
+   runtime classpath. Read every usage, not only the first `configuration`. A usage
+   counts only when all of these hold: it is not a test configuration (the name starts
+   with `test`, or matches `[a-z]Test`), it is not `classpath`, it is not `compileOnly`,
+   it is not `compileClasspath` and does not end with `CompileClasspath`, and the name
+   is `runtimeClasspath` or ends with `RuntimeClasspath`. The Java plugin name
+   `runtimeClasspath` does not end with `RuntimeClasspath` (the leading `r` is
+   lowercase); the equality arm is required. Keep a row that has at least one such
+   usage. Dropped rows include buildscript-only classpath and a plugin coordinate that
+   is not a marker and is not on that classpath (AGP and KGP included).
+
+   **No `gradlew`.** Do not apply the `runtimeClasspath` predicate. Maven `compile` is
+   stored as `implementation` and Maven `runtime` as `runtimeOnly`; neither is
+   `runtimeClasspath`, and those rows stay in the batch. Drop test scopes
+   (`testImplementation`, a name that starts with `test`, or matches `[a-z]Test`) and
+   `compileOnly` / `provided`. Do not print `implementation` or `runtimeOnly` as
+   `not closure-checked`.
 
    If no library upgrade remains, do not call. Print the not-closure-checked lines
    only. An empty `upgrades` list is rejected; do not quote that error as `unknown`.

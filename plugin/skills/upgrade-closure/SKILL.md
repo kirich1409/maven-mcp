@@ -32,9 +32,11 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
 
 2. If the selection would be deps.dev and the user named more than one upgrade,
    say "a batch closure needs a Gradle wrapper" and do not call. Do not loop one
-   call per coordinate. The confirm-step split (markers, rows with no production
-   runtime usage, the 20-upgrade cap, and no call when nothing remains) lives in
-   `/check-deps`. Do not invent a second split.
+   call per coordinate. The confirm-step split lives in `/check-deps`: markers; the
+   `runtimeClasspath` predicate only for Gradle configuration names; without a
+   wrapper, Maven `implementation` and `runtimeOnly` stay (drop test scopes and
+   `compileOnly` / `provided`); the 20-upgrade cap; no call when nothing remains.
+   Do not invent a second split.
 
 3. Render with the same decision row as `/check-deps`. Lead with `advisory`,
    `graphSource`, `diffReliable`, and any `not closure-checked` line you already
