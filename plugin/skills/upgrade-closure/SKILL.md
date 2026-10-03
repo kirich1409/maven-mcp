@@ -32,44 +32,62 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
 
 2. If the selection would be deps.dev and the user named more than one upgrade,
    say "a batch closure needs a Gradle wrapper" and do not call. Do not loop one
-   call per coordinate. The confirm-step split (markers, classpath-only rows,
-   the 20-upgrade cap) lives in `/check-deps`. Do not invent a second split.
+   call per coordinate. The confirm-step split (markers, rows with no production
+   runtime usage, the 20-upgrade cap, and no call when nothing remains) lives in
+   `/check-deps`. Do not invent a second split.
 
 3. Render with the same decision row as `/check-deps`. Lead with `advisory`,
    `graphSource`, `diffReliable`, and any `not closure-checked` line you already
    printed. Do not re-rank. Do not paraphrase a CVE `summary`. Skip a field
    only when the payload omitted it.
 
-   - **`stop`** — one decision row per `MAL-` id, including `path` when present.
-     Do not apply the edit. Do not call an `uncompared` `MAL-` "introduced".
-   - **`review`** — one decision row per introduced id (include an id with no
-     severity), per target `CRITICAL`/`HIGH`, and per remaining `CRITICAL`/`HIGH`
-     still labeled remaining. Then license `violation`s and every matrix reason
-     that is set: `diffReliable` false, `fixesIncomplete`, a target not `landed`,
+   The upgraded coordinate is not in `vulnerabilities.introduced` / `remaining` /
+   `fixed`. Its introduced, remaining, and fixed rows are
+   `targets[].vulnerabilityDelta`; keep that relation. `targets[].vulnerabilities`
+   is `relation: target` only. Do not relabel a delta row `target`, and do not use
+   the target list to fill introduced, remaining, or fixed. Other coordinates come
+   from the closure buckets.
+
+   - **`stop`** — one decision row per `MAL-` id in `targets[].vulnerabilities`,
+     `targets[].vulnerabilityDelta`, and `vulnerabilities.introduced` / `remaining` /
+     `uncompared`, including `path` when present. If the same id is in both the
+     target list and the delta, one row, and the relation is the delta's. Do not
+     apply the edit. Do not call an `uncompared` `MAL-` "introduced".
+   - **`review`** — one decision row per introduced id from `vulnerabilityDelta`
+     and from `vulnerabilities.introduced` (include an id with no severity), per
+     `relation: target` at `CRITICAL`/`HIGH` only when that id is not already in
+     `vulnerabilityDelta`, and per remaining `CRITICAL`/`HIGH` from
+     `vulnerabilityDelta` and from `vulnerabilities.remaining`, still labeled
+     remaining. Then license `violation`s and every matrix reason that is set:
+     `diffReliable` false, `fixesIncomplete`, a target not `landed`,
      `rewroteVersionless`, `capabilityUnavailable`. When
-     `targets[].safeUpgrade.version` is above `toVersion`, say the confirmed
-     direct version does not clear every known CVE and name that candidate. Ask
+     `compare_versions(safeUpgrade.version, toVersion) > 0`, say the confirmed
+     direct version does not clear every known CVE and name that candidate. That
+     compare is numeric segments, not text order (`1.10` is above `1.9`). Ask
      again before editing. Writing that higher version is a new confirm and a
      new preview.
-   - **`info`** — `added` / `changed` / `removed` counts and the first rows,
-     then a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and
-     each introduced `MEDIUM`/`LOW`. License rows whose `verdict` is `review` or
-     `ok`. Do not call the bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
+   - **`info`** — `added` / `changed` / `removed` counts and the first rows, then
+     a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and each
+     introduced `MEDIUM`/`LOW`, from `vulnerabilityDelta` and from the closure
+     buckets. License rows whose `verdict` is `review` or `ok`. Do not call the
+     bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
    - **`unknown`** — the closure was not compared. Quote `error`. Do not describe
      empty buckets as "no change" and do not fill the gap.
    - **`none` after a compare** (`diffReliable: true`, and the target has a
-     `vulnerabilities` list) — no coordinate change outside the target, then the
-     target OSV result. Quote the non-guarantee note from `notes`. Do not say
-     safe. If the coordinate is a platform or carries `managedBy`, and
-     `graphSource` is `depsdev`, do not use that closure sentence: an empty
-     public-graph diff is not "no coordinate change". The server has no
-     `isPlatform` input.
+     `vulnerabilities` list) — no coordinate change outside the target, then that
+     target OSV result (`relation: target`). Quote the non-guarantee note from
+     `notes`. Do not say safe. If the coordinate is a platform or carries
+     `managedBy`, and `graphSource` is `depsdev`, do not use that closure
+     sentence: an empty public-graph diff is not "no coordinate change". The
+     server has no `isPlatform` input.
    - **`none` when nothing was requested to change** — nothing was requested to
      change and the current coordinate was not re-queried. Do not say the graphs
-     were compared. Do not invent an empty OSV result. `targets[].vulnerabilities`
-     is absent on that path; an empty list would mean it was queried.
+     were compared. Do not invent an empty OSV result. Do not say safe.
+     `targets[].vulnerabilities` is absent on that path; an empty list would mean
+     it was queried.
 
-   `none` and `unknown` are not "safe" and are not "no vulnerabilities".
+   Compared `none`, all-identity `none`, and `unknown` are not "safe" and are not
+   "no vulnerabilities".
 
    `targets[].safeUpgrade` is one extra line on the direct coordinate, labeled
    advisory: `fixesAllKnown` and `version`, or `fixesAllKnown: false` plus

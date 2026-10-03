@@ -83,13 +83,23 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
 
 1. **Drop rows that this tool does not compare.** Print an explicit `not closure-checked`
    line for each, name the coordinate, and do not send it. Do not later describe that
-   line as `advisory: none`. Drop a row when either is true:
+   line as `advisory: none`. Drop a row only when either is true:
    - Gradle plugin marker: `artifactId` ends with `.gradle.plugin` and `groupId` is
      that plugin id.
-   - Every `usages[].configuration` is `classpath`, or the row is not on a
-     configuration whose name ends with `RuntimeClasspath`. That includes
-     buildscript-only rows and a plugin coordinate that is not a marker and is not
-     on the runtime classpath (AGP and KGP included).
+   - No `usages[].configuration` is a production runtime classpath. Read every usage,
+     not only the first `configuration`. A usage counts only when all of these hold:
+     it is not a test configuration (the name starts with `test`, or matches
+     `[a-z]Test`), it is not `classpath`, it is not `compileOnly`, it is not
+     `compileClasspath` and does not end with `CompileClasspath`, and the name is
+     `runtimeClasspath` or ends with `RuntimeClasspath`. The Java plugin name
+     `runtimeClasspath` does not end with `RuntimeClasspath` (the leading `r` is
+     lowercase); the equality arm is required. Keep a row that has at least one
+     such usage. Dropped rows include buildscript-only classpath and a plugin
+     coordinate that is not a marker and is not on that classpath (AGP and KGP
+     included).
+
+   If no library upgrade remains, do not call. Print the not-closure-checked lines
+   only. An empty `upgrades` list is rejected; do not quote that error as `unknown`.
 
 2. **No `gradlew`** (Maven project, or Gradle files without a wrapper). Do not call
    the tool once per coordinate. `auto` would select deps.dev.
@@ -100,45 +110,58 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
      public-graph diff is not "no coordinate change" for a platform or a managed
      row: deps.dev does not show versions that BOM moves elsewhere.
 
-3. **`gradlew` exists.** One call. Omit `graphSource` (`auto`). At most 20 library
-   upgrades. The server rejects a longer list; it does not truncate. If more than 20
-   remain, send majors first (`upgradeType` `major`), then rows whose direct audit
-   entry already has `vulnerabilities`. Say the rest were `not closure-checked`.
-   Do not loop.
+3. **`gradlew` exists and at least one library upgrade remains.** One call. Omit
+   `graphSource` (`auto`). At most 20 library upgrades. The server rejects a longer
+   list; it does not truncate. If more than 20 remain, send majors first
+   (`upgradeType` `major`), then rows whose direct audit entry already has
+   `vulnerabilities`. Say the rest were `not closure-checked`. Do not loop.
 
 4. **Render that single result.** Lead with `advisory`, `graphSource`, `diffReliable`,
    and every `not closure-checked` line from the split. Then the block for `advisory`.
    Do not re-rank. A decision row is specified under [Decision row](#decision-row).
    Do not paraphrase a CVE `summary`. Skip a field only when the payload omitted it.
 
-   - **`stop`** — one decision row per `MAL-` id (target `vulnerabilities`, and
-     `vulnerabilities.introduced` / `remaining` / `uncompared`), including `path`
-     when present. Do not edit. Do not call an `uncompared` `MAL-` "introduced".
-   - **`review`** — one decision row per introduced id (include an id with no
-     severity; do not drop it), per target `CRITICAL`/`HIGH`, and per remaining
-     `CRITICAL`/`HIGH` still labeled remaining. Then license rows whose `verdict`
-     is `violation`, and every matrix reason that is set: `diffReliable` false,
-     `fixesIncomplete`, a target not `landed`, `rewroteVersionless`,
-     `capabilityUnavailable`. When `targets[].safeUpgrade.version` is above
-     `toVersion`, say the confirmed direct version does not clear every known CVE
-     and name that candidate. Ask again before editing. Writing that higher version
-     is a new confirm and a new preview, not an in-place edit of this result.
+   The upgraded coordinate is not in `vulnerabilities.introduced` / `remaining` /
+   `fixed`. Its introduced, remaining, and fixed rows are `targets[].vulnerabilityDelta`;
+   keep that relation. `targets[].vulnerabilities` is `relation: target` only. Do not
+   relabel a delta row `target`, and do not use the target list to fill introduced,
+   remaining, or fixed. Other coordinates come from the closure buckets.
+
+   - **`stop`** — one decision row per `MAL-` id in `targets[].vulnerabilities`,
+     `targets[].vulnerabilityDelta`, and `vulnerabilities.introduced` / `remaining` /
+     `uncompared`, including `path` when present. If the same id is in both the
+     target list and the delta, one row, and the relation is the delta's. Do not
+     edit. Do not call an `uncompared` `MAL-` "introduced".
+   - **`review`** — one decision row per introduced id from `vulnerabilityDelta` and
+     from `vulnerabilities.introduced` (include an id with no severity; do not drop
+     it), per `relation: target` at `CRITICAL`/`HIGH` only when that id is not
+     already in `vulnerabilityDelta`, and per remaining `CRITICAL`/`HIGH` from
+     `vulnerabilityDelta` and from `vulnerabilities.remaining`, still labeled
+     remaining. Then license rows whose `verdict` is `violation`, and every matrix
+     reason that is set: `diffReliable` false, `fixesIncomplete`, a target not
+     `landed`, `rewroteVersionless`, `capabilityUnavailable`. When
+     `compare_versions(safeUpgrade.version, toVersion) > 0`, say the confirmed
+     direct version does not clear every known CVE and name that candidate. That
+     compare is numeric segments, not text order (`1.10` is above `1.9`). Ask
+     again before editing. Writing that higher version is a new confirm and a new
+     preview, not an in-place edit of this result.
    - **`info`** — `added` / `changed` / `removed` counts and the first rows, then
      a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and each
-     introduced `MEDIUM`/`LOW`. License rows whose `verdict` is `review` or `ok`.
-     Do not call the bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
+     introduced `MEDIUM`/`LOW`, from `vulnerabilityDelta` and from the closure
+     buckets. License rows whose `verdict` is `review` or `ok`. Do not call the
+     bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
    - **`unknown`** — the closure was not compared. Quote `error`. Do not fill the
      gap, and do not describe empty buckets as "no change".
    - **`none` after a compare** (`diffReliable: true`, and the target has a
      `vulnerabilities` list, empty when nothing came back) — no coordinate change
-     outside the target, then the target OSV result. Quote the non-guarantee note
-     from `notes`. Do not say safe. On a deps.dev platform or `managedBy` row, do
-     not use that closure sentence: an empty public-graph diff is not "no
-     coordinate change".
+     outside the target, then that target OSV result (`relation: target`). Quote
+     the non-guarantee note from `notes`. Do not say safe. On a deps.dev platform
+     or `managedBy` row, do not use that closure sentence: an empty public-graph
+     diff is not "no coordinate change".
    - **`none` from all-identity** (`vulnerabilities` omitted on the target, not
      `[]`) — nothing was requested to change and the current coordinate was not
      re-queried. Do not say the graphs were compared. Do not invent an empty OSV
-     result.
+     result. Do not say safe.
 
    `targets[].safeUpgrade` is one extra line on the direct coordinate, labeled
    advisory: `fixesAllKnown` and `version`, or `fixesAllKnown: false` plus
@@ -149,8 +172,9 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
    send it unless the user accepts. An accepted retry is a new preview, not an edit.
 
 `stop` ends the edit. `review` waits for the new answer. `info`, compared `none`,
-and `unknown` do not mean safe; they also do not by themselves cancel a set the
-user already confirmed. Step 5 stays a build check. This preview is not a build.
+all-identity `none`, and `unknown` do not mean safe; they also do not by themselves
+cancel a set the user already confirmed. Step 5 stays a build check. This preview
+is not a build.
 
 ### Decision row
 
@@ -213,7 +237,7 @@ Surface failures immediately. Attempt trivial fixes; otherwise revert that entry
 - Step 1 stays direct: `audit_project_dependencies` is first-level production dependencies, not the closure. The closure preview runs only after confirm, for the library batch, and is not a safety verdict.
 - The write hooks do not call `compare_upgrade_closure`. Do not add that call.
 - This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
-- The audit requires a Gradle wrapper (`gradlew`). Maven-only projects are out of scope for this scan path. Without a wrapper the preview is one deps.dev call, or no call when the batch is larger.
+- The audit requires a Gradle wrapper (`gradlew`). Maven-only projects are out of scope for this scan path. Without a wrapper the preview is one deps.dev call, or no call when the batch is larger or no library upgrade remains.
 
 ## Fallback (MCP unavailable only)
 
