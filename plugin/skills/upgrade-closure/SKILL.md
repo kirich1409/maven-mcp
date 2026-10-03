@@ -1,27 +1,38 @@
 ---
 name: upgrade-closure
 description: >-
-  Use when the user asks what a single direct dependency upgrade changes in the
-  published closure, which transitives appear or disappear, or whether the
-  candidate coordinate brings new vulnerabilities or license categories. One
-  deps.dev graph pair. Not a project resolve and not a safety verdict.
+  Use when the user asks what a direct dependency upgrade changes in the
+  resolved closure, which transitives appear or disappear, or whether the
+  candidate brings new vulnerabilities or license categories. Gradle when a
+  wrapper exists; otherwise one deps.dev upgrade. Not a safety verdict.
 disable-model-invocation: true
 ---
 
 # Upgrade closure
 
-Compare one direct upgrade (`fromVersion` → `toVersion`) on an isolated public
-deps.dev graph. Call the tool. Do not diff graphs yourself.
+Call **`compare_upgrade_closure`**. Do not diff graphs yourself.
+
+`graphSource` defaults to `auto`:
+
+- `auto` — Gradle when the project is a Gradle build and `gradlew` exists,
+  otherwise deps.dev.
+- `gradle` — two sequential wrapper resolves. No deps.dev fallback if that fails.
+- `depsdev` — one isolated public graph pair. Exactly one upgrade.
+
+Gradle accepts up to 20 substitutions (`substitution` `exact` or `module`,
+default `exact`). `exact` is not retried as `module`. deps.dev rejects more
+than one upgrade. `includeLicenses` defaults to true.
 
 ## Steps
 
-1. Take exactly one library upgrade: `groupId`, `artifactId`, `fromVersion`,
-   `toVersion`. If the user named more than one, say a batch needs a project
-   resolve that this tool does not do, and do not call it once per coordinate.
+1. Pass the library upgrades the user named (`groupId`, `artifactId`,
+   `fromVersion`, `toVersion`) and `projectPath` when the project is not the
+   working directory. Leave `graphSource` unset unless the user asked for
+   `gradle` or `depsdev`. Do not call the tool once per coordinate.
 
-2. Call **`compare_upgrade_closure`** with that single upgrade. Leave
-   `graphSource` unset or set it to `depsdev`. `includeLicenses` defaults to
-   true.
+2. If the selection would be deps.dev and the user named more than one upgrade,
+   say a batch needs a Gradle wrapper and do not call. The confirm-step split
+   (markers, classpath-only rows) is a separate workflow.
 
 3. Lead with `advisory`, `graphSource`, and `diffReliable`. Then render:
 
@@ -51,18 +62,22 @@ deps.dev graph. Call the tool. Do not diff graphs yourself.
 
 ## Constraints and non-goals
 
-- One upgrade. Do not loop this tool.
+- Do not loop this tool. One Gradle batch, or one deps.dev upgrade.
+- Do not treat a failed Gradle result as a deps.dev graph.
 - Do not diff two `get_transitive_graph` results. That wrapper drops `relation`,
   and the server already owns the matrix.
 - Do not run `mvn dependency:tree` or `./gradlew dependencies` and present the
   text as if OSV had been queried.
-- This is an isolated public graph, not the project's classpath. It does not
-  see `dependencyManagement`, `ResolutionStrategy`, strict versions,
-  `enforcedPlatform`, exclusions, or private artifacts. Say that when you
-  render the result.
+- When `graphSource` is `depsdev`, say the graph is isolated: it does not see
+  `dependencyManagement`, `ResolutionStrategy`, strict versions,
+  `enforcedPlatform`, exclusions, or private artifacts. Do not say that about
+  a Gradle result.
+- `landed: false` or `rewroteVersionless: true` is at least `review`. Do not
+  retry `exact` as `module` unless the user asks.
 - An empty OSV list is not verified-clean. Unchanged transitives were not queried.
 - License rows are heuristic signals, not legal advice. Only changed coordinates
-  are licensed.
+  are licensed. On the Gradle path, license metadata is not taken from the
+  resolve; a missing deps.dev record is `review`, not a known license.
 
 ## Fallback (MCP unavailable only)
 

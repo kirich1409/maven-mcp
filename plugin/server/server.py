@@ -29,7 +29,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import zlib
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -4362,28 +4362,67 @@ def _advisory_for_upgrade(
     return result
 
 
-# deps.dev-only until a Gradle wrapper fixture accepts auto/gradle. A public
-# graph must not be described as the project classpath.
+# auto resolves to gradle when gradlew exists, else one deps.dev upgrade.
+# Coordinates are checked after selection and before any resolve.
 _UPGRADE_GA_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _UPGRADE_VERSION_RE = re.compile(r"^[A-Za-z0-9_.+\-]+$")
 _UPGRADE_CHANGED_ONLY_LICENSE_NOTE = (
     "Only the changed coordinates were licensed, not the unchanged closure."
 )
+_GRADLE_LICENSE_METADATA_NOTE = (
+    "License metadata is not taken from the Gradle resolve; "
+    "a missing deps.dev record is review, not a known license."
+)
+_VERSIONLESS_ARM_NOTE = (
+    "The empty-version arm rewrites every versionless request for that "
+    "coordinate on the dumped production-runtime configurations, which is "
+    "wider than one declaration."
+)
+_GRADLE_ERROR_LIMIT = 500
+_GRADLE_UPGRADE_TREE = "===MAVEN_MCP_TREE==="
+_GRADLE_UPGRADE_TREE_END = "===MAVEN_MCP_TREE_END==="
+_GRADLE_UPGRADE_TRUNCATED = "===MAVEN_MCP_TRUNCATED==="
+_GRADLE_UPGRADE_CONFIG_ERROR = "===MAVEN_MCP_CONFIG_ERROR==="
+_GRADLE_UPGRADE_MATCHED = "===MAVEN_MCP_MATCHED==="
+_GRADLE_UPGRADE_REQUEST = "===MAVEN_MCP_REQUEST==="
 
 
-def _select_upgrade_graph_source(args: Dict) -> str:
-    """Return ``depsdev`` or reject the request.
+def _select_upgrade_graph_source(args: Dict, project_path: str) -> str:
+    """Pick ``gradle`` or ``depsdev`` before any resolve.
 
-    ``auto`` and ``gradle`` are not accepted yet: there is no wrapper fixture,
-    and a marketplace install of this revision must not pretend to resolve
-    the project.
+    ``auto`` (the default) is Gradle only when the project is a Gradle build
+    and a wrapper exists. A Gradle file without ``gradlew`` still falls
+    through to deps.dev. Nothing here retries a failed Gradle run as deps.dev.
     """
-    requested = args.get("graphSource") or "depsdev"
-    if requested != "depsdev":
-        raise ValueError(
-            "graphSource must be depsdev; auto and gradle are not accepted"
-        )
+    requested = args.get("graphSource") or "auto"
+    if requested == "depsdev":
+        return "depsdev"
+    if requested == "gradle":
+        return "gradle"
+    # auto, and any unrecognised value: one filesystem check, not one per coordinate.
+    if (
+        _detect_build_system(project_path) == "gradle"
+        and _find_gradle_wrapper(project_path)
+    ):
+        return "gradle"
     return "depsdev"
+
+
+def _upgrade_project_path(args: Dict) -> str:
+    raw = args.get("projectPath") or os.getcwd()
+    if not isinstance(raw, str):
+        raise ValueError("projectPath must be a string")
+    return raw
+
+
+def _upgrade_substitution(args: Dict) -> str:
+    """``exact`` or ``module``. Ignored by the deps.dev fetcher, still validated."""
+    raw = args.get("substitution", "exact")
+    if raw is None:
+        return "exact"
+    if raw not in ("exact", "module"):
+        raise ValueError("substitution must be exact or module")
+    return raw
 
 
 def _parse_upgrade_requests(raw: Any) -> List[Dict[str, str]]:
@@ -4433,41 +4472,88 @@ def _parse_upgrade_requests(raw: Any) -> List[Dict[str, str]]:
     identities = [upgrade["fromVersion"] == upgrade["toVersion"] for upgrade in upgrades]
     if identities and any(identities) and not all(identities):
         raise ValueError("cannot mix an unchanged version with a real bump")
-    if len(upgrades) != 1:
-        raise ValueError("deps.dev compares exactly one upgrade")
+    if not upgrades:
+        raise ValueError("at least one upgrade is required")
     return upgrades
+
+
+def _license_note(prefix: str) -> str:
+    for note in _LICENSE_COMPLIANCE_NOTES:
+        if note.startswith(prefix):
+            return note
+    return prefix
 
 
 def _depsdev_closure_notes(include_licenses: bool) -> List[str]:
     """Isolation paragraph, plus license caveats when that fetch is in scope."""
-    def pick(prefix: str) -> str:
-        for note in _LICENSE_COMPLIANCE_NOTES:
-            if note.startswith(prefix):
-                return note
-        return prefix
-
-    notes = [pick("Graphs are resolved per root in isolation")]
+    notes = [_license_note("Graphs are resolved per root in isolation")]
     if include_licenses:
-        notes.append(pick("License data comes from deps.dev"))
-        notes.append(pick("Verdicts are heuristic"))
-        notes.append(pick("deps.dev may return SPDX"))
-        notes.append(_UPGRADE_CHANGED_ONLY_LICENSE_NOTE)
+        notes.extend(_shared_license_notes())
     return notes
 
 
-def _log_upgrade_closure(result: Dict[str, Any]) -> None:
+def _shared_license_notes() -> List[str]:
+    """Heuristic, SPDX, and changed-only sentences used by both graph sources."""
+    return [
+        _license_note("License data comes from deps.dev"),
+        _license_note("Verdicts are heuristic"),
+        _license_note("deps.dev may return SPDX"),
+        _UPGRADE_CHANGED_ONLY_LICENSE_NOTE,
+    ]
+
+
+def _gradle_closure_notes(include_licenses: bool) -> List[str]:
+    """Gradle classpath notes. The deps.dev isolation paragraph does not apply."""
+    if not include_licenses:
+        return []
+    return _shared_license_notes() + [_GRADLE_LICENSE_METADATA_NOTE]
+
+
+def _log_upgrade_closure(
+    result: Dict[str, Any],
+    *,
+    before: Optional[Dict[str, Any]] = None,
+    after: Optional[Dict[str, Any]] = None,
+    launched_gradle: bool = False,
+) -> None:
+    """One line. No transitive versions and no Gradle stderr."""
     upgrades = result.get("upgrades") or []
     first = upgrades[0] if upgrades else {}
+    targets = result.get("targets") or []
+    landed = sum(1 for target in targets if target.get("landed") is True)
+    versionless = sum(1 for target in targets if target.get("rewroteVersionless"))
+    before_ok = None if before is None else bool(before.get("ok"))
+    after_ok = None if after is None else bool(after.get("ok"))
+    before_trees = 0 if before is None else len(before.get("trees") or [])
+    after_trees = 0 if after is None else len(after.get("trees") or [])
+    zero_tree = (before is not None and before_trees == 0) or (after is not None and after_trees == 0)
+    before_exit = None if before is None else before.get("exitCode")
+    after_exit = None if after is None else after.get("exitCode")
+    timed_out = before_exit == 124 or after_exit == 124
     _logger.info(
         "compare_upgrade_closure graphSource=%s advisory=%s partial=%s "
-        "diffReliable=%s upgrades=%d first=%s:%s",
+        "diffReliable=%s ok=%s/%s trees=%d/%d zeroTree=%s upgrades=%d first=%s:%s "
+        "landed=%d rewroteVersionless=%d exit=%s/%s timeout=%s noConfigurationCache=%s "
+        "capability=%s",
         result.get("graphSource"),
         result.get("advisory"),
         result.get("partial"),
         result.get("diffReliable"),
+        before_ok,
+        after_ok,
+        before_trees,
+        after_trees,
+        zero_tree,
         len(upgrades),
         first.get("groupId") or "-",
         first.get("artifactId") or "-",
+        landed,
+        versionless,
+        before_exit,
+        after_exit,
+        timed_out,
+        launched_gradle,
+        result.get("capabilityUnavailable") or "-",
     )
 
 
@@ -4501,15 +4587,21 @@ def _with_upgrade_source(
     return result
 
 
-def _marker_upgrade_result(graph_source: str, upgrade: Dict[str, str]) -> Dict[str, Any]:
-    echoed = dict(upgrade)
-    echoed["error"] = "plugin marker; closure not compared"
+def _marker_upgrade_result(
+    graph_source: str,
+    upgrades_out: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    echoed: List[Dict[str, Any]] = []
+    for upgrade in upgrades_out:
+        row = dict(upgrade)
+        row["error"] = "plugin marker; closure not compared"
+        echoed.append(row)
     return {
         "graphSource": graph_source,
         "advisory": "unknown",
         "partial": True,
         "diffReliable": False,
-        "upgrades": [echoed],
+        "upgrades": echoed,
         "summary": _empty_upgrade_summary(),
         "dependencies": _empty_upgrade_dependencies(),
         "vulnerabilities": _empty_vuln_buckets(),
@@ -4739,60 +4831,742 @@ def _graph_failure_fields(
         cap = side.get("capabilityUnavailable")
         if capability is None and isinstance(cap, str) and cap:
             capability = cap
-    return error or "deps.dev graph unavailable", capability
+    return error or "upgrade graph unavailable", capability
+
+
+# Static init script. Coordinates stay in the JSON file, never in this text.
+# @@NODE_CAP@@ is MAX_TRANSITIVE_GRAPH_NODES, not a requested coordinate, so
+# two phases still share one byte string.
+_GRADLE_UPGRADE_INIT_SCRIPT = r"""
+import groovy.json.JsonSlurper
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
+// Duplicates _is_production_runtime_configuration and
+// _select_configurations_to_resolve. Do not read resolutionResult unless the
+// name passes: that read resolves the configuration. Test configurations and
+// the buildscript classpath are not resolved here.
+def isTestConfiguration(String name) {
+    if (name.startsWith("test")) {
+        return true
+    }
+    return name.matches(".*[a-z]Test.*")
+}
+
+def isProductionRuntime(String name) {
+    if (name == null || name.isEmpty()) {
+        return false
+    }
+    if (isTestConfiguration(name)) {
+        return false
+    }
+    if (name == "classpath" || name == "compileOnly") {
+        return false
+    }
+    if (name == "compileClasspath" || name.endsWith("CompileClasspath")) {
+        return false
+    }
+    // endswith("RuntimeClasspath") misses Java's runtimeClasspath (lowercase r).
+    return name == "runtimeClasspath" || name.endsWith("RuntimeClasspath")
+}
+
+def oneLine(message) {
+    def text = message == null ? "resolution failed" : message.toString()
+    text = text.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    if (text.length() > 500) {
+        text = text.substring(0, 500)
+    }
+    return text
+}
+
+def field(value) {
+    def text = value == null ? "" : value.toString()
+    return text.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+}
+
+def upgradeFile = System.getProperty("maven.mcp.upgrade.file")
+def payload = new JsonSlurper().parse(new File(upgradeFile))
+def phase = payload.phase == null ? "" : payload.phase.toString()
+def substitution = payload.substitution == null ? "exact" : payload.substitution.toString()
+def upgrades = payload.upgrades
+
+def matched = new LinkedHashMap()
+upgrades.each { u ->
+    def key = u.groupId + "\t" + u.artifactId + "\t" + u.fromVersion + "\t" + u.toVersion
+    matched[key] = [0, 0]
+}
+def requests = []
+
+def recordRequest = { group, name, requestedVersion, rewritten ->
+    requests.add([group, name, requestedVersion, rewritten])
+}
+
+// useVersion does not add a strict constraint. Landed is decided in Python.
+def applyRule = { details ->
+    def req = details.requested
+    def requestedVersion = req.version == null ? "" : req.version.toString()
+    upgrades.each { u ->
+        def sameModule = req.group == u.groupId && req.name == u.artifactId
+        if (!sameModule) {
+            return
+        }
+        def exact = req.version != null && req.version.toString() == u.fromVersion.toString()
+        def versionless = req.version == null || req.version.toString().isEmpty()
+        def take = substitution == "module" || exact || versionless
+        if (!take) {
+            recordRequest(field(req.group), field(req.name), field(requestedVersion), "0")
+            return
+        }
+        def key = u.groupId + "\t" + u.artifactId + "\t" + u.fromVersion + "\t" + u.toVersion
+        def counts = matched[key]
+        if (counts != null) {
+            counts[0] = ((int) counts[0]) + 1
+            if (versionless) {
+                counts[1] = ((int) counts[1]) + 1
+            }
+        }
+        details.useVersion(u.toVersion.toString())
+        details.because("maven-mcp upgrade preview")
+        recordRequest(field(u.groupId), field(u.artifactId), field(requestedVersion), "1")
+    }
+}
+
+def walkComponent
+walkComponent = { component, parentIndex, state ->
+    if (state.truncated) {
+        return
+    }
+    def id = component.id
+    def key = String.valueOf(id)
+    if (state.seen.containsKey(key)) {
+        if (parentIndex != null) {
+            state.edges.add([parentIndex, state.seen[key]])
+        }
+        return
+    }
+    if (((int) state.next) >= @@NODE_CAP@@) {
+        state.truncated = true
+        return
+    }
+    def index = (int) state.next
+    state.next = index + 1
+    state.seen[key] = index
+    def projectNode = id instanceof ProjectComponentIdentifier
+    if (projectNode || !(id instanceof ModuleComponentIdentifier)) {
+        state.nodes.add([index: index, project: true])
+    } else {
+        state.nodes.add([
+            index: index,
+            group: id.group,
+            artifact: id.module,
+            version: id.version,
+        ])
+    }
+    if (parentIndex != null) {
+        state.edges.add([parentIndex, index])
+    }
+    def dependencies = component.dependencies
+    if (dependencies == null) {
+        return
+    }
+    dependencies.each { dep ->
+        if (state.truncated) {
+            return
+        }
+        if (dep instanceof UnresolvedDependencyResult) {
+            def requested = dep.requested
+            def label = requested == null ? "unresolved dependency" : requested.displayName
+            def failure = dep.failure
+            def message = failure == null || failure.message == null ? label : failure.message
+            state.errors.add(oneLine(message))
+            return
+        }
+        if (dep instanceof ResolvedDependencyResult) {
+            def again = walkComponent
+            again.call(dep.selected, index, state)
+        }
+    }
+}
+
+def dumpConfiguration = { p, cfg ->
+    try {
+        def state = [
+            nodes: [],
+            edges: [],
+            seen: [:],
+            next: 0,
+            truncated: false,
+            errors: [],
+        ]
+        // Read resolutionResult only while the help task holds the project lock.
+        // Gradle 9 rejects the same read from projectsEvaluated. The walk is a
+        // script closure; call it explicitly so Gradle's delegate does not
+        // swallow the name.
+        def walk = walkComponent
+        walk.call(cfg.incoming.resolutionResult.root, null, state)
+        println("===MAVEN_MCP_TREE===\t" + p.path + "\t" + cfg.name)
+        state.nodes.each { node ->
+            if (node.project) {
+                println("PROJECT\t" + node.index)
+            } else {
+                println(
+                    "NODE\t" + node.index
+                    + "\t" + field(node.group)
+                    + "\t" + field(node.artifact)
+                    + "\t" + field(node.version)
+                )
+            }
+        }
+        state.edges.each { edge ->
+            println("EDGE\t" + edge[0] + "\t" + edge[1])
+        }
+        println("===MAVEN_MCP_TREE_END===")
+        if (state.truncated) {
+            println("===MAVEN_MCP_TRUNCATED===\t" + p.path + "\t" + cfg.name)
+        }
+        state.errors.each { message ->
+            println("===MAVEN_MCP_CONFIG_ERROR===\t" + p.path + "\t" + cfg.name + "\t" + message)
+        }
+    } catch (Exception e) {
+        println("===MAVEN_MCP_CONFIG_ERROR===\t" + p.path + "\t" + cfg.name + "\t" + oneLine(e.message))
+    }
+}
+
+gradle.projectsEvaluated {
+    def planned = []
+    gradle.rootProject.allprojects.each { p ->
+        def selected = []
+        p.configurations.each { cfg ->
+            if (cfg.canBeResolved && isProductionRuntime(cfg.name)) {
+                selected.add(cfg)
+            }
+        }
+        def hasRelease = selected.any { cfg ->
+            cfg.name.startsWith("release") && cfg.name.endsWith("RuntimeClasspath")
+        }
+        if (hasRelease) {
+            selected = selected.findAll { cfg -> cfg.name != "runtimeClasspath" }
+        }
+        selected.each { cfg ->
+            if (phase == "after") {
+                cfg.resolutionStrategy.eachDependency applyRule
+            }
+            planned.add([project: p, configuration: cfg])
+        }
+    }
+    def help = gradle.rootProject.tasks.findByName("help")
+    if (help != null) {
+        help.doFirst {
+            def dump = dumpConfiguration
+            planned.each { item ->
+                dump.call(item.project, item.configuration)
+            }
+            matched.each { key, counts ->
+                println("===MAVEN_MCP_MATCHED===\t" + key + "\t" + counts[0] + "\t" + counts[1])
+            }
+            requests.each { row ->
+                println("===MAVEN_MCP_REQUEST===\t" + row[0] + "\t" + row[1] + "\t" + row[2] + "\t" + row[3])
+            }
+        }
+    }
+}
+"""
+
+
+def _generate_gradle_upgrade_init_script() -> str:
+    """Static Groovy. Group, artifact, and version are not interpolated."""
+    return _GRADLE_UPGRADE_INIT_SCRIPT.replace(
+        "@@NODE_CAP@@", str(MAX_TRANSITIVE_GRAPH_NODES),
+    )
+
+
+def _parse_gradle_closure_stdout(stdout: str) -> Dict[str, Any]:
+    """Tab-separated dump. The version is the remainder after a fixed split.
+
+    A space-separated ``NODE`` line is not a node. Project components are
+    marked so ``_normalise_closure_graph`` drops them and keeps their children.
+    """
+    trees: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    truncated: List[Dict[str, str]] = []
+    matched: List[Dict[str, Any]] = []
+    requests: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    def header(line: str, marker: str) -> Optional[List[str]]:
+        if line == marker or line.startswith(marker + "\t"):
+            return line.split("\t")
+        return None
+
+    for line in stdout.splitlines():
+        if line.startswith(_GRADLE_UPGRADE_TREE_END):
+            if current is not None:
+                trees.append(current)
+                current = None
+            continue
+        tree_header = header(line, _GRADLE_UPGRADE_TREE)
+        if tree_header is not None:
+            if current is not None:
+                trees.append(current)
+            current = {
+                "module": tree_header[1] if len(tree_header) > 1 else "",
+                "configuration": tree_header[2] if len(tree_header) > 2 else "",
+                "nodes": [],
+                "edges": [],
+            }
+            continue
+        if current is not None and line.startswith("NODE\t"):
+            parts = line.split("\t", 4)
+            if len(parts) != 5:
+                continue
+            try:
+                index = int(parts[1])
+            except ValueError:
+                continue
+            current["nodes"].append({
+                "index": index,
+                "groupId": parts[2],
+                "artifactId": parts[3],
+                "version": parts[4],
+            })
+            continue
+        if current is not None and line.startswith("PROJECT\t"):
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            try:
+                index = int(parts[1])
+            except ValueError:
+                continue
+            current["nodes"].append({"index": index, "project": True})
+            continue
+        if current is not None and line.startswith("EDGE\t"):
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                src = int(parts[1])
+                dst = int(parts[2])
+            except ValueError:
+                continue
+            current["edges"].append({"from": src, "to": dst})
+            continue
+        truncated_header = header(line, _GRADLE_UPGRADE_TRUNCATED)
+        if truncated_header is not None:
+            truncated.append({
+                "module": truncated_header[1] if len(truncated_header) > 1 else "",
+                "configuration": truncated_header[2] if len(truncated_header) > 2 else "",
+            })
+            continue
+        error_header = header(line, _GRADLE_UPGRADE_CONFIG_ERROR)
+        if error_header is not None:
+            # Message keeps the remainder so a tab inside it is not a new column.
+            parts = line.split("\t", 3)
+            errors.append({
+                "module": parts[1] if len(parts) > 1 else "",
+                "configuration": parts[2] if len(parts) > 2 else "",
+                "message": (parts[3] if len(parts) > 3 else "")[:_GRADLE_ERROR_LIMIT],
+            })
+            continue
+        if line.startswith(_GRADLE_UPGRADE_MATCHED + "\t"):
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            try:
+                rewritten = int(parts[5])
+                versionless = int(parts[6])
+            except ValueError:
+                continue
+            matched.append({
+                "groupId": parts[1],
+                "artifactId": parts[2],
+                "fromVersion": parts[3],
+                "toVersion": parts[4],
+                "rewritten": rewritten,
+                "versionless": versionless,
+            })
+            continue
+        if line.startswith(_GRADLE_UPGRADE_REQUEST + "\t"):
+            parts = line.split("\t")
+            if len(parts) < 5:
+                continue
+            try:
+                rewritten = int(parts[4])
+            except ValueError:
+                continue
+            requests.append({
+                "groupId": parts[1],
+                "artifactId": parts[2],
+                "requestedVersion": parts[3],
+                "rewritten": rewritten,
+            })
+    if current is not None:
+        trees.append(current)
+    return {
+        "trees": trees,
+        "errors": errors,
+        "truncated": truncated,
+        "matched": matched,
+        "requests": requests,
+    }
+
+
+def _filter_gradle_closure_parse(
+    parsed: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], bool]:
+    """Drop trees the Python production-runtime predicate rejects."""
+    trees = list(parsed.get("trees") or [])
+    errors = list(parsed.get("errors") or [])
+    truncated_keys = {
+        (item.get("module"), item.get("configuration"))
+        for item in parsed.get("truncated") or []
+    }
+    names: Dict[str, List[str]] = {}
+    for tree in trees:
+        names.setdefault(tree["module"], []).append(tree["configuration"])
+    for error in errors:
+        names.setdefault(error["module"], []).append(error["configuration"])
+    selected: Dict[str, Set[str]] = {}
+    for module, configs in names.items():
+        unique: List[str] = []
+        for config in configs:
+            if config not in unique:
+                unique.append(config)
+        selected[module] = set(_select_configurations_to_resolve(unique))
+    kept_trees = [
+        tree for tree in trees
+        if tree["configuration"] in selected.get(tree["module"], set())
+    ]
+    kept_errors = [
+        error for error in errors
+        if error["configuration"] in selected.get(error["module"], set())
+    ]
+    truncated = any(
+        (tree["module"], tree["configuration"]) in truncated_keys
+        for tree in kept_trees
+    )
+    return kept_trees, kept_errors, truncated
+
+
+def _failed_gradle_side(message: str, exit_code: Optional[int] = None) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "truncated": False,
+        "diffReliable": False,
+        "error": message[:_GRADLE_ERROR_LIMIT],
+        "graphError": None,
+        "nodeErrors": [],
+        "capabilityUnavailable": None,
+        "exitCode": exit_code,
+        "trees": [],
+        "graph": {"nodes": [], "edges": []},
+        "matched": [],
+    }
+
+
+def _gradle_unavailable_error(
+    exit_code: Optional[int],
+    stderr: str,
+    config_error: Optional[str],
+) -> str:
+    """Graph-source failure text. Exit 0 does not copy stderr.
+
+    Stderr is truncated. Exception text from Python is not interpolated.
+    """
+    if exit_code == 0:
+        if config_error:
+            return config_error[:_GRADLE_ERROR_LIMIT]
+        return "Gradle produced no dependency trees"
+    text = (stderr or "").strip()
+    if text:
+        return text[:_GRADLE_ERROR_LIMIT]
+    if config_error:
+        return config_error[:_GRADLE_ERROR_LIMIT]
+    if exit_code == 124:
+        return "Gradle command timed out"
+    if exit_code is None:
+        return "Gradle was not launched"
+    return f"Gradle exited with code {exit_code} and produced no dependency trees"
+
+
+def _side_from_gradle_output(
+    exit_code: Optional[int],
+    stdout: str,
+    stderr: str,
+) -> Dict[str, Any]:
+    """One before or after run onto the shared side shape.
+
+    Zero trees is ``ok: false``, including exit 0. A non-zero exit that still
+    printed a production tree stays ``ok`` and clears ``diffReliable``.
+    """
+    parsed = _parse_gradle_closure_stdout(stdout or "")
+    kept_trees, kept_errors, truncated = _filter_gradle_closure_parse(parsed)
+    for tree in kept_trees:
+        if tree.get("module") in ("", ":"):
+            tree["module"] = None
+    graph_error = None
+    if kept_errors:
+        parts = []
+        for item in kept_errors:
+            module = item.get("module") or ":"
+            config = item.get("configuration") or ""
+            message = item.get("message") or "resolution failed"
+            parts.append(f"{module}:{config} {message}".strip())
+        graph_error = "; ".join(parts)[:_GRADLE_ERROR_LIMIT]
+    ok = bool(kept_trees)
+    if ok:
+        error = None
+        graph = _normalise_closure_graph(kept_trees)
+        trees_out: List[Dict[str, Any]] = kept_trees
+    else:
+        error = _gradle_unavailable_error(exit_code, stderr, graph_error)
+        graph = {"nodes": [], "edges": []}
+        trees_out = []
+        graph_error = None
+    diff_reliable = ok and exit_code == 0 and not truncated and not kept_errors
+    return {
+        "ok": ok,
+        "truncated": truncated,
+        "diffReliable": diff_reliable,
+        "error": error,
+        "graphError": graph_error,
+        "nodeErrors": [],
+        "capabilityUnavailable": None,
+        "exitCode": exit_code,
+        "trees": trees_out,
+        "graph": graph,
+        "matched": list(parsed.get("matched") or []),
+        "requests": list(parsed.get("requests") or []),
+    }
+
+
+def _gradle_resolution_fields(
+    upgrade: Dict[str, str],
+    after_side: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Landed means every selected version on dumped configurations is ``toVersion``.
+
+    ``substitutionMatched > 0`` is not landed. An absent GA is not landed.
+    """
+    group_id = upgrade["groupId"]
+    artifact_id = upgrade["artifactId"]
+    to_version = upgrade["toVersion"]
+    selected: List[str] = []
+    for node in (after_side.get("graph") or {}).get("nodes") or []:
+        if node.get("groupId") != group_id or node.get("artifactId") != artifact_id:
+            continue
+        version = node.get("version")
+        if version and version not in selected:
+            selected.append(version)
+    selected = _sorted_versions(selected)
+    rewritten = 0
+    versionless = 0
+    for row in after_side.get("matched") or []:
+        if (
+            row.get("groupId") == group_id
+            and row.get("artifactId") == artifact_id
+            and row.get("fromVersion") == upgrade["fromVersion"]
+            and row.get("toVersion") == to_version
+        ):
+            rewritten = int(row.get("rewritten") or 0)
+            versionless = int(row.get("versionless") or 0)
+            break
+    return {
+        "selectedVersions": selected,
+        "targetPresent": bool(selected),
+        "landed": bool(selected) and all(version == to_version for version in selected),
+        "substitutionMatched": rewritten,
+        "rewroteVersionless": versionless > 0,
+    }
+
+
+def _gradle_closure_trees(
+    project_path: str,
+    upgrades: List[Dict[str, str]],
+    substitution: str,
+) -> Dict[str, Any]:
+    """Two sequential wrapper runs. Missing ``gradlew`` does not launch.
+
+    The init script file is written once. ``phase`` changes only in the JSON
+    file. The temp directory is removed when this returns.
+    """
+    gradlew = _find_gradle_wrapper(project_path)
+    if not gradlew:
+        failed = _failed_gradle_side("Gradle wrapper (gradlew) not found")
+        return {
+            "launched": False,
+            "before": failed,
+            "after": failed,
+            "requests": [],
+        }
+    with tempfile.TemporaryDirectory(prefix="maven-mcp-upgrade-") as tmp:
+        script_path = os.path.join(tmp, "maven-mcp-upgrade.init.gradle")
+        json_path = os.path.join(tmp, "upgrades.json")
+        script = _generate_gradle_upgrade_init_script()
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+
+        def run(phase: str) -> Tuple[int, str, str]:
+            payload = {
+                "phase": phase,
+                "substitution": substitution,
+                "upgrades": [
+                    {
+                        "groupId": upgrade["groupId"],
+                        "artifactId": upgrade["artifactId"],
+                        "fromVersion": upgrade["fromVersion"],
+                        "toVersion": upgrade["toVersion"],
+                    }
+                    for upgrade in upgrades
+                ],
+            }
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            # --offline, when set, is prepended by _gradle_cli_prefix_args.
+            args = [
+                "--no-configuration-cache",
+                "--init-script",
+                script_path,
+                "-q",
+                "help",
+                "-Dmaven.mcp.upgrade.file=" + json_path,
+            ]
+            return _run_gradle_command(
+                project_path,
+                gradlew,
+                args,
+                timeout=_gradle_resolve_timeout_seconds(),
+            )
+
+        before_code, before_out, before_err = run("before")
+        after_code, after_out, after_err = run("after")
+    before = _side_from_gradle_output(before_code, before_out, before_err)
+    after = _side_from_gradle_output(after_code, after_out, after_err)
+    return {
+        "launched": True,
+        "before": before,
+        "after": after,
+        "requests": list(after.get("requests") or []),
+    }
+
+
+def _partition_upgrade_requests(
+    upgrades: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Marker rows carry an error. Libraries are what a resolve may see."""
+    echoed: List[Dict[str, Any]] = []
+    libraries: List[Dict[str, str]] = []
+    for upgrade in upgrades:
+        row = dict(upgrade)
+        if _gradle_plugin_marker_plugin_id(upgrade["groupId"], upgrade["artifactId"]):
+            row["error"] = "plugin marker; closure not compared"
+        else:
+            libraries.append(upgrade)
+        echoed.append(row)
+    return echoed, libraries
 
 
 def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
-    """Compare one direct upgrade on an isolated deps.dev graph pair.
+    """Compare a direct upgrade before and after the candidate version.
 
-    Not a project resolve. ``advisory`` is not a safety verdict. Gradle is
-    not launched. ``get_transitive_graph`` is not used (it drops ``relation``).
+    ``auto`` uses Gradle when a wrapper exists, otherwise one deps.dev pair.
+    A Gradle failure is not replaced with deps.dev. ``advisory`` is not a
+    safety verdict. ``get_transitive_graph`` is not used (it drops ``relation``).
     """
-    graph_source = _select_upgrade_graph_source(args)
+    project_path = _upgrade_project_path(args)
+    graph_source = _select_upgrade_graph_source(args, project_path)
     upgrades = _parse_upgrade_requests(args.get("upgrades"))
-    upgrade = upgrades[0]
-    if _gradle_plugin_marker_plugin_id(upgrade["groupId"], upgrade["artifactId"]):
-        result = _marker_upgrade_result(graph_source, upgrade)
+    if graph_source == "depsdev" and len(upgrades) != 1:
+        raise ValueError("deps.dev compares exactly one upgrade")
+    substitution = _upgrade_substitution(args)
+    upgrades_out, libraries = _partition_upgrade_requests(upgrades)
+
+    if not libraries:
+        result = _marker_upgrade_result(graph_source, upgrades_out)
         _log_upgrade_closure(result)
         return result
-    if upgrade["fromVersion"] == upgrade["toVersion"]:
-        ranked = _advisory_for_upgrade(all_identity=True, targets=upgrades)
-        result = _with_upgrade_source(graph_source, [dict(upgrade)], ranked)
+
+    if all(upgrade["fromVersion"] == upgrade["toVersion"] for upgrade in libraries):
+        ranked = _advisory_for_upgrade(all_identity=True, targets=libraries)
+        result = _with_upgrade_source(graph_source, upgrades_out, ranked)
+        if any(upgrade.get("error") for upgrade in upgrades_out):
+            # A marker in an otherwise unchanged batch is not "none".
+            result["advisory"] = "unknown"
+            result["partial"] = True
+            result["targets"] = []
+            result["notes"] = [
+                "Plugin marker; closure not compared.",
+                _ADVISORY_IDENTITY_NOTE,
+            ]
         _log_upgrade_closure(result)
         return result
 
     include_licenses = _upgrade_include_licenses(args)
     project_license, disallow = _upgrade_license_policy_args(args)
-    before, after = _fetch_depsdev_closure_sides(upgrade)
+    launched_gradle = False
+    requests: Optional[List[Dict[str, Any]]] = None
+    if graph_source == "gradle":
+        fetched = _gradle_closure_trees(project_path, libraries, substitution)
+        before = fetched["before"]
+        after = fetched["after"]
+        requests = list(fetched.get("requests") or [])
+        launched_gradle = bool(fetched.get("launched"))
+    else:
+        before, after = _fetch_depsdev_closure_sides(libraries[0])
+
     if not before["ok"] or not after["ok"]:
         ranked = _advisory_for_upgrade(
-            targets=[dict(upgrade)],
+            targets=[dict(upgrade) for upgrade in libraries],
             before_ok=bool(before["ok"]),
             after_ok=bool(after["ok"]),
         )
         error, capability = _graph_failure_fields(before, after)
         result = _with_upgrade_source(
             graph_source,
-            [dict(upgrade)],
+            upgrades_out,
             ranked,
             error=error,
             capability=capability,
         )
-        _log_upgrade_closure(result)
+        if requests is not None:
+            result["requests"] = requests
+        _log_upgrade_closure(
+            result, before=before, after=after, launched_gradle=launched_gradle,
+        )
         return result
 
-    diff = _diff_closure(before, after, upgrades, project_graph=False)
-    selected = _select_delta_gavs(upgrades, diff)
+    compared = libraries
+    if graph_source == "gradle":
+        compared = []
+        for upgrade in libraries:
+            row = dict(upgrade)
+            row.update(_gradle_resolution_fields(upgrade, after))
+            compared.append(row)
+    diff = _diff_closure(
+        before,
+        after,
+        compared,
+        project_graph=(graph_source == "gradle"),
+    )
+    selected = _select_delta_gavs(compared, diff)
     records = query_osv_batch(selected["gavs"]) if selected["gavs"] else []
-    classified = _classify_vuln_delta(upgrades, diff, records)
+    classified = _classify_vuln_delta(compared, diff, records)
     license_delta = None
     if include_licenses:
         license_delta = _fetch_upgrade_license_delta(
             diff,
-            upgrades,
+            compared,
             project_license=project_license,
             disallow=disallow,
         )
+    if graph_source == "gradle":
+        notes = _gradle_closure_notes(include_licenses)
+    else:
+        notes = _depsdev_closure_notes(include_licenses)
+    if any(row.get("rewroteVersionless") for row in compared):
+        notes = list(notes) + [_VERSIONLESS_ARM_NOTE]
     ranked = _advisory_for_upgrade(
         targets=classified["targets"],
         before_ok=True,
@@ -4807,12 +5581,16 @@ def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
     )
     result = _with_upgrade_source(
         graph_source,
-        [dict(upgrade)],
+        upgrades_out,
         ranked,
         truncated=bool(before.get("truncated") or after.get("truncated")),
-        notes=_depsdev_closure_notes(include_licenses),
+        notes=notes,
     )
-    _log_upgrade_closure(result)
+    if requests is not None:
+        result["requests"] = requests
+    _log_upgrade_closure(
+        result, before=before, after=after, launched_gradle=launched_gradle,
+    )
     return result
 
 
@@ -10140,7 +10918,12 @@ def _run_gradle_command(
 
 
 def _is_production_runtime_configuration(config: str) -> bool:
-    """True for production runtime classpaths; excludes test/compile/classpath."""
+    """True for production runtime classpaths; excludes test/compile/classpath.
+
+    Duplicated in ``_generate_gradle_upgrade_init_script``. That script must
+    not read ``resolutionResult`` on a rejected name. Python still drops a
+    dumped upgrade tree that fails this predicate.
+    """
     if not config:
         return False
     if _is_test_configuration(config):
@@ -10149,11 +10932,17 @@ def _is_production_runtime_configuration(config: str) -> bool:
         return False
     if config == "compileClasspath" or config.endswith("CompileClasspath"):
         return False
-    return config.endswith("RuntimeClasspath")
+    # endswith("RuntimeClasspath") misses the Java plugin name: the leading
+    # "r" is lowercase, so the whole string is not that suffix.
+    return config == "runtimeClasspath" or config.endswith("RuntimeClasspath")
 
 
 def _select_configurations_to_resolve(available: List[str]) -> List[str]:
-    """Pick production runtime configurations from a probed Gradle config list."""
+    """Pick production runtime configurations from a probed Gradle config list.
+
+    Prefer ``release*RuntimeClasspath`` over bare ``runtimeClasspath``. The
+    same preference is duplicated in ``_generate_gradle_upgrade_init_script``.
+    """
     selected = [c for c in available if _is_production_runtime_configuration(c)]
     if not selected:
         return []
@@ -12355,7 +13144,7 @@ def handle_get_eol_status(args: Dict) -> Any:
 
 
 def handle_compare_upgrade_closure(args: Dict) -> Any:
-    """MCP handler for ``compare_upgrade_closure``. deps.dev only."""
+    """MCP handler for ``compare_upgrade_closure``."""
     return compare_upgrade_closure(args)
 
 
@@ -13467,13 +14256,13 @@ TOOLS = [
     {
         "name": "compare_upgrade_closure",
         "description": (
-            "Compare the published deps.dev closure of exactly one direct upgrade "
-            "(fromVersion to toVersion). This is an isolated public graph, not a "
-            "project resolve: consumer dependencyManagement, ResolutionStrategy, "
-            "strict versions, enforcedPlatform, exclusions, and private artifacts "
-            "are not visible. graphSource must be depsdev. advisory is not a safety "
-            "verdict; none and unknown do not mean the coordinate is safe, and an "
-            "empty closure diff is not a guarantee."
+            "Compare a direct upgrade's closure before and after the candidate "
+            "version. graphSource defaults to auto: Gradle when the project has a "
+            "Gradle build and gradlew (two sequential resolves, up to 20 "
+            "substitutions); otherwise deps.dev for exactly one upgrade. Gradle "
+            "does not fall back to deps.dev after a failure. deps.dev is an "
+            "isolated public graph, not a project resolve. advisory is not a "
+            "safety verdict; none and unknown do not mean the coordinate is safe."
         ),
         "inputSchema": {
             "type": "object",
@@ -13483,8 +14272,8 @@ TOOLS = [
                     "type": "array",
                     "maxItems": MAX_UPGRADE_SUBSTITUTIONS,
                     "description": (
-                        "Exactly one upgrade. More than one is rejected. "
-                        "deps.dev does not union several roots into a project classpath."
+                        "Coordinates to preview. Gradle accepts up to 20. deps.dev "
+                        "accepts exactly one. More than 20 is rejected, not truncated."
                     ),
                     "items": {
                         "type": "object",
@@ -13500,14 +14289,27 @@ TOOLS = [
                 },
                 "projectPath": {
                     "type": "string",
-                    "description": "Unused. This call does not read the project or launch Gradle.",
+                    "description": (
+                        "Project root used to choose and run Gradle. "
+                        "Defaults to the current working directory."
+                    ),
                 },
                 "graphSource": {
                     "type": "string",
-                    "enum": ["depsdev"],
+                    "enum": ["auto", "gradle", "depsdev"],
                     "description": (
-                        "Only depsdev is accepted. The result is an isolated public "
-                        "graph, not a project resolve."
+                        "auto (default) uses Gradle when gradlew exists, otherwise "
+                        "deps.dev. gradle never falls back to deps.dev. deps.dev "
+                        "rejects more than one upgrade."
+                    ),
+                },
+                "substitution": {
+                    "type": "string",
+                    "enum": ["exact", "module"],
+                    "description": (
+                        "Gradle only, default exact. exact rewrites fromVersion and "
+                        "versionless requests. module rewrites every request for that "
+                        "coordinate. Ignored on deps.dev. exact is not retried as module."
                     ),
                 },
                 "includeLicenses": {
@@ -13529,7 +14331,7 @@ TOOLS = [
         "outputSchema": {
             "type": "object",
             "properties": {
-                "graphSource": {"type": "string", "enum": ["depsdev"]},
+                "graphSource": {"type": "string", "enum": ["gradle", "depsdev"]},
                 "advisory": {
                     "type": "string",
                     "enum": ["stop", "review", "info", "none", "unknown"],
@@ -13588,6 +14390,11 @@ TOOLS = [
                             "artifactId": {"type": "string"},
                             "fromVersion": {"type": "string"},
                             "toVersion": {"type": "string"},
+                            "selectedVersions": {"type": "array", "items": {"type": "string"}},
+                            "landed": {"type": "boolean"},
+                            "substitutionMatched": {"type": "integer"},
+                            "rewroteVersionless": {"type": "boolean"},
+                            "targetPresent": {"type": "boolean"},
                             "vulnerabilities": {"type": "array", "items": {"type": "object"}},
                             "vulnerabilityDelta": {"type": "array", "items": {"type": "object"}},
                             "capabilityUnavailable": {"type": "string"},
@@ -13604,6 +14411,18 @@ TOOLS = [
                 "dependenciesTruncated": {"type": "boolean"},
                 "truncated": {"type": "boolean"},
                 "inputTruncated": {"type": "boolean"},
+                "requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "groupId": {"type": "string"},
+                            "artifactId": {"type": "string"},
+                            "requestedVersion": {"type": "string"},
+                            "rewritten": {"type": "integer"},
+                        },
+                    },
+                },
             },
             "required": [
                 "graphSource", "advisory", "partial", "diffReliable", "upgrades",
