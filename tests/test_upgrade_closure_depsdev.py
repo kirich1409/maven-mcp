@@ -5,10 +5,15 @@ query_osv_batch, and fetch_depsdev_licenses. The HTTP 500 querybatch flag
 is pinned in test_maven_search_osv.py.
 """
 
+import os
 import unittest
 import unittest.mock
 
 from _helpers import server, mock_urlopen, http_error
+
+# Not a Gradle build, so omitted graphSource stays on the deps.dev fallback
+# even when the process cwd has a wrapper.
+_PROJECT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _node(group_id, artifact_id, version, relation="", errors=None):
@@ -51,7 +56,7 @@ def _upgrade(group_id="com.squareup.okhttp3", artifact_id="okhttp",
 
 
 def _args(upgrade, **extra):
-    payload = {"upgrades": [upgrade]}
+    payload = {"upgrades": [upgrade], "projectPath": _PROJECT}
     payload.update(extra)
     return payload
 
@@ -346,14 +351,12 @@ class DepsdevClosureTest(unittest.TestCase):
         other = _upgrade(group_id="com.example", artifact_id="lib", from_version="1.0.0", to_version="2.0.0")
         same = _upgrade(from_version="1.0.0", to_version="2.0.0")
         cases = (
-            ({"upgrades": [ok, other]}, "exactly one"),
-            ({"upgrades": [same, dict(same, toVersion="3.0.0")]}, "duplicate"),
+            ({"upgrades": [ok, other], "projectPath": _PROJECT, "graphSource": "depsdev"}, "exactly one"),
+            ({"upgrades": [same, dict(same, toVersion="3.0.0")], "projectPath": _PROJECT}, "duplicate"),
             ({"upgrades": [
                 _upgrade(from_version="1.0.0", to_version="1.0.0"),
                 other,
-            ]}, "cannot mix"),
-            (_args(ok, graphSource="auto"), "must be depsdev"),
-            (_args(ok, graphSource="gradle"), "must be depsdev"),
+            ], "projectPath": _PROJECT}, "cannot mix"),
             (_args(_upgrade(group_id="com.example lib")), "must match"),
             (_args(_upgrade(from_version="1.0.0$bad")), "must match"),
         )
