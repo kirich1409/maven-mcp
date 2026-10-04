@@ -366,6 +366,83 @@ class DepsdevClosureTest(unittest.TestCase):
                 fetch.assert_not_called()
                 osv.assert_not_called()
 
+    def test_license_http_error_is_review_and_partial(self):
+        def fetch(group_id, artifact_id, version):
+            nodes = [_node(group_id, artifact_id, version, "SELF")]
+            if version == "4.12.0":
+                nodes.append(_node("com.example", "extra", "9.0.0", "DIRECT"))
+            return _graph(nodes)
+
+        def lic(_group_id, _artifact_id, _version):
+            return {
+                "ok": False,
+                "status": 503,
+                "licenses": [],
+                "error": "deps.dev returned HTTP 503",
+            }
+
+        with unittest.mock.patch.object(server, "fetch_depsdev_dependencies", fetch), \
+                unittest.mock.patch.object(server, "query_osv_batch", _clean_osv), \
+                unittest.mock.patch.object(server, "fetch_depsdev_licenses", lic):
+            out = server.compare_upgrade_closure(_args(_upgrade()))
+        self.assertEqual(out["advisory"], "review")
+        self.assertTrue(out["partial"])
+        self.assertEqual(out["capabilityUnavailable"], "unreachable")
+        self.assertNotIn("categoriesIntroduced", out["license"])
+
+    def test_license_404_is_a_review_verdict_not_unreachable(self):
+        def fetch(group_id, artifact_id, version):
+            nodes = [_node(group_id, artifact_id, version, "SELF")]
+            if version == "4.12.0":
+                nodes.append(_node("com.example", "extra", "9.0.0", "DIRECT"))
+            return _graph(nodes)
+
+        def lic(_group_id, _artifact_id, version):
+            if version == "9.0.0":
+                return {
+                    "ok": False,
+                    "status": 404,
+                    "licenses": [],
+                    "error": "deps.dev returned HTTP 404",
+                }
+            return {"ok": True, "status": 200, "licenses": ["MIT"], "error": None}
+
+        with unittest.mock.patch.object(server, "fetch_depsdev_dependencies", fetch), \
+                unittest.mock.patch.object(server, "query_osv_batch", _clean_osv), \
+                unittest.mock.patch.object(server, "fetch_depsdev_licenses", lic):
+            out = server.compare_upgrade_closure(_args(_upgrade()))
+        extra = [
+            row for row in out["license"]["appeared"]
+            if row["artifactId"] == "extra"
+        ]
+        self.assertEqual(extra[0]["verdict"], "review")
+        self.assertNotEqual(out.get("capabilityUnavailable"), "unreachable")
+
+    def test_license_cap_is_review_and_partial(self):
+        def fetch(group_id, artifact_id, version):
+            nodes = [_node(group_id, artifact_id, version, "SELF")]
+            if version == "4.12.0":
+                extra_count = server.MAX_UPGRADE_LICENSE_NODES + 1
+                nodes.extend(
+                    _node("com.example", f"extra{i}", "1.0.0", "DIRECT")
+                    for i in range(extra_count)
+                )
+            return _graph(nodes)
+
+        with unittest.mock.patch.object(server, "fetch_depsdev_dependencies", fetch), \
+                unittest.mock.patch.object(server, "query_osv_batch", _clean_osv), \
+                unittest.mock.patch.object(
+                    server, "fetch_depsdev_licenses",
+                    return_value={"ok": True, "status": 200, "licenses": ["MIT"], "error": None},
+                ) as lic:
+            out = server.compare_upgrade_closure(_args(_upgrade()))
+        self.assertEqual(lic.call_count, server.MAX_UPGRADE_LICENSE_NODES)
+        self.assertTrue(out["license"]["truncated"])
+        self.assertNotIn("categoriesIntroduced", out["license"])
+        self.assertEqual(out["advisory"], "review")
+        self.assertTrue(out["partial"])
+        self.assertTrue(any("capped" in note for note in out["notes"]))
+
 
 if __name__ == "__main__":
     unittest.main()

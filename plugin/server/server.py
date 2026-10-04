@@ -4057,6 +4057,30 @@ def _license_delta(
     for group_id, artifact_id, version, kind in selected:
         hit = by_gav.get((group_id, artifact_id, version))
         if not hit or not hit.get("ok"):
+            if hit and hit.get("status") == 404:
+                # A missing record is a review verdict, not a silent skip
+                # and not a transport failure.
+                base = {
+                    "groupId": group_id,
+                    "artifactId": artifact_id,
+                    "version": version,
+                    "spdxId": None,
+                    "category": "unknown",
+                }
+                if kind in ("added", "changed-to"):
+                    verdict = license_compliance_verdict(
+                        spdx_id=None,
+                        category="unknown",
+                        policy=policy,
+                        missing_license=True,
+                    )
+                    row = dict(base)
+                    row["verdict"] = verdict["verdict"]
+                    row["reason"] = verdict["reason"]
+                    appeared.append(row)
+                else:
+                    disappeared.append(base)
+                continue
             complete = False
             continue
         primary = _primary_license_from_depsdev(list(hit.get("licenses") or []))
@@ -4186,6 +4210,7 @@ def _advisory_for_upgrade(
     has_osv_payload = vulnerabilities is not None
     dependencies_truncated = bool(diff and diff.get("dependenciesTruncated"))
     license_capability = (license_delta or {}).get("capabilityUnavailable")
+    license_truncated = bool((license_delta or {}).get("truncated"))
     target_capability = None
     for target in targets or []:
         if target.get("capabilityUnavailable"):
@@ -4218,6 +4243,10 @@ def _advisory_for_upgrade(
         review_notes.append("A required OSV or license fetch was unavailable.")
     if input_truncated or dependencies_truncated:
         review_notes.append("The closure diff or the OSV input was truncated.")
+    if license_truncated:
+        review_notes.append(
+            "License lookups were capped; some changed coordinates were not licensed."
+        )
     for target in targets or []:
         if target.get("landed") is False:
             review_notes.append("A target did not land on toVersion.")
@@ -4280,6 +4309,7 @@ def _advisory_for_upgrade(
         and not fixes_incomplete
         and not input_truncated
         and not dependencies_truncated
+        and not license_truncated
         and not delta_rows
     )
 
@@ -4304,7 +4334,8 @@ def _advisory_for_upgrade(
         notes = ["OSV was not queried for the target, so this is not a clean compare."]
 
     partial = advisory == "unknown" or bool(
-        not diff_reliable or fixes_incomplete or capability or input_truncated or dependencies_truncated
+        not diff_reliable or fixes_incomplete or capability
+        or input_truncated or dependencies_truncated or license_truncated
     )
     result: Dict[str, Any] = {
         "advisory": advisory,
@@ -4602,11 +4633,17 @@ def _license_row_for_gav(gav: Dict[str, str], row: Optional[Dict[str, Any]]) -> 
         return base
     base["ok"] = bool(row.get("ok"))
     base["licenses"] = list(row.get("licenses") or [])
+    if row.get("status") is not None:
+        base["status"] = row["status"]
     raw_error = row.get("error")
     if raw_error:
         base["error"] = raw_error if isinstance(raw_error, str) else "deps.dev license fetch failed"
     if row.get("capabilityUnavailable"):
         base["capabilityUnavailable"] = row["capabilityUnavailable"]
+    elif not base["ok"] and row.get("status") != 404:
+        # 404 is a missing deps.dev record. 5xx, bad JSON, and a deadline
+        # miss are a coverage gap the ranker already treats as review.
+        base["capabilityUnavailable"] = "unreachable"
     return base
 
 
@@ -4654,12 +4691,15 @@ def _fetch_upgrade_license_delta(
                 fetched.append(row)
             else:
                 fetched.append(_license_row_for_gav(gav, None))
-    return _license_delta(
+    delta = _license_delta(
         diff,
         fetched,
         project_license=project_license,
         disallow=disallow,
     )
+    if selected.get("truncated"):
+        delta["truncated"] = True
+    return delta
 
 
 def _upgrade_include_licenses(args: Dict) -> bool:
