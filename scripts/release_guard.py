@@ -1,0 +1,1132 @@
+#!/usr/bin/env python3
+"""Classify a Release dispatch and decide what the workflow may publish.
+
+Stdlib only. The workflow checks out, fetches, builds, attests, and calls
+the GitHub API. This script does not upload and does not write refs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+REPO = "kirich1409/maven-mcp"
+PYPI_PROJECT_URL = "https://pypi.org/pypi/maven-mcp/{version}/json"
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+TAG_NAME_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+
+# Already published. noop may name them; nothing else may upload or move refs.
+FROZEN_SHAS = frozenset(
+    {
+        "02fa8f5a936b85151041de0f0a524db484c6d2a0",
+        "1ae5ca62417826ac1af1e40e26fdbf11348a3ed4",
+    }
+)
+FROZEN_TAGS = frozenset({"v1.0.0", "v1.1.0"})
+
+REQUIRED_CHECK_NAMES = (
+    "python-tests (3.9)",
+    "python-tests (3.13)",
+    "ruff",
+    "mypy",
+)
+
+# First attempt is immediate. The other seven are slept before the next GET.
+POLL_SLEEPS = [0, 5, 10, 15, 20, 20, 20, 20]
+
+EXIT_CLASSES = frozenset({"publish", "missing-file", "repair-github", "noop"})
+UPLOAD_CLASSES = frozenset({"publish", "missing-file", "repair-github"})
+
+
+class GuardError(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass
+class ClassifyFacts:
+    sha: str
+    version: str
+    version_on_main: str
+    main_is_ancestor_of_sha: bool
+    sha_is_ancestor_of_main: bool
+    pypi_status: int
+    pypi_body: Optional[dict]
+    tag_object_sha: Optional[str]
+    release_exists: bool
+
+
+@dataclass
+class GuardOutcome:
+    ok: bool
+    klass: Optional[str]
+    reason: str
+    checks: List[dict]
+
+
+@dataclass
+class GitState:
+    object_type: str
+    main_ref_exists: bool
+    develop_ref_exists: bool
+    sha_is_ancestor_of_develop: bool
+    main_is_ancestor_of_sha: bool
+    sha_is_ancestor_of_main: bool
+    main_sha: str
+
+
+@dataclass
+class TagRef:
+    name: str
+    object_sha: str
+
+
+@dataclass
+class NotesDecision:
+    draft: bool
+    body: str
+
+
+@dataclass
+class PromotePlan:
+    main: str
+    tag: str
+    release: str
+    body: str
+    force: bool = False
+
+
+def parse_version(text: str) -> Optional[Tuple[int, int, int]]:
+    if not VERSION_RE.match(text):
+        return None
+    major, minor, patch = text.split(".")
+    return (int(major), int(minor), int(patch))
+
+
+def version_greater(candidate: str, baseline: str) -> bool:
+    left = parse_version(candidate)
+    right = parse_version(baseline)
+    if left is None or right is None:
+        return False
+    return left > right
+
+
+def _table(text: str, name: str) -> Optional[str]:
+    match = re.search(
+        rf"(?m)^\[{re.escape(name)}\]\s*$([\s\S]*?)(?=^\[|\Z)",
+        text,
+    )
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def project_version(text: str) -> str:
+    block = _table(text, "project")
+    if block is None:
+        raise GuardError("pyproject-project")
+    found = re.search(r'(?m)^version\s*=\s*"([^"]+)"', block)
+    if found is None:
+        raise GuardError("pyproject-version")
+    return found.group(1)
+
+
+def assert_release_build(text: str) -> None:
+    """Reject a build backend other than the pinned hatchling floor.
+
+    uv build runs that backend. The publish job is the one that can mint
+    an OIDC token, so the backend that produced the bytes is checked here.
+    """
+    block = _table(text, "project")
+    if block is None:
+        raise GuardError("pyproject-project")
+    deps = re.search(r"(?m)^dependencies\s*=\s*(\[[^\]]*\])", block)
+    if deps is None or deps.group(1).strip() != "[]":
+        raise GuardError("dependencies")
+    build = _table(text, "build-system")
+    if build is None:
+        raise GuardError("build-system")
+    requires = re.search(r"(?m)^requires\s*=\s*\[([^\]]*)\]", build)
+    if requires is None:
+        raise GuardError("build-system")
+    parts = [part.strip() for part in requires.group(1).split(",") if part.strip()]
+    if parts != ['"hatchling>=1.26.3"']:
+        raise GuardError("build-system")
+
+
+def metadata_matches(body: object, version: str) -> bool:
+    if not isinstance(body, dict):
+        return False
+    info = body.get("info")
+    if not isinstance(info, dict):
+        return False
+    if info.get("version") != version:
+        return False
+    if info.get("license_expression") != "MIT":
+        return False
+    if "license" not in info or info.get("license") is not None:
+        return False
+    if info.get("requires_python") != ">=3.9":
+        return False
+    return info.get("yanked") is False
+
+
+def file_counts(body: object) -> Optional[Tuple[int, int]]:
+    """Return (wheels, sdists) or None when a url is yanked or unexpected.
+
+    None is not a partial file set. Callers treat it as not a gate match.
+    """
+    if not isinstance(body, dict):
+        return None
+    urls = body.get("urls")
+    if not isinstance(urls, list):
+        return None
+    wheels = 0
+    sdists = 0
+    for url in urls:
+        if not isinstance(url, dict):
+            return None
+        if url.get("yanked") is True:
+            return None
+        kind = url.get("packagetype")
+        if kind == "bdist_wheel":
+            wheels += 1
+        elif kind == "sdist":
+            sdists += 1
+        else:
+            return None
+    return wheels, sdists
+
+
+def json_gate_matches(status: int, body: Optional[dict], version: str) -> bool:
+    if status != 200 or body is None:
+        return False
+    return metadata_matches(body, version) and file_counts(body) == (1, 1)
+
+
+def classify(facts: ClassifyFacts) -> str:
+    """First match wins. Raises GuardError('conflict') instead of returning it."""
+    if _is_noop(facts):
+        return "noop"
+    if facts.sha in FROZEN_SHAS:
+        raise GuardError("conflict")
+    if facts.pypi_status == 404:
+        if _is_publish(facts):
+            return "publish"
+        raise GuardError("conflict")
+    if facts.pypi_status == 200 and facts.pypi_body is not None and metadata_matches(
+        facts.pypi_body, facts.version
+    ):
+        counts = file_counts(facts.pypi_body)
+        if counts in {(1, 0), (0, 1)}:
+            if not facts.main_is_ancestor_of_sha:
+                raise GuardError("conflict")
+            return "missing-file"
+        if counts == (1, 1):
+            tag_sha = facts.tag_object_sha
+            if tag_sha is not None and tag_sha != facts.sha:
+                raise GuardError("conflict")
+            if not facts.main_is_ancestor_of_sha:
+                raise GuardError("conflict")
+            return "repair-github"
+    raise GuardError("conflict")
+
+
+def _is_noop(facts: ClassifyFacts) -> bool:
+    return (
+        json_gate_matches(facts.pypi_status, facts.pypi_body, facts.version)
+        and facts.tag_object_sha == facts.sha
+        and facts.release_exists
+        and facts.sha_is_ancestor_of_main
+    )
+
+
+def _is_publish(facts: ClassifyFacts) -> bool:
+    return (
+        facts.tag_object_sha is None
+        and not facts.release_exists
+        and version_greater(facts.version, facts.version_on_main)
+        and facts.main_is_ancestor_of_sha
+    )
+
+
+def latest_check_run(runs: Sequence[dict], name: str) -> dict:
+    matching = [run for run in runs if run.get("name") == name]
+    if not matching:
+        raise GuardError(f"check-run-missing:{name}")
+
+    def sort_key(run: dict) -> Tuple[str, int]:
+        started = run.get("started_at") or ""
+        if not isinstance(started, str):
+            started = ""
+        raw_id = run.get("id")
+        ident = -1
+        if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+            ident = raw_id
+        elif isinstance(raw_id, str):
+            try:
+                ident = int(raw_id)
+            except ValueError:
+                ident = -1
+        return (started, ident)
+
+    matching.sort(key=sort_key, reverse=True)
+    return matching[0]
+
+
+def require_green_checks(runs: Sequence[dict]) -> List[dict]:
+    chosen: List[dict] = []
+    for name in REQUIRED_CHECK_NAMES:
+        run = latest_check_run(runs, name)
+        if run.get("status") != "completed" or run.get("conclusion") != "success":
+            raise GuardError(f"check-run-not-success:{name}")
+        chosen.append(run)
+    return chosen
+
+
+def load_check_runs(raw: object) -> List[dict]:
+    if isinstance(raw, list):
+        if raw and all(isinstance(item, dict) and "check_runs" in item for item in raw):
+            runs: List[dict] = []
+            for page in raw:
+                runs.extend(_runs_in_page(page))
+            return runs
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, dict):
+        return _runs_in_page(raw)
+    raise GuardError("check-runs")
+
+
+def _runs_in_page(page: dict) -> List[dict]:
+    runs = page.get("check_runs", [])
+    if not isinstance(runs, list):
+        raise GuardError("check-runs")
+    return [run for run in runs if isinstance(run, dict)]
+
+
+def load_check_runs_path(path: Path) -> List[dict]:
+    if path.is_dir():
+        pages = []
+        for child in sorted(path.glob("*.json")):
+            pages.append(json.loads(child.read_text(encoding="utf-8")))
+        return load_check_runs(pages)
+    return load_check_runs(json.loads(path.read_text(encoding="utf-8")))
+
+
+def next_link(header: str) -> Optional[str]:
+    if not header:
+        return None
+    for part in header.split(","):
+        match = re.search(r"<([^>]+)>\s*;\s*rel=\"?next\"?", part.strip(), re.I)
+        if match is None:
+            continue
+        url = match.group(1)
+        if not url.startswith("https://api.github.com/"):
+            raise GuardError("check-runs-link")
+        return url
+    return None
+
+
+def link_header_value(header_text: str) -> str:
+    values: List[str] = []
+    for line in header_text.splitlines():
+        if line.lower().startswith("link:"):
+            values.append(line.split(":", 1)[1].strip())
+    return ", ".join(values)
+
+
+@dataclass
+class GuardSpec:
+    github_ref: str
+    github_repository: str
+    sha: str
+    version: str
+    object_type: str
+    main_ref_exists: bool
+    develop_ref_exists: bool
+    sha_is_ancestor_of_develop: bool
+    check_versions_sha_ok: bool
+    check_versions_main_ok: bool
+    pyproject_text: str
+    check_runs: List[dict]
+    facts: ClassifyFacts
+
+
+def evaluate(spec: GuardSpec) -> GuardOutcome:
+    """Preconditions, then classification. Rule 4 is not a precondition."""
+    if spec.github_ref != "refs/heads/main":
+        return _fail("ref")
+    if spec.github_repository != REPO:
+        return _fail("repository")
+    if not SHA_RE.match(spec.sha):
+        return _fail("sha")
+    if spec.object_type != "commit":
+        return _fail("sha-type")
+    if not VERSION_RE.match(spec.version):
+        return _fail("version")
+    if not spec.main_ref_exists:
+        return _fail("main-ref")
+    if not spec.develop_ref_exists:
+        return _fail("develop-ref")
+    if not spec.sha_is_ancestor_of_develop:
+        return _fail("develop-ancestor")
+    if not spec.check_versions_sha_ok:
+        return _fail("check-versions-sha")
+    if not spec.check_versions_main_ok:
+        return _fail("check-versions-main")
+    try:
+        assert_release_build(spec.pyproject_text)
+        checks = require_green_checks(spec.check_runs)
+        klass = classify(spec.facts)
+    except GuardError as exc:
+        return _fail(exc.reason)
+    if klass not in EXIT_CLASSES:
+        return _fail("conflict")
+    return GuardOutcome(ok=True, klass=klass, reason="", checks=checks)
+
+
+def _fail(reason: str) -> GuardOutcome:
+    return GuardOutcome(ok=False, klass=None, reason=reason, checks=[])
+
+
+def _git(repo: Path, args: Sequence[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def ref_exists(repo: Path, ref: str) -> bool:
+    return _git(repo, ["rev-parse", "--verify", "--quiet", ref]).returncode == 0
+
+
+def object_type(repo: Path, sha: str) -> str:
+    proc = _git(repo, ["cat-file", "-t", sha])
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    # merge-base --is-ancestor is true when the two commits are equal.
+    return _git(repo, ["merge-base", "--is-ancestor", ancestor, descendant]).returncode == 0
+
+
+def read_git_state(repo: Path, sha: str) -> GitState:
+    main_exists = ref_exists(repo, "refs/heads/main")
+    develop_exists = ref_exists(repo, "refs/heads/develop")
+    main_sha = ""
+    if main_exists:
+        main_sha = _git(repo, ["rev-parse", "refs/heads/main"], check=True).stdout.strip()
+    return GitState(
+        object_type=object_type(repo, sha),
+        main_ref_exists=main_exists,
+        develop_ref_exists=develop_exists,
+        sha_is_ancestor_of_develop=develop_exists and is_ancestor(repo, sha, "refs/heads/develop"),
+        main_is_ancestor_of_sha=main_exists and is_ancestor(repo, "refs/heads/main", sha),
+        sha_is_ancestor_of_main=main_exists and is_ancestor(repo, sha, "refs/heads/main"),
+        main_sha=main_sha,
+    )
+
+
+def git_show(repo: Path, spec: str) -> str:
+    proc = _git(repo, ["show", spec])
+    if proc.returncode != 0:
+        raise GuardError("git-show")
+    return proc.stdout
+
+
+def git_log_oneline(repo: Path, revision_range: str) -> str:
+    proc = _git(repo, ["log", "--oneline", revision_range])
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.rstrip("\n")
+
+
+def parse_ls_remote_tags(text: str) -> List[TagRef]:
+    """Prefer the peeled commit SHA from a `^{}` line when the tag is annotated."""
+    raw: Dict[str, str] = {}
+    peeled: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        sha, ref = line.split("\t", 1)
+        if not ref.startswith("refs/tags/"):
+            continue
+        if ref.endswith("^{}"):
+            peeled[ref[len("refs/tags/") : -3]] = sha
+        else:
+            raw[ref[len("refs/tags/") :]] = sha
+    names = set(raw) | set(peeled)
+    return [
+        TagRef(name, peeled[name] if name in peeled else raw[name]) for name in sorted(names)
+    ]
+
+
+def select_vprev(
+    tags: Sequence[TagRef],
+    sha: str,
+    is_ancestor_of_sha: Callable[[str], bool],
+) -> Optional[str]:
+    best_name: Optional[str] = None
+    best_version: Optional[Tuple[int, int, int]] = None
+    for tag in tags:
+        if not TAG_NAME_RE.match(tag.name):
+            continue
+        parsed = parse_version(tag.name[1:])
+        if parsed is None:
+            continue
+        if not is_ancestor_of_sha(tag.object_sha):
+            continue
+        if best_version is None or parsed > best_version:
+            best_version = parsed
+            best_name = tag.name
+    return best_name
+
+
+def notes_decision(
+    version: str,
+    notes_text: Optional[str],
+    vprev: Optional[str],
+    log_oneline: str,
+) -> NotesDecision:
+    if notes_text is not None and notes_text.strip() != "":
+        return NotesDecision(draft=False, body=notes_text)
+    if not vprev:
+        return NotesDecision(draft=True, body="")
+    link = f"https://github.com/{REPO}/compare/{vprev}...v{version}"
+    blurb = (
+        "Install with `uvx maven-mcp`.\n"
+        "This skeleton is not a substitute for the prose on the v1.1.0 page. "
+        "A human should publish this draft after editing, or add "
+        f"docs/releases/v{version}.md."
+    )
+    log = log_oneline.strip()
+    body = f"{link}\n\n{log}\n\n{blurb}\n" if log else f"{link}\n\n{blurb}\n"
+    return NotesDecision(draft=True, body=body)
+
+
+def promote_plan(
+    *,
+    klass: str,
+    sha: str,
+    version: str,
+    main_sha: str,
+    main_is_ancestor_of_sha: bool,
+    tag_object_sha: Optional[str],
+    release_exists: bool,
+    notes_text: Optional[str],
+    vprev: Optional[str],
+    log_oneline: str,
+) -> PromotePlan:
+    """Refuse before any ref write. Never sets force and never deletes."""
+    if klass == "noop":
+        raise GuardError("noop")
+    if klass not in UPLOAD_CLASSES:
+        raise GuardError("class")
+    if sha in FROZEN_SHAS:
+        raise GuardError("frozen-sha")
+    tag_name = f"v{version}"
+    if tag_name in FROZEN_TAGS:
+        raise GuardError("frozen-tag")
+    if not main_is_ancestor_of_sha:
+        raise GuardError("not-ancestor")
+    if tag_object_sha is not None and tag_object_sha != sha:
+        raise GuardError("tag-moved")
+    main_action = "skip" if main_sha == sha else "update"
+    tag_action = "skip" if tag_object_sha == sha else "create"
+    if release_exists:
+        plan = PromotePlan(main=main_action, tag=tag_action, release="skip", body="")
+    else:
+        notes = notes_decision(version, notes_text, vprev, log_oneline)
+        plan = PromotePlan(
+            main=main_action,
+            tag=tag_action,
+            release="draft" if notes.draft else "published",
+            body=notes.body,
+        )
+    if plan.force:
+        raise GuardError("force")
+    return plan
+
+
+def readme_prose(readme: str) -> str:
+    return next(
+        block.strip()
+        for block in readme.split("\n\n")
+        if block.strip() and not block.lstrip().startswith("#")
+    )
+
+
+def inspect_wheel(path: Path, version: str, readme: str, matrix: bytes) -> None:
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if "server.py" not in names:
+            raise GuardError("wheel-server")
+        if "compat-matrices.json" not in names:
+            raise GuardError("wheel-matrix")
+        if archive.read("compat-matrices.json") != matrix:
+            raise GuardError("wheel-matrix-bytes")
+        metadata_name = next(
+            (name for name in names if name.endswith(".dist-info/METADATA")),
+            None,
+        )
+        if metadata_name is None:
+            raise GuardError("wheel-metadata")
+        metadata = archive.read(metadata_name).decode("utf-8")
+    paragraph = readme_prose(readme)
+    if "Name: maven-mcp\n" not in metadata:
+        raise GuardError("wheel-name")
+    if f"Version: {version}\n" not in metadata:
+        raise GuardError("wheel-version")
+    if "License-Expression: MIT\n" not in metadata:
+        raise GuardError("wheel-license")
+    if "Requires-Python: >=3.9\n" not in metadata:
+        raise GuardError("wheel-python")
+    if "Requires-Dist:" in metadata:
+        raise GuardError("wheel-requires-dist")
+    if paragraph not in metadata:
+        raise GuardError("wheel-readme")
+
+
+def sdist_version(path: Path) -> str:
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            if member.name != "PKG-INFO" and not member.name.endswith("/PKG-INFO"):
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            text = extracted.read().decode("utf-8")
+            found = re.search(r"(?m)^Version: (.+)$", text)
+            if found is not None:
+                return found.group(1).strip()
+    raise GuardError("sdist-version")
+
+
+def inspect_dist(dist: Path, version: str, readme: str, matrix: bytes) -> None:
+    wheels = sorted(dist.glob("*.whl"))
+    sdists = sorted(dist.glob("*.tar.gz"))
+    if len(wheels) != 1 or len(sdists) != 1:
+        raise GuardError("dist-count")
+    inspect_wheel(wheels[0], version, readme, matrix)
+    if sdist_version(sdists[0]) != version:
+        raise GuardError("sdist-version")
+
+
+def filenames_to_upload(
+    klass: str,
+    dist_names: Sequence[str],
+    pypi_status: int,
+    pypi_body: Optional[dict],
+) -> List[str]:
+    if klass == "repair-github":
+        return []
+    if klass not in ("publish", "missing-file"):
+        raise GuardError("class")
+    wheels = [name for name in dist_names if name.endswith(".whl")]
+    sdists = [name for name in dist_names if name.endswith(".tar.gz")]
+    if klass == "publish" and not wheels and not sdists:
+        raise GuardError("dist-empty")
+    listed = _listed_filenames(pypi_status, pypi_body)
+    present = _present_types(pypi_status, pypi_body)
+    if klass == "publish":
+        chosen = wheels + sdists
+    else:
+        chosen = []
+        if present.get("bdist_wheel", 0) == 0:
+            chosen.extend(wheels)
+        if present.get("sdist", 0) == 0:
+            chosen.extend(sdists)
+        if not chosen:
+            raise GuardError("missing-file-absent")
+    return [name for name in chosen if Path(name).name not in listed]
+
+
+def _listed_filenames(status: int, body: Optional[dict]) -> set[str]:
+    found: set[str] = set()
+    if status != 200 or not isinstance(body, dict):
+        return found
+    urls = body.get("urls")
+    if not isinstance(urls, list):
+        return found
+    for url in urls:
+        if not isinstance(url, dict) or url.get("yanked") is True:
+            continue
+        name = url.get("filename")
+        if isinstance(name, str):
+            found.add(name)
+    return found
+
+
+def _present_types(status: int, body: Optional[dict]) -> Dict[str, int]:
+    counts = {"bdist_wheel": 0, "sdist": 0}
+    if status != 200 or not isinstance(body, dict):
+        return counts
+    urls = body.get("urls")
+    if not isinstance(urls, list):
+        return counts
+    for url in urls:
+        if not isinstance(url, dict) or url.get("yanked") is True:
+            continue
+        kind = url.get("packagetype")
+        if kind in counts:
+            counts[kind] += 1
+    return counts
+
+
+def publish_output_is_already_exists(output: str) -> bool:
+    return "already exists" in output.lower()
+
+
+def poll_until_match(
+    fetch: Callable[[], Tuple[int, Optional[dict]]],
+    version: str,
+    sleep: Callable[[int], None],
+) -> bool:
+    for delay in POLL_SLEEPS:
+        sleep(delay)
+        status, body = fetch()
+        if json_gate_matches(status, body, version):
+            return True
+    return False
+
+
+def render_summary(
+    *,
+    sha: str,
+    version: str,
+    version_on_main: str,
+    log_main_to_sha: str,
+    log_sha_to_main: str,
+    klass: str,
+    checks: Sequence[dict],
+) -> str:
+    lines = [
+        f"- sha: `{sha}`",
+        f"- version: `{version}`",
+        f"- version on main: `{version_on_main}`",
+        "",
+        "### main..sha",
+        "```",
+        log_main_to_sha,
+        "```",
+        "",
+        "### sha..main",
+        "```",
+        log_sha_to_main,
+        "```",
+        "",
+        f"- class: `{klass}`",
+        "",
+        "### check runs",
+    ]
+    for run in checks:
+        url = run.get("html_url") or run.get("id")
+        lines.append(f"- {run.get('name')}: {url}")
+    return "\n".join(lines) + "\n"
+
+
+def peeled_commit_sha(ref_obj: dict, tag_obj: Optional[dict]) -> str:
+    obj = ref_obj.get("object")
+    if not isinstance(obj, dict):
+        raise GuardError("tag-ref")
+    kind = obj.get("type")
+    sha = obj.get("sha")
+    if kind == "commit":
+        if not isinstance(sha, str) or not SHA_RE.match(sha):
+            raise GuardError("tag-ref")
+        return sha
+    if kind == "tag":
+        if tag_obj is None:
+            if not isinstance(sha, str) or not SHA_RE.match(sha):
+                raise GuardError("tag-ref")
+            raise GuardError(f"fetch-tag-object:{sha}")
+        inner = tag_obj.get("object")
+        if not isinstance(inner, dict):
+            raise GuardError("tag-object")
+        commit = inner.get("sha")
+        if inner.get("type") != "commit" or not isinstance(commit, str) or not SHA_RE.match(commit):
+            raise GuardError("tag-object")
+        return commit
+    raise GuardError("tag-ref")
+
+
+def _check_versions(repo: Path, version: Optional[str]) -> bool:
+    script = repo / "scripts" / "check-versions.py"
+    if not script.is_file():
+        return False
+    cmd = [sys.executable, str(script)]
+    if version is not None:
+        cmd.append(version)
+    env = os.environ.copy()
+    for key in (
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+    ):
+        env.pop(key, None)
+    proc = subprocess.run(cmd, cwd=str(repo), env=env)
+    return proc.returncode == 0
+
+
+def check_versions_on_main(repo: Path) -> bool:
+    parent = Path(tempfile.mkdtemp(prefix="maven-mcp-main-"))
+    tree = parent / "tree"
+    added = False
+    try:
+        proc = _git(repo, ["worktree", "add", "--detach", str(tree), "refs/heads/main"])
+        if proc.returncode != 0:
+            return False
+        added = True
+        return _check_versions(tree, None)
+    finally:
+        if added:
+            _git(repo, ["worktree", "remove", "--force", str(tree)])
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _read_pypi_body(path: Optional[Path], status: int) -> Optional[dict]:
+    if path is None or status == 404 or not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise GuardError("pypi-json") from exc
+    if not isinstance(parsed, dict):
+        raise GuardError("pypi-json")
+    return parsed
+
+
+def _dispatch_env() -> Tuple[str, str, str, str]:
+    ref = os.environ.get("GITHUB_REF", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    sha = os.environ.get("SHA", "")
+    version = os.environ.get("VERSION", "")
+    return ref, repository, sha, version
+
+
+def cmd_assert_dispatch_env() -> int:
+    ref, repository, sha, version = _dispatch_env()
+    if ref != "refs/heads/main":
+        print("reason: ref", file=sys.stderr)
+        return 1
+    if repository != REPO:
+        print("reason: repository", file=sys.stderr)
+        return 1
+    if not SHA_RE.match(sha):
+        print("reason: sha", file=sys.stderr)
+        return 1
+    if not VERSION_RE.match(version):
+        print("reason: version", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    repo = Path(args.repo)
+    ref, repository, sha, version = _dispatch_env()
+    try:
+        state = read_git_state(repo, sha)
+        pypi_body = _read_pypi_body(Path(args.pypi_body) if args.pypi_body else None, args.pypi_status)
+        tag_sha = args.tag_object_sha or None
+        if tag_sha == "":
+            tag_sha = None
+        facts = ClassifyFacts(
+            sha=sha,
+            version=version,
+            version_on_main=project_version(git_show(repo, "refs/heads/main:pyproject.toml")),
+            main_is_ancestor_of_sha=state.main_is_ancestor_of_sha,
+            sha_is_ancestor_of_main=state.sha_is_ancestor_of_main,
+            pypi_status=args.pypi_status,
+            pypi_body=pypi_body,
+            tag_object_sha=tag_sha,
+            release_exists=args.release_exists,
+        )
+        spec = GuardSpec(
+            github_ref=ref,
+            github_repository=repository,
+            sha=sha,
+            version=version,
+            object_type=state.object_type,
+            main_ref_exists=state.main_ref_exists,
+            develop_ref_exists=state.develop_ref_exists,
+            sha_is_ancestor_of_develop=state.sha_is_ancestor_of_develop,
+            check_versions_sha_ok=_check_versions(repo, version),
+            check_versions_main_ok=check_versions_on_main(repo),
+            pyproject_text=(repo / "pyproject.toml").read_text(encoding="utf-8"),
+            check_runs=load_check_runs_path(Path(args.check_runs)),
+            facts=facts,
+        )
+        outcome = evaluate(spec)
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    if not outcome.ok or outcome.klass is None:
+        print(f"reason: {outcome.reason}", file=sys.stderr)
+        return 1
+    summary = render_summary(
+        sha=sha,
+        version=version,
+        version_on_main=facts.version_on_main,
+        log_main_to_sha=git_log_oneline(repo, f"refs/heads/main..{sha}"),
+        log_sha_to_main=git_log_oneline(repo, f"{sha}..refs/heads/main"),
+        klass=outcome.klass,
+        checks=outcome.checks,
+    )
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(summary)
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as handle:
+            handle.write(f"class={outcome.klass}\n")
+    print(outcome.klass)
+    return 0
+
+
+def cmd_next_link() -> int:
+    try:
+        url = next_link(link_header_value(sys.stdin.read()))
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    if url:
+        print(url)
+    return 0
+
+
+def cmd_peel_tag(args: argparse.Namespace) -> int:
+    ref_obj = json.loads(Path(args.ref_json).read_text(encoding="utf-8"))
+    tag_obj = None
+    if args.tag_object_json:
+        tag_obj = json.loads(Path(args.tag_object_json).read_text(encoding="utf-8"))
+    try:
+        print(peeled_commit_sha(ref_obj, tag_obj))
+    except GuardError as exc:
+        if exc.reason.startswith("fetch-tag-object:"):
+            print(exc.reason.split(":", 1)[1])
+            return 2
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_inspect_dist(args: argparse.Namespace) -> int:
+    root = Path(args.repo)
+    try:
+        inspect_dist(
+            Path(args.dist),
+            args.version,
+            (root / "README.md").read_text(encoding="utf-8"),
+            (root / "plugin" / "server" / "compat-matrices.json").read_bytes(),
+        )
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    except (OSError, zipfile.BadZipFile, tarfile.TarError) as exc:
+        print(f"reason: dist-read:{type(exc).__name__}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_upload_files(args: argparse.Namespace) -> int:
+    dist = Path(args.dist)
+    names = [path.name for path in sorted(dist.glob("*.whl"))]
+    names.extend(path.name for path in sorted(dist.glob("*.tar.gz")))
+    try:
+        body = _read_pypi_body(Path(args.pypi_body) if args.pypi_body else None, args.pypi_status)
+        chosen = filenames_to_upload(args.klass, names, args.pypi_status, body)
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    for name in chosen:
+        print(dist / name)
+    return 0
+
+
+def cmd_is_already_exists() -> int:
+    if publish_output_is_already_exists(sys.stdin.read()):
+        return 0
+    return 1
+
+
+def _fetch_pypi(version: str) -> Tuple[int, Optional[dict]]:
+    url = PYPI_PROJECT_URL.format(version=version)
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = getattr(response, "status", 200)
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return 404, None
+        return exc.code, None
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+        return 0, None
+    if not isinstance(payload, dict):
+        return status, None
+    return status, payload
+
+
+def cmd_poll(args: argparse.Namespace) -> int:
+    matched = poll_until_match(_fetch_pypi_for(args.version), args.version, time.sleep)
+    if not matched:
+        print("reason: conflict", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _fetch_pypi_for(version: str) -> Callable[[], Tuple[int, Optional[dict]]]:
+    def fetch() -> Tuple[int, Optional[dict]]:
+        return _fetch_pypi(version)
+
+    return fetch
+
+
+def _notes_from_git(repo: Path, sha: str, version: str) -> Optional[str]:
+    proc = _git(repo, ["show", f"{sha}:docs/releases/v{version}.md"])
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    repo = Path(args.repo)
+    sha = os.environ.get("SHA", "")
+    version = os.environ.get("VERSION", "")
+    klass = os.environ.get("CLASS", "")
+    tag_sha = os.environ.get("TAG_OBJECT_SHA") or None
+    release_exists = os.environ.get("RELEASE_EXISTS", "") == "true"
+    try:
+        if not SHA_RE.match(sha) or not VERSION_RE.match(version):
+            raise GuardError("inputs")
+        state = read_git_state(repo, sha)
+        remote = subprocess.run(
+            ["git", "ls-remote", f"https://github.com/{REPO}.git", "refs/tags/*"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if remote.returncode != 0:
+            raise GuardError("ls-remote")
+        tags = parse_ls_remote_tags(remote.stdout)
+
+        def ancestor_of_sha(commit: str) -> bool:
+            return is_ancestor(repo, commit, sha)
+
+        vprev = select_vprev(tags, sha, ancestor_of_sha)
+        log = ""
+        if vprev:
+            previous = next(tag.object_sha for tag in tags if tag.name == vprev)
+            log = git_log_oneline(repo, f"{previous}..{sha}")
+        plan = promote_plan(
+            klass=klass,
+            sha=sha,
+            version=version,
+            main_sha=state.main_sha,
+            main_is_ancestor_of_sha=state.main_is_ancestor_of_sha,
+            tag_object_sha=tag_sha,
+            release_exists=release_exists,
+            notes_text=_notes_from_git(repo, sha, version),
+            vprev=vprev,
+            log_oneline=log,
+        )
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
+        return 1
+    body_path = Path(args.body_out)
+    body_path.write_text(plan.body, encoding="utf-8")
+    print(f"main={plan.main}")
+    print(f"tag={plan.tag}")
+    print(f"release={plan.release}")
+    print("force=false")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="release_guard.py")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("assert-dispatch-env")
+    sub.add_parser("next-link")
+
+    peel = sub.add_parser("peel-tag")
+    peel.add_argument("--ref-json", required=True)
+    peel.add_argument("--tag-object-json")
+
+    classify_cmd = sub.add_parser("classify")
+    classify_cmd.add_argument("--repo", default=".")
+    classify_cmd.add_argument("--check-runs", required=True)
+    classify_cmd.add_argument("--pypi-status", type=int, required=True)
+    classify_cmd.add_argument("--pypi-body")
+    classify_cmd.add_argument("--tag-object-sha", default="")
+    classify_cmd.add_argument("--release-exists", action="store_true")
+
+    inspect = sub.add_parser("inspect-dist")
+    inspect.add_argument("--repo", default=".")
+    inspect.add_argument("--dist", required=True)
+    inspect.add_argument("--version", required=True)
+
+    upload = sub.add_parser("upload-files")
+    upload.add_argument("--class", dest="klass", required=True)
+    upload.add_argument("--dist", required=True)
+    upload.add_argument("--pypi-status", type=int, required=True)
+    upload.add_argument("--pypi-body")
+
+    sub.add_parser("is-already-exists")
+
+    poll = sub.add_parser("poll")
+    poll.add_argument("--version", required=True)
+
+    promote = sub.add_parser("promote")
+    promote.add_argument("--repo", default=".")
+    promote.add_argument("--body-out", required=True)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    commands = {
+        "assert-dispatch-env": lambda: cmd_assert_dispatch_env(),
+        "next-link": lambda: cmd_next_link(),
+        "peel-tag": lambda: cmd_peel_tag(args),
+        "classify": lambda: cmd_classify(args),
+        "inspect-dist": lambda: cmd_inspect_dist(args),
+        "upload-files": lambda: cmd_upload_files(args),
+        "is-already-exists": lambda: cmd_is_already_exists(),
+        "poll": lambda: cmd_poll(args),
+        "promote": lambda: cmd_promote(args),
+    }
+    return commands[args.cmd]()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,493 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "40-hex commit on develop to publish"
+        required: true
+        type: string
+      version:
+        description: "X.Y.Z already committed on sha"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch main, develop, and the commit
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "reason: sha" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_REPOSITORY" != "kirich1409/maven-mcp" ]; then
+            echo "reason: ref" >&2
+            exit 1
+          fi
+          git remote set-url origin https://github.com/kirich1409/maven-mcp.git
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main:refs/heads/main refs/heads/develop:refs/heads/develop
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin "$SHA"
+          git rev-parse --verify --quiet refs/heads/main >/dev/null
+          git rev-parse --verify --quiet refs/heads/develop >/dev/null
+          test "$(git cat-file -t "$SHA")" = commit
+          # The workflow file and this script are the pair on main. The sha tree is the release.
+          git show refs/heads/main:scripts/release_guard.py > "${RUNNER_TEMP}/release_guard.py"
+          python3 "${RUNNER_TEMP}/release_guard.py" assert-dispatch-env
+
+      - name: Fetch check runs
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "reason: sha" >&2
+            exit 1
+          fi
+          dest="${RUNNER_TEMP}/check-pages"
+          mkdir -p "$dest"
+          url="https://api.github.com/repos/kirich1409/maven-mcp/commits/${SHA}/check-runs?per_page=100"
+          i=0
+          while [ -n "$url" ]; do
+            headers="${RUNNER_TEMP}/check-headers-${i}.txt"
+            curl -fsSL -D "$headers" -o "${dest}/${i}.json" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url"
+            url="$(python3 "${RUNNER_TEMP}/release_guard.py" next-link < "$headers")"
+            i=$((i + 1))
+            if [ "$i" -gt 20 ]; then
+              echo "reason: check-runs-pagination" >&2
+              exit 1
+            fi
+          done
+
+      - name: Read PyPI, tag, and Release
+        id: remote
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          pypi_status="$(curl -sS -o "${RUNNER_TEMP}/pypi.json" -w "%{http_code}" \
+            "https://pypi.org/pypi/maven-mcp/${VERSION}/json")" || {
+            echo "reason: pypi-get" >&2
+            exit 1
+          }
+          tag_status="$(curl -sS -o "${RUNNER_TEMP}/tag-ref.json" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/kirich1409/maven-mcp/git/ref/tags/v${VERSION}")" || {
+            echo "reason: tag-get" >&2
+            exit 1
+          }
+          tag_sha=""
+          if [ "$tag_status" = "200" ]; then
+            set +e
+            tag_sha="$(env -u GH_TOKEN python3 "${RUNNER_TEMP}/release_guard.py" peel-tag --ref-json "${RUNNER_TEMP}/tag-ref.json")"
+            peel_code=$?
+            set -e
+            if [ "$peel_code" -eq 2 ]; then
+              if ! printf '%s' "$tag_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "reason: tag-ref" >&2
+                exit 1
+              fi
+              curl -fsSL -o "${RUNNER_TEMP}/tag-object.json" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/kirich1409/maven-mcp/git/tags/${tag_sha}"
+              tag_sha="$(env -u GH_TOKEN python3 "${RUNNER_TEMP}/release_guard.py" peel-tag \
+                --ref-json "${RUNNER_TEMP}/tag-ref.json" \
+                --tag-object-json "${RUNNER_TEMP}/tag-object.json")"
+            elif [ "$peel_code" -ne 0 ]; then
+              exit "$peel_code"
+            fi
+          elif [ "$tag_status" != "404" ]; then
+            echo "reason: tag-get" >&2
+            exit 1
+          fi
+          release_status="$(curl -sS -o "${RUNNER_TEMP}/release.json" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/kirich1409/maven-mcp/releases/tags/v${VERSION}")" || {
+            echo "reason: release-get" >&2
+            exit 1
+          }
+          release_exists=false
+          if [ "$release_status" = "200" ]; then
+            release_exists=true
+          elif [ "$release_status" != "404" ]; then
+            echo "reason: release-get" >&2
+            exit 1
+          fi
+          {
+            echo "pypi_status=${pypi_status}"
+            echo "tag_sha=${tag_sha}"
+            echo "release_exists=${release_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Classify
+        id: classify
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PYPI_STATUS: ${{ steps.remote.outputs.pypi_status }}
+          TAG_SHA: ${{ steps.remote.outputs.tag_sha }}
+          RELEASE_EXISTS: ${{ steps.remote.outputs.release_exists }}
+        run: |
+          set -euo pipefail
+          args=(
+            --check-runs "${RUNNER_TEMP}/check-pages"
+            --pypi-status "$PYPI_STATUS"
+            --pypi-body "${RUNNER_TEMP}/pypi.json"
+            --tag-object-sha "$TAG_SHA"
+          )
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            args+=(--release-exists)
+          fi
+          python3 "${RUNNER_TEMP}/release_guard.py" classify "${args[@]}"
+
+  build:
+    needs: guard
+    if: success() && (needs.guard.outputs.class == 'publish' || needs.guard.outputs.class == 'missing-file' || needs.guard.outputs.class == 'repair-github')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          enable-cache: false
+
+      - name: Install the build interpreter
+        run: uv python install 3.13
+
+      - name: Build sdist and wheel
+        run: uv build --sdist --wheel
+
+      - name: Stage the guard script from main
+        run: |
+          set -euo pipefail
+          git remote set-url origin https://github.com/kirich1409/maven-mcp.git
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          git show refs/remotes/origin/main:scripts/release_guard.py > "${RUNNER_TEMP}/release_guard.py"
+          mkdir -p "${RUNNER_TEMP}/release-guard-stage"
+          cp "${RUNNER_TEMP}/release_guard.py" "${RUNNER_TEMP}/release-guard-stage/release_guard.py"
+
+      - name: Inspect the uv artifacts
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          python3 "${RUNNER_TEMP}/release_guard.py" inspect-dist --dist dist --version "$VERSION"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist
+          path: dist/
+          retention-days: 5
+          if-no-files-found: error
+
+      # Publish has id-token only and does not check out the release SHA.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-guard
+          path: ${{ runner.temp }}/release-guard-stage/release_guard.py
+          retention-days: 5
+          if-no-files-found: error
+
+  publish:
+    needs: [guard, build]
+    if: success() && (needs.guard.outputs.class == 'publish' || needs.guard.outputs.class == 'missing-file' || needs.guard.outputs.class == 'repair-github')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/maven-mcp
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          enable-cache: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist
+          path: dist
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-guard
+          path: guard
+
+      - uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
+
+      - name: Publish or skip
+        env:
+          UV_PUBLISH_TOKEN: ""
+          CLASS: ${{ needs.guard.outputs.class }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          case "$CLASS" in
+            publish|missing-file|repair-github) ;;
+            *)
+              echo "reason: class" >&2
+              exit 1
+              ;;
+          esac
+          script="$(find guard -name release_guard.py -type f -print -quit)"
+          if [ -z "$script" ]; then
+            echo "reason: release-guard-missing" >&2
+            exit 1
+          fi
+          run_guard() {
+            env -u GH_TOKEN \
+              -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+              -u ACTIONS_ID_TOKEN_REQUEST_URL \
+              python3 "$script" "$@"
+          }
+          pypi_status="$(curl -sS -o "${RUNNER_TEMP}/pypi.json" -w "%{http_code}" \
+            "https://pypi.org/pypi/maven-mcp/${VERSION}/json")" || {
+            echo "reason: pypi-get" >&2
+            exit 1
+          }
+          run_guard upload-files \
+            --class "$CLASS" \
+            --dist dist \
+            --pypi-status "$pypi_status" \
+            --pypi-body "${RUNNER_TEMP}/pypi.json" \
+            > "${RUNNER_TEMP}/upload-files.txt"
+          mapfile -t files < "${RUNNER_TEMP}/upload-files.txt"
+          if [ "${#files[@]}" -eq 0 ]; then
+            run_guard poll --version "$VERSION"
+            exit $?
+          fi
+          for file in "${files[@]}"; do
+            set +e
+            uv publish --trusted-publishing always "$file" >"${RUNNER_TEMP}/uv-publish.txt" 2>&1
+            code=$?
+            set -e
+            cat "${RUNNER_TEMP}/uv-publish.txt"
+            if [ "$code" -ne 0 ]; then
+              if ! run_guard is-already-exists <"${RUNNER_TEMP}/uv-publish.txt"; then
+                exit "$code"
+              fi
+            fi
+          done
+          run_guard poll --version "$VERSION"
+
+  promote:
+    needs: [guard, publish]
+    if: success() && (needs.guard.outputs.class == 'publish' || needs.guard.outputs.class == 'missing-file' || needs.guard.outputs.class == 'repair-github')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch main, develop, and the commit
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "reason: sha" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_REPOSITORY" != "kirich1409/maven-mcp" ]; then
+            echo "reason: ref" >&2
+            exit 1
+          fi
+          git remote set-url origin https://github.com/kirich1409/maven-mcp.git
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin refs/heads/main:refs/heads/main refs/heads/develop:refs/heads/develop
+          GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin "$SHA"
+          git rev-parse --verify --quiet refs/heads/main >/dev/null
+          git rev-parse --verify --quiet refs/heads/develop >/dev/null
+          test "$(git cat-file -t "$SHA")" = commit
+          git show refs/heads/main:scripts/release_guard.py > "${RUNNER_TEMP}/release_guard.py"
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        id: release-app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: kirich1409
+          repositories: maven-mcp
+
+      - name: Fast-forward main, tag, and Release
+        env:
+          GH_TOKEN: ${{ steps.release-app.outputs.token }}
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+          CLASS: ${{ needs.guard.outputs.class }}
+        run: |
+          set -euo pipefail
+          case "$SHA" in
+            02fa8f5a936b85151041de0f0a524db484c6d2a0|1ae5ca62417826ac1af1e40e26fdbf11348a3ed4)
+              echo "reason: frozen-sha" >&2
+              exit 1
+              ;;
+          esac
+          case "$VERSION" in
+            1.0.0|1.1.0)
+              echo "reason: frozen-tag" >&2
+              exit 1
+              ;;
+          esac
+          if ! git merge-base --is-ancestor refs/heads/main "$SHA"; then
+            echo "reason: not-ancestor" >&2
+            exit 1
+          fi
+          tag_status="$(curl -sS -o "${RUNNER_TEMP}/tag-ref.json" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/kirich1409/maven-mcp/git/ref/tags/v${VERSION}")" || {
+            echo "reason: tag-get" >&2
+            exit 1
+          }
+          tag_sha=""
+          if [ "$tag_status" = "200" ]; then
+            set +e
+            tag_sha="$(env -u GH_TOKEN python3 "${RUNNER_TEMP}/release_guard.py" peel-tag --ref-json "${RUNNER_TEMP}/tag-ref.json")"
+            peel_code=$?
+            set -e
+            if [ "$peel_code" -eq 2 ]; then
+              if ! printf '%s' "$tag_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "reason: tag-ref" >&2
+                exit 1
+              fi
+              curl -fsSL -o "${RUNNER_TEMP}/tag-object.json" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/kirich1409/maven-mcp/git/tags/${tag_sha}"
+              tag_sha="$(env -u GH_TOKEN python3 "${RUNNER_TEMP}/release_guard.py" peel-tag \
+                --ref-json "${RUNNER_TEMP}/tag-ref.json" \
+                --tag-object-json "${RUNNER_TEMP}/tag-object.json")"
+            elif [ "$peel_code" -ne 0 ]; then
+              exit "$peel_code"
+            fi
+          elif [ "$tag_status" != "404" ]; then
+            echo "reason: tag-get" >&2
+            exit 1
+          fi
+          release_status="$(curl -sS -o "${RUNNER_TEMP}/release.json" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/kirich1409/maven-mcp/releases/tags/v${VERSION}")" || {
+            echo "reason: release-get" >&2
+            exit 1
+          }
+          release_exists=false
+          if [ "$release_status" = "200" ]; then
+            release_exists=true
+          elif [ "$release_status" != "404" ]; then
+            echo "reason: release-get" >&2
+            exit 1
+          fi
+          TAG_OBJECT_SHA="$tag_sha" RELEASE_EXISTS="$release_exists" \
+            env -u GH_TOKEN python3 "${RUNNER_TEMP}/release_guard.py" promote \
+            --body-out "${RUNNER_TEMP}/release-body.md" \
+            > "${RUNNER_TEMP}/promote.txt"
+          main_action="$(awk -F= '$1=="main" {print $2}' "${RUNNER_TEMP}/promote.txt")"
+          tag_action="$(awk -F= '$1=="tag" {print $2}' "${RUNNER_TEMP}/promote.txt")"
+          release_action="$(awk -F= '$1=="release" {print $2}' "${RUNNER_TEMP}/promote.txt")"
+          case "$main_action" in
+            update|skip) ;;
+            *) echo "reason: promote-main" >&2; exit 1 ;;
+          esac
+          case "$tag_action" in
+            create|skip) ;;
+            *) echo "reason: promote-tag" >&2; exit 1 ;;
+          esac
+          case "$release_action" in
+            draft|published|skip) ;;
+            *) echo "reason: promote-release" >&2; exit 1 ;;
+          esac
+          main_now="$(git rev-parse refs/heads/main)"
+          if [ "$main_action" = "update" ] && [ "$main_now" != "$SHA" ]; then
+            gh api --method PATCH /repos/kirich1409/maven-mcp/git/refs/heads/main -f sha="$SHA"
+          fi
+          if [ "$tag_action" = "create" ]; then
+            if gh api "/repos/kirich1409/maven-mcp/git/ref/tags/v${VERSION}" >/dev/null 2>&1; then
+              echo "reason: tag-exists" >&2
+              exit 1
+            fi
+            gh api --method POST /repos/kirich1409/maven-mcp/git/refs \
+              -f ref="refs/tags/v${VERSION}" \
+              -f sha="$SHA"
+          fi
+          if [ "$release_action" != "skip" ]; then
+            draft=false
+            if [ "$release_action" = "draft" ]; then
+              draft=true
+            fi
+            gh api --method POST /repos/kirich1409/maven-mcp/releases \
+              -f tag_name="v${VERSION}" \
+              -f target_commitish="$SHA" \
+              -f name="maven-mcp ${VERSION}" \
+              -f body="@${RUNNER_TEMP}/release-body.md" \
+              -F draft="$draft"
+          fi

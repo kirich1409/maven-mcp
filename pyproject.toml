@@ -51,7 +51,7 @@ python_version = "3.9"
 # relative to the invocation CWD. CI runs mypy from the repo root (matching
 # AGENTS.md), so these are repo-root-relative.
 files = ["plugin/server", "tests"]
-mypy_path = ["plugin/server"]
+mypy_path = ["plugin/server", "scripts"]
 warn_unused_configs = true
 warn_redundant_casts = true
 

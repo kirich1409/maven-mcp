@@ -222,7 +222,7 @@ python3 -m unittest discover -s tests
 python3 scripts/check-versions.py
 ```
 
-Contribution branches come from `develop`, and the contract for coding agents is [AGENTS.md](AGENTS.md).
+Contribution branches come from `develop`, and the contract for coding agents is [AGENTS.md](AGENTS.md). A release is a dispatch of Release on `main`, described in [AGENTS.md](AGENTS.md).
 
 ## License
 
