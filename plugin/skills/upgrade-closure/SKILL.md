@@ -50,7 +50,11 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
    the target list to fill introduced, remaining, or fixed. Other coordinates come
    from the closure buckets.
 
-   - **`stop`** — one decision row per `MAL-` id in `targets[].vulnerabilities`,
+   Render every CVE decision row in those lists, whatever `advisory` is. A `stop`
+   result still shows a non-MAL CVE. A `review` result still shows `fixed` and
+   `MEDIUM`/`LOW` rows. `advisory` only chooses the action.
+
+   - **`stop`** — do not apply the edit. Also call out each `MAL-` id in `targets[].vulnerabilities`,
      `targets[].vulnerabilityDelta`, and `vulnerabilities.introduced` / `remaining` /
      `uncompared`, including `path` when present. If the same id is in both the
      target list and the delta, one row, and the relation is the delta's. Do not
@@ -65,14 +69,16 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
      `rewroteVersionless`, `capabilityUnavailable`. When
      `compare_versions(safeUpgrade.version, toVersion) > 0`, say the confirmed
      direct version does not clear every known CVE and name that candidate. That
-     compare is numeric segments, not text order (`1.10` is above `1.9`). Ask
+     compare is `compare_versions`: numeric segments, then stability class, qualifier
+     presence, prerelease ordinals, then a lexical tie-break. Not text order (`1.10`
+     is above `1.9`). An RC and a final release that share a numeric core are not equal. Ask
      again before editing. Writing that higher version is a new confirm and a
      new preview.
    - **`info`** — `added` / `changed` / `removed` counts and the first rows, then
      a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and each
      introduced `MEDIUM`/`LOW`, from `vulnerabilityDelta` and from the closure
      buckets. License rows whose `verdict` is `review` or `ok`. Do not call the
-     bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
+     bump safe. Those rows are in addition to the full CVE list above, not instead of it.
    - **`unknown`** — the closure was not compared. Quote `error`. Do not describe
      empty buckets as "no change" and do not fill the gap.
    - **`none` after a compare** (`diffReliable: true`, and the target has a

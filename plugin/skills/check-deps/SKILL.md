@@ -143,7 +143,11 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
    relabel a delta row `target`, and do not use the target list to fill introduced,
    remaining, or fixed. Other coordinates come from the closure buckets.
 
-   - **`stop`** — one decision row per `MAL-` id in `targets[].vulnerabilities`,
+   Render every CVE decision row in those lists, whatever `advisory` is. A `stop`
+   result still shows a non-MAL HIGH CVE. A `review` result still shows `fixed` and
+   `MEDIUM`/`LOW` rows. `advisory` only chooses the action; it does not hide rows.
+
+   - **`stop`** — do not edit. Also call out each `MAL-` id in `targets[].vulnerabilities`,
      `targets[].vulnerabilityDelta`, and `vulnerabilities.introduced` / `remaining` /
      `uncompared`, including `path` when present. If the same id is in both the
      target list and the delta, one row, and the relation is the delta's. Do not
@@ -158,14 +162,16 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
      `landed`, `rewroteVersionless`, `capabilityUnavailable`. When
      `compare_versions(safeUpgrade.version, toVersion) > 0`, say the confirmed
      direct version does not clear every known CVE and name that candidate. That
-     compare is numeric segments, not text order (`1.10` is above `1.9`). Ask
+     compare is `compare_versions`: numeric segments, then stability class, qualifier
+     presence, prerelease ordinals, then a lexical tie-break. Not text order (`1.10`
+     is above `1.9`). An RC and a final release that share a numeric core are not equal. Ask
      again before editing. Writing that higher version is a new confirm and a new
      preview, not an in-place edit of this result.
    - **`info`** — `added` / `changed` / `removed` counts and the first rows, then
      a decision row for each remaining `MEDIUM`/`LOW`, each `fixed` id, and each
      introduced `MEDIUM`/`LOW`, from `vulnerabilityDelta` and from the closure
      buckets. License rows whose `verdict` is `review` or `ok`. Do not call the
-     bump safe. Do not list remaining `CRITICAL`/`HIGH` here.
+     bump safe. Those rows are in addition to the full CVE list above, not instead of it.
    - **`unknown`** — the closure was not compared. Quote `error`. Do not fill the
      gap, and do not describe empty buckets as "no change".
    - **`none` after a compare** (`diffReliable: true`, and the target has a
@@ -253,7 +259,7 @@ Surface failures immediately. Attempt trivial fixes; otherwise revert that entry
 - Step 1 stays direct: `audit_project_dependencies` is first-level production dependencies, not the closure. The closure preview runs only after confirm, for the library batch, and is not a safety verdict.
 - The write hooks do not call `compare_upgrade_closure`. Do not add that call.
 - This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
-- The audit requires a Gradle wrapper (`gradlew`). Maven-only projects are out of scope for this scan path. Without a wrapper the preview is one deps.dev call, or no call when the batch is larger or no library upgrade remains.
+- Gradle resolution in step 1 needs `gradlew`. Maven projects are in scope: `audit_project_dependencies` still returns their rows, and the no-wrapper preview is one deps.dev call, or no call when the batch is larger or no library upgrade remains.
 
 ## Fallback (MCP unavailable only)
 
