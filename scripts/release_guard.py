@@ -168,9 +168,171 @@ def assert_release_build(text: str) -> None:
     parts = [part.strip() for part in requires.group(1).split(",") if part.strip()]
     if parts != ['"hatchling>=1.26.3"']:
         raise GuardError("build-system")
-    # Target hooks ([tool.hatch.build.targets.wheel.hooks.*]) as well as the top-level table.
-    if re.search(r"(?m)^\[tool\.hatch\.build\.[^\]]*hooks", text):
+    if _hatch_build_has_hook(text):
         raise GuardError("build-hook")
+
+
+def _hatch_build_has_hook(text: str) -> bool:
+    """True when a tool.hatch.build table declares a hooks key.
+
+    Hatchling accepts a header, a dotted key, or an inline table, with
+    whitespace around dots and brackets. Assignments are scanned in the
+    stdlib; there is no TOML parser.
+    """
+    table: Optional[Tuple[str, ...]] = None
+    pending: Optional[str] = None
+    for raw in text.splitlines():
+        if pending is not None:
+            found = raw.find(pending)
+            if found < 0:
+                continue
+            pending = None
+            raw = raw[found + 3 :]
+            if not raw.strip():
+                continue
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            table = _toml_table_path(line)
+            if table is not None and _is_hatch_build_table(table) and "hooks" in table:
+                return True
+            continue
+        if not _is_hatch_build_table(table):
+            continue
+        assignment = _split_toml_assignment(line)
+        if assignment is None:
+            continue
+        key, value = assignment
+        segments = _toml_key_segments(key.strip())
+        if segments is None or "hooks" in segments:
+            return True
+        pending = _unclosed_triple(value)
+    return False
+
+
+def _is_hatch_build_table(table: Optional[Tuple[str, ...]]) -> bool:
+    if table is None or len(table) < 3:
+        return False
+    return table[0] == "tool" and table[1] == "hatch" and table[2] == "build"
+
+
+def _toml_table_path(line: str) -> Optional[Tuple[str, ...]]:
+    match = re.match(r"^\[{1,2}\s*(.*?)\s*\]{1,2}\s*(?:#.*)?$", line)
+    if match is None:
+        return ("tool", "hatch", "build", "hooks") if "hooks" in line else None
+    segments = _toml_key_segments(match.group(1).strip())
+    if segments is None and "hooks" in match.group(1).split("."):
+        return ("tool", "hatch", "build", "hooks")
+    return segments
+
+
+def _split_toml_assignment(line: str) -> Optional[Tuple[str, str]]:
+    in_single = False
+    in_double = False
+    escape = False
+    for index, char in enumerate(line):
+        if escape:
+            escape = False
+            continue
+        if char == "\\" and in_double:
+            escape = True
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == "=" and not in_single and not in_double:
+            return line[:index], line[index + 1 :]
+    return None
+
+
+def _unclosed_triple(value: str) -> Optional[str]:
+    earliest: Optional[Tuple[int, str]] = None
+    for quote in ('"""', "'''"):
+        found = value.find(quote)
+        if found >= 0 and (earliest is None or found < earliest[0]):
+            earliest = (found, quote)
+    if earliest is None:
+        return None
+    quote = earliest[1]
+    opened = False
+    start = 0
+    while True:
+        found = value.find(quote, start)
+        if found < 0:
+            break
+        opened = not opened
+        start = found + 3
+    if opened:
+        return quote
+    return None
+
+
+def _toml_key_segments(text: str) -> Optional[Tuple[str, ...]]:
+    segments: List[str] = []
+    index = 0
+    length = len(text)
+    expect_segment = True
+    while index < length:
+        while index < length and text[index] in " \t":
+            index += 1
+        if index >= length:
+            break
+        expect_segment = False
+        if text[index] == '"':
+            segment, index = _toml_basic_string(text, index)
+        elif text[index] == "'":
+            segment, index = _toml_literal_string(text, index)
+        else:
+            start = index
+            while index < length and (text[index].isalnum() or text[index] in "-_"):
+                index += 1
+            if index == start:
+                return None
+            segment = text[start:index]
+        if segment is None:
+            return None
+        segments.append(segment)
+        while index < length and text[index] in " \t":
+            index += 1
+        if index >= length:
+            break
+        if text[index] != ".":
+            return None
+        index += 1
+        expect_segment = True
+    if expect_segment or not segments:
+        return None
+    return tuple(segments)
+
+
+def _toml_basic_string(text: str, index: int) -> Tuple[Optional[str], int]:
+    index += 1
+    chars: List[str] = []
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            if index + 1 >= len(text):
+                return None, index
+            chars.append(text[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            return "".join(chars), index + 1
+        chars.append(char)
+        index += 1
+    return None, index
+
+
+def _toml_literal_string(text: str, index: int) -> Tuple[Optional[str], int]:
+    index += 1
+    end = text.find("'", index)
+    if end < 0:
+        return None, index
+    return text[index:end], end + 1
 
 
 def metadata_matches(body: object, version: str) -> bool:
@@ -415,8 +577,19 @@ def _fail(reason: str) -> GuardOutcome:
 
 
 def _git(repo: Path, args: Sequence[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    # Empty fsmonitor stops a command the release tree can plant in .git/config.
+    # alias.worktree= keeps a hiding alias from replacing the builtin.
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "alias.worktree=",
+            *args,
+        ],
         check=check,
         capture_output=True,
         text=True,
@@ -582,9 +755,37 @@ def readme_prose(readme: str) -> str:
     )
 
 
+def _require_wheel_members(names: Sequence[str]) -> None:
+    """Payload is server.py and the matrix. Other members must be one dist-info tree."""
+    dist_info: Optional[str] = None
+    for name in names:
+        trimmed = name[:-1] if name.endswith("/") else name
+        parts = trimmed.split("/")
+        if (
+            name.startswith("/")
+            or "\\" in name
+            or not parts
+            or ".." in parts
+            or "" in parts
+        ):
+            raise GuardError("wheel-member")
+        if name in ("server.py", "compat-matrices.json"):
+            continue
+        if parts[0].endswith(".dist-info"):
+            if dist_info is None:
+                dist_info = parts[0]
+            elif dist_info != parts[0]:
+                raise GuardError("wheel-member")
+            continue
+        raise GuardError("wheel-member")
+    if dist_info is None:
+        raise GuardError("wheel-metadata")
+
+
 def inspect_wheel(path: Path, version: str, readme: str, matrix: bytes, server: bytes) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
+        _require_wheel_members(names)
         if "server.py" not in names:
             raise GuardError("wheel-server")
         if archive.read("server.py") != server:
@@ -632,6 +833,37 @@ def sdist_version(path: Path) -> str:
     raise GuardError("sdist-version")
 
 
+def _sdist_file(path: Path, suffix: str) -> bytes:
+    found: Optional[bytes] = None
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            parts = member.name.split("/")
+            if member.name.startswith("/") or ".." in parts:
+                raise GuardError("sdist-member")
+            if not member.name.endswith(suffix):
+                continue
+            if found is not None:
+                raise GuardError("sdist-member")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise GuardError("sdist-member")
+            found = extracted.read()
+    if found is None:
+        raise GuardError("sdist-member")
+    return found
+
+
+def inspect_sdist(path: Path, version: str, matrix: bytes, server: bytes) -> None:
+    if sdist_version(path) != version:
+        raise GuardError("sdist-version")
+    if _sdist_file(path, "/plugin/server/server.py") != server:
+        raise GuardError("sdist-server-bytes")
+    if _sdist_file(path, "/plugin/server/compat-matrices.json") != matrix:
+        raise GuardError("sdist-matrix-bytes")
+
+
 def inspect_dist(
     dist: Path,
     version: str,
@@ -644,8 +876,7 @@ def inspect_dist(
     if len(wheels) != 1 or len(sdists) != 1:
         raise GuardError("dist-count")
     inspect_wheel(wheels[0], version, readme, matrix, server)
-    if sdist_version(sdists[0]) != version:
-        raise GuardError("sdist-version")
+    inspect_sdist(sdists[0], version, matrix, server)
 
 
 def filenames_to_upload(
@@ -885,8 +1116,9 @@ def cmd_classify(args: argparse.Namespace) -> int:
         pypi_body = _read_pypi_body(Path(args.pypi_body) if args.pypi_body else None, args.pypi_status)
         state = read_git_state(repo, sha)
         version_on_main = project_version(git_show(repo, "refs/heads/main:pyproject.toml"))
-        check_versions_sha_ok = _check_versions(repo, version)
+        # Main first: the SHA script can edit .git/config before the next git call.
         check_versions_main_ok = check_versions_on_main(repo)
+        check_versions_sha_ok = _check_versions(repo, version)
         tag_sha = args.tag_object_sha or None
         if tag_sha == "":
             tag_sha = None

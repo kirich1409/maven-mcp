@@ -274,12 +274,8 @@ jobs:
           name: release-sources
           path: sources
 
-      - uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
-
-      - name: Publish or skip
+      - name: Inspect dist before attest
         env:
-          UV_PUBLISH_TOKEN: ""
-          CLASS: ${{ needs.guard.outputs.class }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -304,18 +300,46 @@ jobs:
               exit 1
             fi
           done
+          env -u GH_TOKEN \
+            -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            python3 "$script" inspect-dist \
+            --dist dist \
+            --version "$VERSION" \
+            --readme sources/README.md \
+            --matrix sources/compat-matrices.json \
+            --server sources/server.py
+
+      - uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
+
+      - name: Publish or skip
+        env:
+          UV_PUBLISH_TOKEN: ""
+          CLASS: ${{ needs.guard.outputs.class }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "reason: version" >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            1.0.0|1.1.0)
+              echo "reason: frozen-tag" >&2
+              exit 1
+              ;;
+          esac
+          script="guard/release_guard.py"
+          if [ ! -f "$script" ]; then
+            echo "reason: release-guard-missing" >&2
+            exit 1
+          fi
           run_guard() {
             env -u GH_TOKEN \
               -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
               -u ACTIONS_ID_TOKEN_REQUEST_URL \
               python3 "$script" "$@"
           }
-          run_guard inspect-dist \
-            --dist dist \
-            --version "$VERSION" \
-            --readme sources/README.md \
-            --matrix sources/compat-matrices.json \
-            --server sources/server.py
           pypi_status="$(curl -sS -o "${RUNNER_TEMP}/pypi.json" -w "%{http_code}" \
             "https://pypi.org/pypi/maven-mcp/${VERSION}/json")" || {
             echo "reason: pypi-get" >&2

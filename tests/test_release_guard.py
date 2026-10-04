@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import io
+import json
+import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -148,6 +153,26 @@ def _commit(repo: Path, message: str, filename: str = "README.md", body: str = "
     _git(repo, "add", filename)
     _git(repo, "commit", "-q", "-m", message)
     return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _make_sdist(
+    path: Path,
+    *,
+    version: str = "1.2.3",
+    server: bytes = b"print('ok')\n",
+    matrix: bytes = b"matrix-bytes",
+) -> None:
+    root_name = f"maven_mcp-{version}"
+    payload = {
+        f"{root_name}/PKG-INFO": f"Metadata-Version: 2.1\nVersion: {version}\n".encode(),
+        f"{root_name}/plugin/server/server.py": server,
+        f"{root_name}/plugin/server/compat-matrices.json": matrix,
+    }
+    with tarfile.open(path, "w:gz") as archive:
+        for name, data in payload.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
 
 
 def _make_wheel(
@@ -390,6 +415,33 @@ class ClassifyTest(unittest.TestCase):
         target = PYPROJECT + '\n[tool.hatch.build.targets.wheel.hooks.custom]\npath = "x"\n'
         outcome = rg.evaluate(_spec(_facts(), pyproject_text=target))
         self.assertEqual(outcome.reason, "build-hook")
+        spaced = PYPROJECT + "\n[ tool.hatch.build.hooks.custom ]\npath = \"x\"\n"
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=spaced)).reason, "build-hook")
+        indented = PYPROJECT + "\n    [tool.hatch.build.hooks.custom]\npath = \"x\"\n"
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=indented)).reason, "build-hook")
+        dotted = (
+            PYPROJECT
+            + "\n[tool.hatch.build.targets.wheel]\nhooks.custom.path = \"hatch_build.py\"\n"
+        )
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=dotted)).reason, "build-hook")
+        spaced_dots = (
+            PYPROJECT
+            + "\n[tool.hatch.build.targets.wheel]\nhooks . custom . path = \"hatch_build.py\"\n"
+        )
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=spaced_dots)).reason, "build-hook")
+        inline = (
+            PYPROJECT
+            + "\n[tool.hatch.build]\nhooks = { custom = { path = \"hatch_build.py\" } }\n"
+        )
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=inline)).reason, "build-hook")
+        nested = (
+            PYPROJECT
+            + "\n[tool.hatch.build]\ntargets.wheel.hooks.custom.path = \"hatch_build.py\"\n"
+        )
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=nested)).reason, "build-hook")
+        comment = PYPROJECT + "\n# [tool.hatch.build.hooks.custom]\n"
+        self.assertTrue(rg.evaluate(_spec(_facts(), pyproject_text=comment)).ok)
+        rg.assert_release_build((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
 class CheckRunTest(unittest.TestCase):
@@ -563,6 +615,30 @@ class WheelTest(unittest.TestCase):
                 rg.inspect_wheel(changed, "1.2.3", readme, matrix, b"other\n")
             self.assertEqual(caught.exception.reason, "wheel-server-bytes")
 
+            extra = root / "extra.whl"
+            _make_wheel(extra, paragraph=paragraph)
+            with zipfile.ZipFile(extra, "a") as archive:
+                archive.writestr("server.pth", "import os\n")
+            with self.assertRaises(rg.GuardError) as caught:
+                rg.inspect_wheel(extra, "1.2.3", readme, matrix, server)
+            self.assertEqual(caught.exception.reason, "wheel-member")
+
+            sdist = root / "pkg.tar.gz"
+            _make_sdist(sdist, server=server, matrix=matrix)
+            dist = root / "dist"
+            dist.mkdir()
+            _make_wheel(dist / "pkg.whl", matrix=matrix, paragraph=paragraph)
+            (dist / "pkg.tar.gz").write_bytes(sdist.read_bytes())
+            rg.inspect_dist(dist, "1.2.3", readme, matrix, server)
+
+            bad = root / "bad-sdist"
+            bad.mkdir()
+            _make_wheel(bad / "pkg.whl", matrix=matrix, paragraph=paragraph)
+            _make_sdist(bad / "pkg.tar.gz", server=b"tampered\n", matrix=matrix)
+            with self.assertRaises(rg.GuardError) as caught:
+                rg.inspect_dist(bad, "1.2.3", readme, matrix, server)
+            self.assertEqual(caught.exception.reason, "sdist-server-bytes")
+
 
 class PromoteTest(unittest.TestCase):
     def _plan(self, **overrides: object) -> rg.PromotePlan:
@@ -697,6 +773,56 @@ class GitAncestorTest(unittest.TestCase):
             shown = rg.git_show(repo, "refs/heads/main:pyproject.toml")
             self.assertIn('version = "1.2.0"', shown)
 
+    def test_git_disables_fsmonitor_and_worktree_alias(self) -> None:
+        with patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            rg._git(Path("."), ["worktree", "add", "tree"])
+        argv = run.call_args.args[0]
+        self.assertIn("core.fsmonitor=", argv)
+        self.assertIn("alias.worktree=", argv)
+        self.assertLess(argv.index("core.fsmonitor="), argv.index("worktree"))
+
+    def test_main_versions_script_runs_before_the_sha_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            marker = root / "order.txt"
+            _init_repo(repo)
+            (repo / "scripts").mkdir()
+            (repo / "scripts" / "check-versions.py").write_text(
+                "import os\nfrom pathlib import Path\n"
+                "Path(os.environ['MARKER']).open('a', encoding='utf-8').write(Path.cwd().name + '\\n')\n",
+                encoding="utf-8",
+            )
+            (repo / "pyproject.toml").write_text(PYPROJECT, encoding="utf-8")
+            _git(repo, "add", "scripts/check-versions.py", "pyproject.toml")
+            _git(repo, "commit", "-q", "-m", "release")
+            _git(repo, "branch", "develop")
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+            checks = root / "checks.json"
+            checks.write_text(
+                json.dumps({"check_runs": _green_checks()}),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                repo=str(repo),
+                check_runs=str(checks),
+                pypi_status=404,
+                pypi_body=None,
+                tag_object_sha="",
+                release_exists=False,
+            )
+            env = {
+                "SHA": sha,
+                "VERSION": "1.2.0",
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_REPOSITORY": rg.REPO,
+                "MARKER": str(marker),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                rg.cmd_classify(args)
+            self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["tree", "repo"])
+
 
 class WorkflowContractTest(unittest.TestCase):
     def test_release_workflow_shape(self) -> None:
@@ -752,6 +878,11 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("--slurp", text)
         self.assertLess(text.index("name: release-guard"), text.index("name: Classify"))
         self.assertLess(text.index("name: release-sources"), text.index("uv build --sdist --wheel"))
+        self.assertLess(text.index("inspect-dist"), text.index("astral-sh/attest-action@"))
+        self.assertLess(
+            text.index("astral-sh/attest-action@"),
+            text.index("uv publish --trusted-publishing always"),
+        )
         self.assertNotIn(FROZEN_V110, text)
         self.assertNotIn(FROZEN_V100, text)
 
