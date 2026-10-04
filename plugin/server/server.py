@@ -3676,6 +3676,10 @@ def _select_delta_gavs(
             push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("toVersion"))
         for upgrade in upgrades or []:
             push(upgrade.get("groupId"), upgrade.get("artifactId"), upgrade.get("fromVersion"))
+        for upgrade in upgrades or []:
+            # The version Gradle selected can differ from toVersion (not landed).
+            for version in upgrade.get("selectedVersions") or []:
+                push(upgrade.get("groupId"), upgrade.get("artifactId"), version)
     for group_id, artifact_id, version, _kind in _ordered_license_gavs(diff):
         push(group_id, artifact_id, version)
 
@@ -3697,6 +3701,9 @@ def _select_delta_gavs(
             pinned = upgrade.get(version_key)
             if upgrade.get("groupId") and upgrade.get("artifactId") and pinned:
                 target_keys.add((upgrade.get("groupId"), upgrade.get("artifactId"), pinned))
+        for version in upgrade.get("selectedVersions") or []:
+            if upgrade.get("groupId") and upgrade.get("artifactId") and version:
+                target_keys.add((upgrade.get("groupId"), upgrade.get("artifactId"), version))
     prefix: List[Dict[str, str]] = []
     rest: List[Dict[str, str]] = []
     for gav in deduped:
@@ -3930,34 +3937,48 @@ def _classify_vuln_delta(
         ):
             if field in upgrade:
                 target[field] = upgrade[field]
-        to_key = (group_id, artifact_id, to_version)
-        to_record = queried.get(to_key)
-        if to_record is not None:
-            raw_vulns = [
-                raw for raw in (to_record.get("vulnerabilities") or []) if raw.get("id")
-            ]
+        selected_versions = [
+            version for version in (upgrade.get("selectedVersions") or []) if version
+        ]
+        # When Gradle selected something other than toVersion, that version
+        # is what the build will use.
+        vuln_versions = selected_versions or ([to_version] if to_version else [])
+        raw_vulns = []
+        saw_record = False
+        for version in vuln_versions:
+            record = queried.get((group_id, artifact_id, version))
+            if record is None:
+                input_truncated = True
+                continue
+            saw_record = True
+            if record.get("capabilityUnavailable") and "capabilityUnavailable" not in target:
+                target["capabilityUnavailable"] = record["capabilityUnavailable"]
+            for raw in record.get("vulnerabilities") or []:
+                if raw.get("id"):
+                    raw_vulns.append((version, raw))
+        if saw_record:
             target["vulnerabilities"] = [
                 _upgrade_vuln_item(
                     raw,
                     relation="target",
                     group_id=group_id,
                     artifact_id=artifact_id,
-                    version=to_version,
-                    selected_version=to_version,
+                    version=version,
+                    selected_version=version,
                 )
-                for raw in raw_vulns
+                for version, raw in raw_vulns
             ]
-            if to_record.get("capabilityUnavailable"):
-                target["capabilityUnavailable"] = to_record["capabilityUnavailable"]
             if raw_vulns:
-                safe = _compute_safe_upgrade(raw_vulns)
+                safe = _compute_safe_upgrade([raw for _version, raw in raw_vulns])
                 if safe is not None:
                     target["safeUpgrade"] = safe
-        else:
+        elif to_version:
             input_truncated = True
+        to_record = queried.get((group_id, artifact_id, to_version)) if to_version else None
         if from_version and to_version:
+            after_versions = selected_versions or [to_version]
             delta = classify_pair(
-                group_id, artifact_id, [from_version], [to_version], target=True,
+                group_id, artifact_id, [from_version], after_versions, target=True,
             )
             if (group_id, artifact_id, from_version) in queried and to_record is not None:
                 target["vulnerabilityDelta"] = delta
@@ -4395,11 +4416,13 @@ def _select_upgrade_graph_source(args: Dict, project_path: str) -> str:
     through to deps.dev. Nothing here retries a failed Gradle run as deps.dev.
     """
     requested = args.get("graphSource") or "auto"
+    if requested not in ("auto", "depsdev", "gradle"):
+        raise ValueError("graphSource must be auto, depsdev, or gradle")
     if requested == "depsdev":
         return "depsdev"
     if requested == "gradle":
         return "gradle"
-    # auto, and any unrecognised value: one filesystem check, not one per coordinate.
+    # auto: one filesystem check, not one per coordinate.
     if (
         _detect_build_system(project_path) == "gradle"
         and _find_gradle_wrapper(project_path)
@@ -5579,6 +5602,14 @@ def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
         capability_unavailable=classified.get("capabilityUnavailable"),
         input_truncated=bool(classified.get("inputTruncated") or selected.get("truncated")),
     )
+    if any(row.get("error") for row in upgrades_out) and ranked.get("advisory") == "none":
+        ranked = dict(ranked)
+        ranked["advisory"] = "review"
+        ranked["partial"] = True
+        ranked["notes"] = [
+            "A requested coordinate was not closure-checked.",
+            *list(ranked.get("notes") or []),
+        ]
     result = _with_upgrade_source(
         graph_source,
         upgrades_out,

@@ -439,6 +439,67 @@ class GradleClosureMockTest(unittest.TestCase):
         self.assertEqual(out["advisory"], "none")
         self.assertNotIn("vulnerabilities", out["targets"][0])
 
+    def test_unknown_graph_source_is_rejected(self):
+        with unittest.mock.patch.object(server, "_gradle_run") as run, \
+                self.assertRaisesRegex(ValueError, "graphSource must be auto, depsdev, or gradle"):
+            server.compare_upgrade_closure(_args(
+                [_upgrade()], graphSource="gradel",
+            ))
+        run.assert_not_called()
+
+    def test_marker_beside_clean_closure_is_not_none(self):
+        def respond(payload):
+            version = "4.9.3" if payload.get("phase") == "before" else "4.12.0"
+            return _lib_tree(version), "", 0
+
+        marker = _upgrade(
+            group_id="com.example.plugin",
+            artifact_id="com.example.plugin.gradle.plugin",
+            from_version="1.0.0",
+            to_version="2.0.0",
+        )
+        out, _spy, _deps, _lic = self._run(
+            respond,
+            _args([marker, _upgrade()], projectPath=self._wrapper_project(), graphSource="gradle"),
+        )
+        self.assertEqual(out["advisory"], "review")
+        self.assertTrue(out["partial"])
+        self.assertTrue(any("not closure-checked" in note for note in out["notes"]))
+
+    def test_unlanded_selected_version_is_queried(self):
+        def respond(payload):
+            version = "4.9.3" if payload.get("phase") == "before" else "5.0.0"
+            return _lib_tree(version), "", 0
+
+        def osv(deps):
+            rows = _clean_osv(deps)
+            self.assertIn("5.0.0", [row["version"] for row in rows])
+            for row in rows:
+                if row["version"] == "5.0.0":
+                    row["vulnerabilities"] = [{
+                        "id": "CVE-2026-1",
+                        "summary": "selected",
+                        "url": "https://osv.dev/vulnerability/CVE-2026-1",
+                        "malicious": False,
+                        "severity": "HIGH",
+                    }]
+            return rows
+
+        spy = _GradleRunSpy(respond)
+        with unittest.mock.patch.object(server, "_gradle_run", spy), \
+                unittest.mock.patch.object(server, "query_osv_batch", osv), \
+                unittest.mock.patch.object(server, "fetch_depsdev_licenses", return_value={
+                    "ok": True, "status": 200, "licenses": ["MIT"], "error": None,
+                }):
+            out = server.compare_upgrade_closure(_args(
+                [_upgrade()], projectPath=self._wrapper_project(), graphSource="gradle",
+            ))
+        self.assertFalse(out["targets"][0]["landed"])
+        self.assertIn("5.0.0", out["targets"][0]["selectedVersions"])
+        ids = [item["id"] for item in out["targets"][0]["vulnerabilities"]]
+        self.assertIn("CVE-2026-1", ids)
+        self.assertEqual(out["advisory"], "review")
+
     def _wrapper_project(self):
         root = tempfile.mkdtemp(prefix="maven-mcp-wrapper-flag-")
         self.addCleanup(shutil.rmtree, root, True)
@@ -510,6 +571,7 @@ def _write(path, text):
         handle.write(text)
 
 
+@unittest.skipUnless(shutil.which("gradle"), "real wrapper fixtures need a host gradle")
 class GradleWrapperFixtureTest(unittest.TestCase):
     """Real gradlew. Not strictly, not +, and 9.9.9 is not published."""
 
