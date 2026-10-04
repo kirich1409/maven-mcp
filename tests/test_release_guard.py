@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -251,6 +253,55 @@ class ClassifyTest(unittest.TestCase):
             _class(_facts(pypi_status=200, pypi_body=wheel_only, main_is_ancestor_of_sha=False)),
             "conflict",
         )
+        self.assertEqual(
+            _class(_facts(pypi_status=200, pypi_body=wheel_only, tag_object_sha=None)),
+            "missing-file",
+        )
+        self.assertEqual(
+            _class(_facts(pypi_status=200, pypi_body=wheel_only, tag_object_sha=SHA)),
+            "missing-file",
+        )
+        self.assertEqual(
+            _class(_facts(pypi_status=200, pypi_body=wheel_only, tag_object_sha=OTHER)),
+            "conflict",
+        )
+
+    def test_frozen_versions_conflict_unless_noop(self) -> None:
+        for version in ("1.0.0", "1.1.0"):
+            self.assertEqual(
+                _class(_facts(version=version, version_on_main="0.9.0")),
+                "conflict",
+            )
+            partial = _pypi(version, files=("bdist_wheel",))
+            self.assertEqual(
+                _class(_facts(version=version, version_on_main="0.9.0", pypi_status=200, pypi_body=partial)),
+                "conflict",
+            )
+        self.assertEqual(
+            _class(
+                _facts(
+                    sha=FROZEN_V110,
+                    version="1.1.0",
+                    version_on_main="1.1.0",
+                    sha_is_ancestor_of_main=True,
+                    pypi_status=200,
+                    pypi_body=_pypi("1.1.0"),
+                    tag_object_sha=FROZEN_V110,
+                    release_exists=True,
+                )
+            ),
+            "noop",
+        )
+        yanked = _pypi()
+        yanked["urls"][0]["yanked"] = True
+        self.assertIsNone(rg.file_counts(yanked))
+        with self.assertRaises(rg.GuardError) as caught:
+            rg.filenames_to_upload("publish", ["pkg.whl", "pkg.tar.gz"], 200, yanked)
+        self.assertEqual(caught.exception.reason, "pypi-urls")
+        unknown = _pypi()
+        unknown["urls"].append({"packagetype": "bdist_egg", "filename": "egg", "yanked": False})
+        self.assertIsNone(rg.file_counts(unknown))
+        self.assertIsNone(rg.file_counts({"urls": ["nope"]}))
 
     def test_repair_github_tag_absent_or_equal_and_conflicts(self) -> None:
         body = _pypi()
@@ -333,6 +384,12 @@ class ClassifyTest(unittest.TestCase):
         )
         outcome = rg.evaluate(_spec(_facts(), pyproject_text=other))
         self.assertEqual(outcome.reason, "build-system")
+        hook = PYPROJECT + '\n[tool.hatch.build.hooks.custom]\npath = "x"\n'
+        outcome = rg.evaluate(_spec(_facts(), pyproject_text=hook))
+        self.assertEqual(outcome.reason, "build-hook")
+        target = PYPROJECT + '\n[tool.hatch.build.targets.wheel.hooks.custom]\npath = "x"\n'
+        outcome = rg.evaluate(_spec(_facts(), pyproject_text=target))
+        self.assertEqual(outcome.reason, "build-hook")
 
 
 class CheckRunTest(unittest.TestCase):
@@ -440,7 +497,7 @@ class VprevTest(unittest.TestCase):
                 rg.TagRef("v1.2", base),
                 rg.TagRef("not-a-release", base),
             ]
-            self.assertEqual(rg.select_vprev(tags, sha, is_anc), "v1.4.0")
+            self.assertEqual(rg.select_vprev(tags, is_anc), "v1.4.0")
             self.assertFalse(is_anc(side))
             self.assertTrue(is_anc(base))
 
@@ -475,29 +532,36 @@ class WheelTest(unittest.TestCase):
         paragraph = "Hello release wheel."
         readme = f"# Title\n\n{paragraph}\n"
         matrix = b"matrix-bytes"
+        server = b"print('ok')\n"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             good = root / "good.whl"
             _make_wheel(good, matrix=matrix, paragraph=paragraph)
-            rg.inspect_wheel(good, "1.2.3", readme, matrix)
+            rg.inspect_wheel(good, "1.2.3", readme, matrix, server)
 
             requires = root / "requires.whl"
             _make_wheel(requires, extra="Requires-Dist: hatchling\n", paragraph=paragraph)
             with self.assertRaises(rg.GuardError) as caught:
-                rg.inspect_wheel(requires, "1.2.3", readme, matrix)
+                rg.inspect_wheel(requires, "1.2.3", readme, matrix, server)
             self.assertEqual(caught.exception.reason, "wheel-requires-dist")
 
             wrong = root / "wrong.whl"
             _make_wheel(wrong, version="9.9.9", paragraph=paragraph)
             with self.assertRaises(rg.GuardError) as caught:
-                rg.inspect_wheel(wrong, "1.2.3", readme, matrix)
+                rg.inspect_wheel(wrong, "1.2.3", readme, matrix, server)
             self.assertEqual(caught.exception.reason, "wheel-version")
 
             missing = root / "missing.whl"
             _make_wheel(missing, server=False, paragraph=paragraph)
             with self.assertRaises(rg.GuardError) as caught:
-                rg.inspect_wheel(missing, "1.2.3", readme, matrix)
+                rg.inspect_wheel(missing, "1.2.3", readme, matrix, server)
             self.assertEqual(caught.exception.reason, "wheel-server")
+
+            changed = root / "changed.whl"
+            _make_wheel(changed, paragraph=paragraph)
+            with self.assertRaises(rg.GuardError) as caught:
+                rg.inspect_wheel(changed, "1.2.3", readme, matrix, b"other\n")
+            self.assertEqual(caught.exception.reason, "wheel-server-bytes")
 
 
 class PromoteTest(unittest.TestCase):
@@ -536,7 +600,6 @@ class PromoteTest(unittest.TestCase):
         self.assertEqual(plan.tag, "create")
         self.assertEqual(plan.release, "published")
         self.assertEqual(plan.body, "Notes only.\n")
-        self.assertFalse(plan.force)
         skipped = self._plan(
             main_sha=SHA,
             tag_object_sha=SHA,
@@ -561,16 +624,26 @@ class PollTest(unittest.TestCase):
                 return 200, body
             return 404, None
 
-        self.assertTrue(rg.poll_until_match(fetch, "1.2.3", seen.append))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertTrue(rg.poll_until_match(fetch, "1.2.3", seen.append))
         self.assertEqual(seen, [0, 5])
         self.assertEqual(calls["n"], 2)
+        logged = err.getvalue()
+        self.assertIn("status=404", logged)
+        self.assertIn("license_expression=missing", logged)
+        self.assertIn("status=200", logged)
+        self.assertIn("license_expression=MIT", logged)
+        self.assertIn("license=null", logged)
+        self.assertIn("requires_python=>=3.9", logged)
 
         exhausted: list = []
 
         def always_miss() -> tuple:
             return 404, None
 
-        self.assertFalse(rg.poll_until_match(always_miss, "1.2.3", exhausted.append))
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(rg.poll_until_match(always_miss, "1.2.3", exhausted.append))
         self.assertEqual(exhausted, rg.POLL_SLEEPS)
         self.assertTrue(rg.publish_output_is_already_exists("HTTP 400: File already exists"))
         self.assertFalse(rg.publish_output_is_already_exists("HTTP 403"))
@@ -659,8 +732,7 @@ class WorkflowContractTest(unittest.TestCase):
             text,
         )
         self.assertIn("retention-days: 5", text)
-        self.assertIn(FROZEN_V110, text)
-        self.assertIn(FROZEN_V100, text)
+        self.assertIn("1.0.0|1.1.0", text)
         self.assertNotIn("force=true", text)
         self.assertNotIn("git push", text)
         self.assertIn("persist-credentials: false", text)
@@ -668,6 +740,29 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("refs/heads/main:scripts/release_guard.py", text)
         self.assertIn("env -u GH_TOKEN", text)
         self.assertNotIn("cp scripts/release_guard.py", text)
+        self.assertIn("guard/release_guard.py", text)
+        self.assertNotIn("find guard", text)
+        self.assertNotIn("assert-dispatch-env", text)
+        self.assertIn('-F body=@"${RUNNER_TEMP}/release-body.md"', text)
+        self.assertNotIn('-f body="@', text)
+        self.assertIn("name: release-guard", text)
+        self.assertIn("name: release-sources", text)
+        self.assertIn("release-listed", text)
+        self.assertIn("--paginate", text)
+        self.assertIn("--slurp", text)
+        self.assertLess(text.index("name: release-guard"), text.index("name: Classify"))
+        self.assertLess(text.index("name: release-sources"), text.index("uv build --sdist --wheel"))
+        self.assertNotIn(FROZEN_V110, text)
+        self.assertNotIn(FROZEN_V100, text)
+
+    def test_release_tag_present_includes_drafts_and_pages(self) -> None:
+        tag = "v1.2.0"
+        self.assertTrue(rg.release_tag_present({"tag_name": tag, "draft": True}, tag))
+        self.assertFalse(rg.release_tag_present({"tag_name": "v9.9.9", "draft": False}, tag))
+        pages = [[{"tag_name": "v0.1.0"}], [{"tag_name": tag, "draft": True}]]
+        self.assertTrue(rg.release_tag_present(pages, tag))
+        self.assertFalse(rg.release_tag_present([[{"tag_name": "v0.1.0"}]], tag))
+        self.assertFalse(rg.release_tag_present("v1.2.0", tag))
 
 
 if __name__ == "__main__":

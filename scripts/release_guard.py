@@ -110,7 +110,6 @@ class PromotePlan:
     tag: str
     release: str
     body: str
-    force: bool = False
 
 
 def parse_version(text: str) -> Optional[Tuple[int, int, int]]:
@@ -169,6 +168,9 @@ def assert_release_build(text: str) -> None:
     parts = [part.strip() for part in requires.group(1).split(",") if part.strip()]
     if parts != ['"hatchling>=1.26.3"']:
         raise GuardError("build-system")
+    # Target hooks ([tool.hatch.build.targets.wheel.hooks.*]) as well as the top-level table.
+    if re.search(r"(?m)^\[tool\.hatch\.build\.[^\]]*hooks", text):
+        raise GuardError("build-hook")
 
 
 def metadata_matches(body: object, version: str) -> bool:
@@ -188,30 +190,37 @@ def metadata_matches(body: object, version: str) -> bool:
     return info.get("yanked") is False
 
 
-def file_counts(body: object) -> Optional[Tuple[int, int]]:
-    """Return (wheels, sdists) or None when a url is yanked or unexpected.
+def _url_rows(body: object) -> Optional[List[dict]]:
+    """Clean url rows, or None when any row is yanked, unknown, or not an object.
 
-    None is not a partial file set. Callers treat it as not a gate match.
+    None is not a partial file set. classify treats it as not a gate match.
+    filenames_to_upload raises on a 200 body that fails this walk.
     """
     if not isinstance(body, dict):
         return None
     urls = body.get("urls")
     if not isinstance(urls, list):
         return None
-    wheels = 0
-    sdists = 0
+    rows: List[dict] = []
     for url in urls:
         if not isinstance(url, dict):
             return None
         if url.get("yanked") is True:
             return None
         kind = url.get("packagetype")
-        if kind == "bdist_wheel":
-            wheels += 1
-        elif kind == "sdist":
-            sdists += 1
-        else:
+        if kind not in ("bdist_wheel", "sdist"):
             return None
+        rows.append(url)
+    return rows
+
+
+def file_counts(body: object) -> Optional[Tuple[int, int]]:
+    """Return (wheels, sdists) or None when a url is yanked or unexpected."""
+    rows = _url_rows(body)
+    if rows is None:
+        return None
+    wheels = sum(1 for row in rows if row.get("packagetype") == "bdist_wheel")
+    sdists = sum(1 for row in rows if row.get("packagetype") == "sdist")
     return wheels, sdists
 
 
@@ -225,7 +234,7 @@ def classify(facts: ClassifyFacts) -> str:
     """First match wins. Raises GuardError('conflict') instead of returning it."""
     if _is_noop(facts):
         return "noop"
-    if facts.sha in FROZEN_SHAS:
+    if facts.sha in FROZEN_SHAS or f"v{facts.version}" in FROZEN_TAGS:
         raise GuardError("conflict")
     if facts.pypi_status == 404:
         if _is_publish(facts):
@@ -235,15 +244,14 @@ def classify(facts: ClassifyFacts) -> str:
         facts.pypi_body, facts.version
     ):
         counts = file_counts(facts.pypi_body)
+        tag_sha = facts.tag_object_sha
+        tag_moved = tag_sha is not None and tag_sha != facts.sha
         if counts in {(1, 0), (0, 1)}:
-            if not facts.main_is_ancestor_of_sha:
+            if tag_moved or not facts.main_is_ancestor_of_sha:
                 raise GuardError("conflict")
             return "missing-file"
         if counts == (1, 1):
-            tag_sha = facts.tag_object_sha
-            if tag_sha is not None and tag_sha != facts.sha:
-                raise GuardError("conflict")
-            if not facts.main_is_ancestor_of_sha:
+            if tag_moved or not facts.main_is_ancestor_of_sha:
                 raise GuardError("conflict")
             return "repair-github"
     raise GuardError("conflict")
@@ -484,7 +492,6 @@ def parse_ls_remote_tags(text: str) -> List[TagRef]:
 
 def select_vprev(
     tags: Sequence[TagRef],
-    sha: str,
     is_ancestor_of_sha: Callable[[str], bool],
 ) -> Optional[str]:
     best_name: Optional[str] = None
@@ -538,7 +545,7 @@ def promote_plan(
     vprev: Optional[str],
     log_oneline: str,
 ) -> PromotePlan:
-    """Refuse before any ref write. Never sets force and never deletes."""
+    """Refuse before any ref write. Never forces and never deletes."""
     if klass == "noop":
         raise GuardError("noop")
     if klass not in UPLOAD_CLASSES:
@@ -564,8 +571,6 @@ def promote_plan(
             release="draft" if notes.draft else "published",
             body=notes.body,
         )
-    if plan.force:
-        raise GuardError("force")
     return plan
 
 
@@ -577,11 +582,13 @@ def readme_prose(readme: str) -> str:
     )
 
 
-def inspect_wheel(path: Path, version: str, readme: str, matrix: bytes) -> None:
+def inspect_wheel(path: Path, version: str, readme: str, matrix: bytes, server: bytes) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         if "server.py" not in names:
             raise GuardError("wheel-server")
+        if archive.read("server.py") != server:
+            raise GuardError("wheel-server-bytes")
         if "compat-matrices.json" not in names:
             raise GuardError("wheel-matrix")
         if archive.read("compat-matrices.json") != matrix:
@@ -625,12 +632,18 @@ def sdist_version(path: Path) -> str:
     raise GuardError("sdist-version")
 
 
-def inspect_dist(dist: Path, version: str, readme: str, matrix: bytes) -> None:
+def inspect_dist(
+    dist: Path,
+    version: str,
+    readme: str,
+    matrix: bytes,
+    server: bytes,
+) -> None:
     wheels = sorted(dist.glob("*.whl"))
     sdists = sorted(dist.glob("*.tar.gz"))
     if len(wheels) != 1 or len(sdists) != 1:
         raise GuardError("dist-count")
-    inspect_wheel(wheels[0], version, readme, matrix)
+    inspect_wheel(wheels[0], version, readme, matrix, server)
     if sdist_version(sdists[0]) != version:
         raise GuardError("sdist-version")
 
@@ -649,55 +662,46 @@ def filenames_to_upload(
     sdists = [name for name in dist_names if name.endswith(".tar.gz")]
     if klass == "publish" and not wheels and not sdists:
         raise GuardError("dist-empty")
-    listed = _listed_filenames(pypi_status, pypi_body)
-    present = _present_types(pypi_status, pypi_body)
+    listed: set[str] = set()
+    present = {"bdist_wheel": 0, "sdist": 0}
+    if pypi_status == 200:
+        rows = _url_rows(pypi_body)
+        if rows is None:
+            raise GuardError("pypi-urls")
+        for url in rows:
+            kind = url.get("packagetype")
+            if kind in present:
+                present[kind] += 1
+            name = url.get("filename")
+            if isinstance(name, str):
+                listed.add(name)
     if klass == "publish":
         chosen = wheels + sdists
     else:
         chosen = []
-        if present.get("bdist_wheel", 0) == 0:
+        if present["bdist_wheel"] == 0:
             chosen.extend(wheels)
-        if present.get("sdist", 0) == 0:
+        if present["sdist"] == 0:
             chosen.extend(sdists)
         if not chosen:
             raise GuardError("missing-file-absent")
     return [name for name in chosen if Path(name).name not in listed]
 
 
-def _listed_filenames(status: int, body: Optional[dict]) -> set[str]:
-    found: set[str] = set()
-    if status != 200 or not isinstance(body, dict):
-        return found
-    urls = body.get("urls")
-    if not isinstance(urls, list):
-        return found
-    for url in urls:
-        if not isinstance(url, dict) or url.get("yanked") is True:
-            continue
-        name = url.get("filename")
-        if isinstance(name, str):
-            found.add(name)
-    return found
-
-
-def _present_types(status: int, body: Optional[dict]) -> Dict[str, int]:
-    counts = {"bdist_wheel": 0, "sdist": 0}
-    if status != 200 or not isinstance(body, dict):
-        return counts
-    urls = body.get("urls")
-    if not isinstance(urls, list):
-        return counts
-    for url in urls:
-        if not isinstance(url, dict) or url.get("yanked") is True:
-            continue
-        kind = url.get("packagetype")
-        if kind in counts:
-            counts[kind] += 1
-    return counts
-
-
 def publish_output_is_already_exists(output: str) -> bool:
     return "already exists" in output.lower()
+
+
+def _poll_info_field(body: Optional[dict], key: str) -> str:
+    if not isinstance(body, dict):
+        return "missing"
+    info = body.get("info")
+    if not isinstance(info, dict) or key not in info:
+        return "missing"
+    value = info.get(key)
+    if value is None:
+        return "null"
+    return str(value)
 
 
 def poll_until_match(
@@ -708,6 +712,15 @@ def poll_until_match(
     for delay in POLL_SLEEPS:
         sleep(delay)
         status, body = fetch()
+        print(
+            "pypi status={status} license_expression={expression} license={license} requires_python={python}".format(
+                status=status,
+                expression=_poll_info_field(body, "license_expression"),
+                license=_poll_info_field(body, "license"),
+                python=_poll_info_field(body, "requires_python"),
+            ),
+            file=sys.stderr,
+        )
         if json_gate_matches(status, body, version):
             return True
     return False
@@ -748,6 +761,19 @@ def render_summary(
     return "\n".join(lines) + "\n"
 
 
+def release_tag_present(payload: object, tag: str) -> bool:
+    """True when a Release object, a list, or paginated pages name tag.
+
+    `gh api --paginate --slurp` yields a list of page arrays. A single
+    object is the get-by-tag shape. A draft counts.
+    """
+    if isinstance(payload, dict):
+        return payload.get("tag_name") == tag
+    if isinstance(payload, list):
+        return any(release_tag_present(item, tag) for item in payload)
+    return False
+
+
 def peeled_commit_sha(ref_obj: dict, tag_obj: Optional[dict]) -> str:
     obj = ref_obj.get("object")
     if not isinstance(obj, dict):
@@ -780,14 +806,17 @@ def _check_versions(repo: Path, version: Optional[str]) -> bool:
     cmd = [sys.executable, str(script)]
     if version is not None:
         cmd.append(version)
-    env = os.environ.copy()
-    for key in (
-        "GITHUB_TOKEN",
+    dropped = {
+        "RUNNER_TEMP",
         "GH_TOKEN",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
-    ):
-        env.pop(key, None)
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GITHUB_") and key not in dropped
+    }
     proc = subprocess.run(cmd, cwd=str(repo), env=env)
     return proc.returncode == 0
 
@@ -831,19 +860,14 @@ def _dispatch_env() -> Tuple[str, str, str, str]:
     return ref, repository, sha, version
 
 
-def cmd_assert_dispatch_env() -> int:
-    ref, repository, sha, version = _dispatch_env()
-    if ref != "refs/heads/main":
-        print("reason: ref", file=sys.stderr)
+def cmd_assert_build(args: argparse.Namespace) -> int:
+    try:
+        assert_release_build(Path(args.pyproject).read_text(encoding="utf-8"))
+    except GuardError as exc:
+        print(f"reason: {exc.reason}", file=sys.stderr)
         return 1
-    if repository != REPO:
-        print("reason: repository", file=sys.stderr)
-        return 1
-    if not SHA_RE.match(sha):
-        print("reason: sha", file=sys.stderr)
-        return 1
-    if not VERSION_RE.match(version):
-        print("reason: version", file=sys.stderr)
+    except OSError as exc:
+        print(f"reason: pyproject-read:{type(exc).__name__}", file=sys.stderr)
         return 1
     return 0
 
@@ -851,16 +875,25 @@ def cmd_assert_dispatch_env() -> int:
 def cmd_classify(args: argparse.Namespace) -> int:
     repo = Path(args.repo)
     ref, repository, sha, version = _dispatch_env()
+    if not SHA_RE.match(sha):
+        print("reason: sha", file=sys.stderr)
+        return 1
     try:
-        state = read_git_state(repo, sha)
+        # Evidence is in memory before the release tree's check-versions.py runs.
+        check_runs = load_check_runs_path(Path(args.check_runs))
+        pyproject_text = git_show(repo, f"{sha}:pyproject.toml")
         pypi_body = _read_pypi_body(Path(args.pypi_body) if args.pypi_body else None, args.pypi_status)
+        state = read_git_state(repo, sha)
+        version_on_main = project_version(git_show(repo, "refs/heads/main:pyproject.toml"))
+        check_versions_sha_ok = _check_versions(repo, version)
+        check_versions_main_ok = check_versions_on_main(repo)
         tag_sha = args.tag_object_sha or None
         if tag_sha == "":
             tag_sha = None
         facts = ClassifyFacts(
             sha=sha,
             version=version,
-            version_on_main=project_version(git_show(repo, "refs/heads/main:pyproject.toml")),
+            version_on_main=version_on_main,
             main_is_ancestor_of_sha=state.main_is_ancestor_of_sha,
             sha_is_ancestor_of_main=state.sha_is_ancestor_of_main,
             pypi_status=args.pypi_status,
@@ -877,10 +910,10 @@ def cmd_classify(args: argparse.Namespace) -> int:
             main_ref_exists=state.main_ref_exists,
             develop_ref_exists=state.develop_ref_exists,
             sha_is_ancestor_of_develop=state.sha_is_ancestor_of_develop,
-            check_versions_sha_ok=_check_versions(repo, version),
-            check_versions_main_ok=check_versions_on_main(repo),
-            pyproject_text=(repo / "pyproject.toml").read_text(encoding="utf-8"),
-            check_runs=load_check_runs_path(Path(args.check_runs)),
+            check_versions_sha_ok=check_versions_sha_ok,
+            check_versions_main_ok=check_versions_main_ok,
+            pyproject_text=pyproject_text,
+            check_runs=check_runs,
             facts=facts,
         )
         outcome = evaluate(spec)
@@ -939,13 +972,13 @@ def cmd_peel_tag(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect_dist(args: argparse.Namespace) -> int:
-    root = Path(args.repo)
     try:
         inspect_dist(
             Path(args.dist),
             args.version,
-            (root / "README.md").read_text(encoding="utf-8"),
-            (root / "plugin" / "server" / "compat-matrices.json").read_bytes(),
+            Path(args.readme).read_text(encoding="utf-8"),
+            Path(args.matrix).read_bytes(),
+            Path(args.server).read_bytes(),
         )
     except GuardError as exc:
         print(f"reason: {exc.reason}", file=sys.stderr)
@@ -996,18 +1029,22 @@ def _fetch_pypi(version: str) -> Tuple[int, Optional[dict]]:
 
 
 def cmd_poll(args: argparse.Namespace) -> int:
-    matched = poll_until_match(_fetch_pypi_for(args.version), args.version, time.sleep)
+    matched = poll_until_match(lambda: _fetch_pypi(args.version), args.version, time.sleep)
     if not matched:
         print("reason: conflict", file=sys.stderr)
         return 1
     return 0
 
 
-def _fetch_pypi_for(version: str) -> Callable[[], Tuple[int, Optional[dict]]]:
-    def fetch() -> Tuple[int, Optional[dict]]:
-        return _fetch_pypi(version)
-
-    return fetch
+def cmd_release_listed(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(Path(args.body).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"reason: release-json:{type(exc).__name__}", file=sys.stderr)
+        return 2
+    if release_tag_present(payload, args.tag):
+        return 0
+    return 1
 
 
 def _notes_from_git(repo: Path, sha: str, version: str) -> Optional[str]:
@@ -1041,7 +1078,7 @@ def cmd_promote(args: argparse.Namespace) -> int:
         def ancestor_of_sha(commit: str) -> bool:
             return is_ancestor(repo, commit, sha)
 
-        vprev = select_vprev(tags, sha, ancestor_of_sha)
+        vprev = select_vprev(tags, ancestor_of_sha)
         log = ""
         if vprev:
             previous = next(tag.object_sha for tag in tags if tag.name == vprev)
@@ -1066,7 +1103,6 @@ def cmd_promote(args: argparse.Namespace) -> int:
     print(f"main={plan.main}")
     print(f"tag={plan.tag}")
     print(f"release={plan.release}")
-    print("force=false")
     return 0
 
 
@@ -1074,7 +1110,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="release_guard.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("assert-dispatch-env")
+    assert_build = sub.add_parser("assert-build")
+    assert_build.add_argument("--pyproject", required=True)
     sub.add_parser("next-link")
 
     peel = sub.add_parser("peel-tag")
@@ -1090,9 +1127,15 @@ def build_parser() -> argparse.ArgumentParser:
     classify_cmd.add_argument("--release-exists", action="store_true")
 
     inspect = sub.add_parser("inspect-dist")
-    inspect.add_argument("--repo", default=".")
     inspect.add_argument("--dist", required=True)
     inspect.add_argument("--version", required=True)
+    inspect.add_argument("--readme", required=True)
+    inspect.add_argument("--matrix", required=True)
+    inspect.add_argument("--server", required=True)
+
+    listed = sub.add_parser("release-listed")
+    listed.add_argument("--tag", required=True)
+    listed.add_argument("--body", required=True)
 
     upload = sub.add_parser("upload-files")
     upload.add_argument("--class", dest="klass", required=True)
@@ -1115,11 +1158,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     commands = {
-        "assert-dispatch-env": lambda: cmd_assert_dispatch_env(),
+        "assert-build": lambda: cmd_assert_build(args),
         "next-link": lambda: cmd_next_link(),
         "peel-tag": lambda: cmd_peel_tag(args),
         "classify": lambda: cmd_classify(args),
         "inspect-dist": lambda: cmd_inspect_dist(args),
+        "release-listed": lambda: cmd_release_listed(args),
         "upload-files": lambda: cmd_upload_files(args),
         "is-already-exists": lambda: cmd_is_already_exists(),
         "poll": lambda: cmd_poll(args),
