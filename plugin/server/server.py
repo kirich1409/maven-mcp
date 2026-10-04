@@ -3946,7 +3946,7 @@ def _classify_vuln_delta(
         raw_vulns = []
         saw_record = False
         for version in vuln_versions:
-            record = queried.get((group_id, artifact_id, version))
+            record: Optional[Dict[str, Any]] = queried.get((group_id, artifact_id, version))
             if record is None:
                 input_truncated = True
                 continue
