@@ -984,8 +984,10 @@ class LicenseAndSelectionTest(unittest.TestCase):
         )
         self.assertEqual(violation["advisory"], "review")
 
-    def test_tool_registry_unchanged(self):
-        self.assertEqual(len(server.TOOLS), 20)
+    def test_tool_registry_includes_compare_upgrade_closure(self):
+        names = [tool["name"] for tool in server.TOOLS]
+        self.assertEqual(len(names), 21)
+        self.assertIn("compare_upgrade_closure", names)
 
 
 if __name__ == "__main__":

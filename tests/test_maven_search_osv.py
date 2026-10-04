@@ -739,6 +739,8 @@ class TestQueryOsvBatch(unittest.TestCase):
         self.assertEqual(v["fixedVersion"], "2.0.1")
         self.assertEqual(v["url"], "https://github.com/advisories/GHSA-1234-abcd")
         self.assertEqual(len(results[1]["vulnerabilities"]), 0)
+        # A 200 with an empty list is a real empty result, not an outage.
+        self.assertNotIn("capabilityUnavailable", results[1])
 
     def test_post_body_shape_and_content_type(self):
         # Mirrors osv-client.test.ts "sends correct request format". Asserts the
@@ -767,15 +769,22 @@ class TestQueryOsvBatch(unittest.TestCase):
 
     def test_empty_vulnerabilities_on_api_error(self):
         # Mirrors osv-client.test.ts "returns empty vulnerabilities on API error".
+        # Two 500s cover HTTP_MAX_ATTEMPTS so the helper sees status != 200,
+        # not a follow-up urlopen failure from an exhausted mock.
         with unittest.mock.patch(
             "urllib.request.urlopen",
-            side_effect=mock_urlopen([http_error("u", 500, "boom")]),
-        ):
+            side_effect=mock_urlopen([
+                http_error("u", 500, "boom"),
+                http_error("u", 500, "boom"),
+            ]),
+        ), unittest.mock.patch.object(server, "_sleep"):
             results = server.query_osv_batch([
                 {"groupId": "com.example", "artifactId": "lib", "version": "1.0.0"},
             ])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["vulnerabilities"], [])
+        # HTTP non-200 must not look like a clean empty advisory list.
+        self.assertEqual(results[0].get("capabilityUnavailable"), "unreachable")
 
     def test_normalizes_moderate_severity_to_medium(self):
         # Mirrors osv-client.test.ts "normalizes MODERATE severity to MEDIUM".

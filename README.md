@@ -34,12 +34,13 @@ Version lookups use the repositories the build file declares. Maven Central, Goo
 | `catalog_entry` | Generate/validate Gradle version-catalog entries (`libs.versions.toml`) with rule-correct aliases and minimal diffs |
 | `verify_coordinates` | Tri-state existence check + did-you-mean for hallucinated coordinates |
 | `get_eol_status` | End-of-life / support status for JDK (vendor-specific), Kotlin, Gradle, and Spring Boot via endoflife.date |
+| `compare_upgrade_closure` | Compare one direct upgrade on an isolated public deps.dev graph (not a project resolve) |
 
 ### Skills
 
 Claude Code keeps a listing of every installed skill's name and description in context, on a
 budget of ~1% of the model's context window; when the listing overflows, descriptions get
-dropped. Twenty-one entries from one plugin consume that budget on their own, so only the
+dropped. Twenty-two entries from one plugin consume that budget on their own, so only the
 skills whose body adds a workflow beyond a single tool call stay model-routed. The rest are
 manual: the slash command and the underlying MCP tool are unchanged, Claude just no longer
 carries their descriptions in every session.
@@ -75,6 +76,7 @@ capability through the MCP tool above:
 | `/license-compliance` | Aggregate transitive licenses vs a project license policy; flag copyleft/violations |
 | `/search-artifacts` | Search Maven Central (or Nexus/Artifactory in closed mode) by keyword |
 | `/eol-status` | Check end-of-life / support status for JDK, Kotlin, Gradle, or Spring Boot |
+| `/upgrade-closure` | Compare one direct upgrade on an isolated public deps.dev graph; advisory only, not a project resolve |
 
 ### Supported build systems
 
