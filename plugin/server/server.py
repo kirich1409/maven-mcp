@@ -4114,9 +4114,11 @@ def _license_delta(
         gone = {row["category"] for row in disappeared}
         introduced: List[str] = []
         for row in appeared:
-            category = row["category"]
-            if category not in gone and category not in introduced:
-                introduced.append(category)
+            row_category = row.get("category")
+            if not isinstance(row_category, str):
+                continue
+            if row_category not in gone and row_category not in introduced:
+                introduced.append(row_category)
         result["categoriesIntroduced"] = introduced
     if capability:
         result["capabilityUnavailable"] = capability
