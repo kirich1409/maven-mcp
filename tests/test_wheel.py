@@ -7,6 +7,7 @@ CI does this before `unittest discover`).
 """
 
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -14,6 +15,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 _MATRIX = ROOT / "plugin" / "server" / "compat-matrices.json"
+
+
+def _project_version() -> str:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    block = re.search(r"(?m)^\[project\]\s*$([\s\S]*?)(?=^\[|\Z)", text)
+    if block is None:
+        raise AssertionError("pyproject.toml has no [project] table")
+    found = re.search(r'(?m)^version\s*=\s*"([^"]+)"', block.group(1))
+    if found is None:
+        raise AssertionError("[project].version missing")
+    return found.group(1)
 
 
 def _build_wheel(dest: str) -> str:
@@ -71,7 +83,7 @@ class WheelPackagingTest(unittest.TestCase):
                 ).decode("utf-8")
 
         self.assertIn("Name: maven-mcp\n", metadata)
-        self.assertIn("Version: 1.1.0\n", metadata)
+        self.assertIn(f"Version: {_project_version()}\n", metadata)
         self.assertIn("License-Expression: MIT\n", metadata)
         self.assertIn("Requires-Python: >=3.9\n", metadata)
         self.assertNotIn("Requires-Dist:", metadata)

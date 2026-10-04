@@ -222,7 +222,7 @@ python3 -m unittest discover -s tests
 python3 scripts/check-versions.py
 ```
 
-The implementation contract for coding agents is [AGENTS.md](AGENTS.md).
+Contribution branches come from `develop`, and the contract for coding agents is [AGENTS.md](AGENTS.md).
 
 ## License
 

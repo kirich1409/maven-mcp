@@ -52,25 +52,27 @@ coverage report --rcfile=pyproject.toml   # fail_under=75, ~90% measured
 
 ## Work and releases
 
-Ordinary changes keep the version already on `main`. A release is a separate cut, and only when the user asks for one. `1.1.0` is the current release. `1.0.0` stays published: git tag `v1.0.0` is `02fa8f5` on `main`, and PyPI project `maven-mcp` serves that version. Do not rebuild, retag, or re-upload `1.0.0`.
+`1.1.0` is the current release. Tag `v1.1.0` is `1ae5ca6`. Tag `v1.0.0` is `02fa8f5`. Neither tag is moved, and neither wheel is rebuilt. Ordinary commits, now on `develop`, keep the version already on `main` until a release pull request. Do not rebuild, retag, or re-upload `1.0.0` or `1.1.0`.
 
 ### Day-to-day
 
 - Issues belong in `kirich1409/maven-mcp`.
-- Branch from `main` as `feature/…`, `fix/…`, or `chore/…` (kebab-case English). `main` rejects a direct push: rulesets Main Protect (no deletion, no non-fast-forward, linear history) and Pull Request Only.
-- Open a pull request. Required checks are `python-tests (3.9)`, `python-tests (3.13)`, `ruff`, and `mypy`. Coverage runs in CI and is not required. Review count is 0; review threads must be resolved; Copilot reviews on push. Squash-merge and delete the branch. Merge and rebase are allowed; squash is the history this repo keeps.
-- When the user asks for a PR, push the branch, open it, wait until the required checks are green, and squash-merge. Do not leave the PR open.
+- Branch from `develop` as `feature/…`, `fix/…`, or `chore/…` (kebab-case English). Open the pull request with `gh pr create --base develop`. Pull Request Only requires check `base-is-develop` from the PR-base GitHub App. The workflow on `main` posts conclusion `failure` for a pull request into `main` and does not post `success`. An Actions job of that name does not count. A success conclusion on that check means `PR_BASE_APP_PRIVATE_KEY` was used outside that workflow; do not merge it. `main` is not an integration branch. Both branches reject a direct push. Name Develop Protect on `develop`. Main Protect and Pull Request Only stay on the default branch, which stays `main`. Main Protect has no bypass actor. Agents do not fast-forward `main` and do not push tags.
+- Open a pull request into `develop`. Required checks are `python-tests (3.9)`, `python-tests (3.13)`, `ruff`, and `mypy`. Coverage runs in CI and is not required. Review count is 0; review threads must be resolved; Copilot reviews on push. Squash-merge and delete the branch. Rebase is allowed by the pull-request rule; a merge commit still fails linear history, so "merge is allowed" in that rule is not usable. Squash is the history this repo keeps. `base-is-develop` is not one of the four release checks. Develop Protect does not require it, and the poster does not run for a pull request into `develop`. Programmatic merge stays on the async merge API (`PUT /repos/{owner}/{repo}/pulls/{n}/merge-async`).
+- When the user asks for a pull request, push the branch, open it with `gh pr create --base develop`, wait for the four checks, and squash-merge. Do not leave the pull request open.
 - Leave `SERVER_VERSION`, `USER_AGENT`, the three plugin manifests, `.claude-plugin/marketplace.json`, and `[project].version` on the current release until the release cut below. `python3 scripts/check-versions.py` must exit 0.
 - A new runtime dependency needs an explicit yes. hatchling stays a build-system dependency. The wheel's `force-include` keeps `compat-matrices.json` beside the installed `server.py`.
 - Do not commit `.grok-report/`, build artifacts, or credentials.
 
 ### Cutting a release
 
-1. One PR sets a new `X.Y.Z` in every place `scripts/check-versions.py` compares, then lands on `main` with the required checks green. Patch for a fix, minor for compatible behavior. `python3 scripts/check-versions.py` exits 0 on that commit.
+1. One pull request sets a new `X.Y.Z` in every place `scripts/check-versions.py` compares, then lands on `develop` with the required checks green. The human chooses patch, minor, or major. `python3 scripts/check-versions.py X.Y.Z` exits 0. `tests/test_wheel.py` reads `[project].version` and is not edited for the bump.
 2. `tests/test_wheel.py` still passes: the wheel contains `server.py` and `compat-matrices.json` at install root, `License-Expression: MIT`, the README text, `Requires-Python: >=3.9`, and no `Requires-Dist`. PyPI JSON then reports `license_expression` `MIT` and leaves legacy `license` null.
 3. Tag that merge commit `vX.Y.Z` and create the GitHub Release on the same commit. The monorepo-era name `maven-mcp--vX.Y.Z` is retired. Do not move a tag that already points at a published commit.
 4. From a clean checkout of that tag, run `uv build --sdist --wheel` and `uv publish`. Treat the release as published only after `https://pypi.org/pypi/maven-mcp/X.Y.Z/json` returns HTTP 200 with that version, `license_expression` MIT, and `requires_python` `>=3.9`. Release notes may name `uvx maven-mcp` only after that response.
 5. Upload with `UV_PUBLISH_TOKEN` or a PyPI trusted publisher already registered for `kirich1409/maven-mcp`. The first upload of a project that does not exist yet needs an account-scoped token. Do not commit, log, or paste the token. There is no publish workflow in this repo. A version already on PyPI cannot be replaced; a bad wheel is the next version number.
+
+This hand procedure is the one to follow while `.github/workflows/release.yml` is not the file on `main`.
 
 Marketplace installs read `main` and do not wait for PyPI. `uvx maven-mcp` installs the PyPI release.
 
@@ -393,5 +395,5 @@ Fires before `Edit`/`Write`/`MultiEdit` on build files; extracts coordinates fro
 - No XML parser dependency — all XML parsing is regex-based.
 - Network seam is `urllib.request.urlopen`; tests mock it with `unittest.mock.patch("urllib.request.urlopen", ...)`.
 - Tests live dev-only at `tests/` (outside `plugin/`, so they are not shipped). They import `server` via a `__file__`-resolved `sys.path` shim in `tests/_helpers.py`; filesystem-touching parsers are exercised against real files written into a `TemporaryDirectory`. `tests/test_http_transport.py` covers the HTTP transport end-to-end over loopback (`("127.0.0.1", 0)` on a daemon thread).
-- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/.cursor-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only). The wheel's `force-include` puts `compat-matrices.json` beside the installed `server.py`; `tests/test_wheel.py` builds that wheel.
+- Version constants (`SERVER_VERSION`, `USER_AGENT`) in `server.py` stay in sync with `plugin/.claude-plugin/plugin.json`, `plugin/.codex-plugin/plugin.json`, `plugin/.cursor-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `[project].version` in `pyproject.toml`. `python3 scripts/check-versions.py` enforces that, and rejects the previous repository URL. The console script is `maven-mcp = "server:main"` (hatchling is build-system only). The wheel's `force-include` puts `compat-matrices.json` beside the installed `server.py`; `tests/test_wheel.py` builds that wheel and reads `[project].version` from `pyproject.toml` rather than a hardcoded version string.
 - `import server` is side-effect-free (the `if __name__ == "__main__": main()` guard at the tail).
