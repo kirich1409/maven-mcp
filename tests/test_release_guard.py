@@ -161,6 +161,7 @@ def _make_sdist(
     version: str = "1.2.3",
     server: bytes = b"print('ok')\n",
     matrix: bytes = b"matrix-bytes",
+    extra: dict[str, bytes] | None = None,
 ) -> None:
     root_name = f"maven_mcp-{version}"
     payload = {
@@ -168,6 +169,8 @@ def _make_sdist(
         f"{root_name}/plugin/server/server.py": server,
         f"{root_name}/plugin/server/compat-matrices.json": matrix,
     }
+    if extra:
+        payload.update(extra)
     with tarfile.open(path, "w:gz") as archive:
         for name, data in payload.items():
             info = tarfile.TarInfo(name)
@@ -441,6 +444,32 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=nested)).reason, "build-hook")
         comment = PYPROJECT + "\n# [tool.hatch.build.hooks.custom]\n"
         self.assertTrue(rg.evaluate(_spec(_facts(), pyproject_text=comment)).ok)
+        root_key = 'tool.hatch.build.hooks.custom.path = "x"\n' + PYPROJECT
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=root_key)).reason, "build-hook")
+        under_hatch = PYPROJECT + '\n[tool.hatch]\nbuild.hooks.custom.path = "x"\n'
+        self.assertEqual(
+            rg.evaluate(_spec(_facts(), pyproject_text=under_hatch)).reason,
+            "build-hook",
+        )
+        under_tool = PYPROJECT + '\n[tool]\nhatch.build.hooks.custom.path = "x"\n'
+        self.assertEqual(
+            rg.evaluate(_spec(_facts(), pyproject_text=under_tool)).reason,
+            "build-hook",
+        )
+        inline_root = (
+            'tool = { hatch = { build = { hooks = { custom = { path = "x" } } } } }\n' + PYPROJECT
+        )
+        self.assertEqual(
+            rg.evaluate(_spec(_facts(), pyproject_text=inline_root)).reason,
+            "build-hook",
+        )
+        escaped = PYPROJECT + '\n[tool.hatch.build]\n"\\u0068ooks" = "x"\n'
+        self.assertEqual(rg.evaluate(_spec(_facts(), pyproject_text=escaped)).reason, "build-hook")
+        escaped_header = PYPROJECT + '\n[tool.hatch.build."\\u0068ooks".custom]\npath = "x"\n'
+        self.assertEqual(
+            rg.evaluate(_spec(_facts(), pyproject_text=escaped_header)).reason,
+            "build-hook",
+        )
         rg.assert_release_build((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
@@ -638,6 +667,27 @@ class WheelTest(unittest.TestCase):
             with self.assertRaises(rg.GuardError) as caught:
                 rg.inspect_dist(bad, "1.2.3", readme, matrix, server)
             self.assertEqual(caught.exception.reason, "sdist-server-bytes")
+
+            extras = {
+                "setup.py": b"import os\n",
+                "hatch_build.py": b"def initialize(version, build_data):\n    pass\n",
+                "plugin/server/server.pth": b"import os\n",
+                "../setup.py": b"import os\n",
+            }
+            for index, (name, body) in enumerate(extras.items()):
+                extra_dir = root / f"extra-sdist-{index}"
+                extra_dir.mkdir()
+                member = name if name.startswith("../") else f"maven_mcp-1.2.3/{name}"
+                _make_wheel(extra_dir / "pkg.whl", matrix=matrix, paragraph=paragraph)
+                _make_sdist(
+                    extra_dir / "pkg.tar.gz",
+                    server=server,
+                    matrix=matrix,
+                    extra={member: body},
+                )
+                with self.assertRaises(rg.GuardError) as caught:
+                    rg.inspect_dist(extra_dir, "1.2.3", readme, matrix, server)
+                self.assertEqual(caught.exception.reason, "sdist-member", name)
 
 
 class PromoteTest(unittest.TestCase):

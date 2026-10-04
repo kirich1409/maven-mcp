@@ -172,106 +172,105 @@ def assert_release_build(text: str) -> None:
         raise GuardError("build-hook")
 
 
-def _hatch_build_has_hook(text: str) -> bool:
-    """True when a tool.hatch.build table declares a hooks key.
+_HATCH_BUILD = ("tool", "hatch", "build")
+_HATCH_HOOK = ("tool", "hatch", "build", "hooks")
 
-    Hatchling accepts a header, a dotted key, or an inline table, with
-    whitespace around dots and brackets. Assignments are scanned in the
-    stdlib; there is no TOML parser.
+
+def _hatch_build_has_hook(text: str) -> bool:
+    """True when header segments plus the key name tool.hatch.build.hooks.
+
+    A dotted key may start at the root or under a shorter header. An inline
+    table on a prefix of that path is included. A backslash in a quoted key
+    is not decoded. There is no TOML parser.
     """
-    table: Optional[Tuple[str, ...]] = None
-    pending: Optional[str] = None
+    table: Tuple[str, ...] = ()
     for raw in text.splitlines():
-        if pending is not None:
-            found = raw.find(pending)
-            if found < 0:
-                continue
-            pending = None
-            raw = raw[found + 3 :]
-            if not raw.strip():
-                continue
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("["):
-            table = _toml_table_path(line)
-            if table is not None and _is_hatch_build_table(table) and "hooks" in table:
+            parsed = _toml_table_path(line)
+            if parsed is None:
+                if _unparsed_hatch_header(line):
+                    return True
+                table = ()
+                continue
+            table = parsed
+            if _contains_in_order(table, _HATCH_HOOK):
                 return True
-            continue
-        if not _is_hatch_build_table(table):
             continue
         assignment = _split_toml_assignment(line)
         if assignment is None:
             continue
         key, value = assignment
         segments = _toml_key_segments(key.strip())
-        if segments is None or "hooks" in segments:
+        if segments is None:
+            if _is_hatch_build_table(table) or ("\\" in key and _is_hatch_build_prefix(table)):
+                return True
+            continue
+        combined = table + segments
+        if _contains_in_order(combined, _HATCH_HOOK):
             return True
-        pending = _unclosed_triple(value)
+        if _is_hatch_build_prefix(combined) and _inline_declares_hooks(value):
+            return True
     return False
+
+
+def _contains_in_order(segments: Sequence[str], needle: Sequence[str]) -> bool:
+    index = 0
+    for segment in segments:
+        if index < len(needle) and segment == needle[index]:
+            index += 1
+    return index == len(needle)
 
 
 def _is_hatch_build_table(table: Optional[Tuple[str, ...]]) -> bool:
     if table is None or len(table) < 3:
         return False
-    return table[0] == "tool" and table[1] == "hatch" and table[2] == "build"
+    return table[:3] == _HATCH_BUILD
+
+
+def _is_hatch_build_prefix(table: Tuple[str, ...]) -> bool:
+    return table == _HATCH_BUILD[: len(table)]
 
 
 def _toml_table_path(line: str) -> Optional[Tuple[str, ...]]:
     match = re.match(r"^\[{1,2}\s*(.*?)\s*\]{1,2}\s*(?:#.*)?$", line)
     if match is None:
-        return ("tool", "hatch", "build", "hooks") if "hooks" in line else None
-    segments = _toml_key_segments(match.group(1).strip())
-    if segments is None and "hooks" in match.group(1).split("."):
-        return ("tool", "hatch", "build", "hooks")
-    return segments
+        return None
+    return _toml_key_segments(match.group(1).strip())
+
+
+def _unparsed_hatch_header(line: str) -> bool:
+    """A quoted backslash under tool.hatch.build is a hook we cannot name."""
+    match = re.match(r"^\[{1,2}\s*(.*?)\s*\]{1,2}\s*(?:#.*)?$", line)
+    if match is None or "\\" not in match.group(1):
+        return False
+    body = match.group(1)
+    quote_at = -1
+    for quote in "\"'":
+        found = body.find(quote)
+        if found >= 0 and (quote_at < 0 or found < quote_at):
+            quote_at = found
+    leading = body[:quote_at] if quote_at >= 0 else body
+    leading = leading.strip().rstrip(".").strip()
+    if not leading:
+        return False
+    segments = _toml_key_segments(leading)
+    if segments is None:
+        return False
+    return _is_hatch_build_prefix(segments) or _is_hatch_build_table(segments)
 
 
 def _split_toml_assignment(line: str) -> Optional[Tuple[str, str]]:
-    in_single = False
-    in_double = False
-    escape = False
-    for index, char in enumerate(line):
-        if escape:
-            escape = False
-            continue
-        if char == "\\" and in_double:
-            escape = True
-            continue
-        if char == '"' and not in_single:
-            in_double = not in_double
-            continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-            continue
-        if char == "=" and not in_single and not in_double:
-            return line[:index], line[index + 1 :]
-    return None
-
-
-def _unclosed_triple(value: str) -> Optional[str]:
-    earliest: Optional[Tuple[int, str]] = None
-    for quote in ('"""', "'''"):
-        found = value.find(quote)
-        if found >= 0 and (earliest is None or found < earliest[0]):
-            earliest = (found, quote)
-    if earliest is None:
+    split_at = line.find("=")
+    if split_at < 0:
         return None
-    quote = earliest[1]
-    opened = False
-    start = 0
-    while True:
-        found = value.find(quote, start)
-        if found < 0:
-            break
-        opened = not opened
-        start = found + 3
-    if opened:
-        return quote
-    return None
+    return line[:split_at], line[split_at + 1 :]
 
 
 def _toml_key_segments(text: str) -> Optional[Tuple[str, ...]]:
+    """Bare and quoted key segments. A backslash inside quotes fails closed."""
     segments: List[str] = []
     index = 0
     length = len(text)
@@ -282,20 +281,24 @@ def _toml_key_segments(text: str) -> Optional[Tuple[str, ...]]:
         if index >= length:
             break
         expect_segment = False
-        if text[index] == '"':
-            segment, index = _toml_basic_string(text, index)
-        elif text[index] == "'":
-            segment, index = _toml_literal_string(text, index)
+        if text[index] in "\"'":
+            quote = text[index]
+            end = index + 1
+            while end < length and text[end] != quote:
+                if text[end] == "\\":
+                    return None
+                end += 1
+            if end >= length:
+                return None
+            segments.append(text[index + 1 : end])
+            index = end + 1
         else:
             start = index
             while index < length and (text[index].isalnum() or text[index] in "-_"):
                 index += 1
             if index == start:
                 return None
-            segment = text[start:index]
-        if segment is None:
-            return None
-        segments.append(segment)
+            segments.append(text[start:index])
         while index < length and text[index] in " \t":
             index += 1
         if index >= length:
@@ -309,30 +312,49 @@ def _toml_key_segments(text: str) -> Optional[Tuple[str, ...]]:
     return tuple(segments)
 
 
-def _toml_basic_string(text: str, index: int) -> Tuple[Optional[str], int]:
-    index += 1
-    chars: List[str] = []
-    while index < len(text):
+def _inline_declares_hooks(value: str) -> bool:
+    """True when `{...}` names a hooks key. Escapes are not decoded."""
+    text = value.strip()
+    if not text.startswith("{"):
+        return False
+    index = 0
+    length = len(text)
+    while index < length:
         char = text[index]
-        if char == "\\":
-            if index + 1 >= len(text):
-                return None, index
-            chars.append(text[index + 1])
-            index += 2
+        if char in "\"'":
+            end = index + 1
+            while end < length and text[end] != char:
+                if text[end] == "\\":
+                    return True
+                end += 1
+            if end >= length:
+                return True
+            quoted = text[index + 1 : end]
+            after = _past_spaces(text, end + 1)
+            if quoted == "hooks" and after < length and text[after] in ".=":
+                return True
+            index = end + 1
             continue
-        if char == '"':
-            return "".join(chars), index + 1
-        chars.append(char)
+        if char == "#":
+            newline = text.find("\n", index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if text.startswith("hooks", index) and _key_boundary(text, index):
+            after = _past_spaces(text, index + len("hooks"))
+            if after < length and text[after] in ".=":
+                return True
         index += 1
-    return None, index
+    return False
 
 
-def _toml_literal_string(text: str, index: int) -> Tuple[Optional[str], int]:
-    index += 1
-    end = text.find("'", index)
-    if end < 0:
-        return None, index
-    return text[index:end], end + 1
+def _past_spaces(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    return index
+
+
+def _key_boundary(text: str, index: int) -> bool:
+    return index == 0 or text[index - 1] in " \t\r\n{[.,"
 
 
 def metadata_matches(body: object, version: str) -> bool:
@@ -833,6 +855,128 @@ def sdist_version(path: Path) -> str:
     raise GuardError("sdist-version")
 
 
+# Relative names from `uv build --sdist` of this repository (tracked files
+# plus generated PKG-INFO). Anything else is not published.
+SDIST_MEMBERS = frozenset(
+    {
+        ".claude-plugin/marketplace.json",
+        ".github/workflows/base-is-develop.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/live-canary.yml",
+        ".github/workflows/release.yml",
+        ".gitignore",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "LICENSE",
+        "PKG-INFO",
+        "README.md",
+        "docs/configuration.md",
+        "plugin/.claude-plugin/plugin.json",
+        "plugin/.codex-plugin/plugin.json",
+        "plugin/.cursor-plugin/plugin.json",
+        "plugin/.mcp.json",
+        "plugin/hooks/cursor-hooks.json",
+        "plugin/hooks/hooks.json",
+        "plugin/hooks/post-edit-deps.sh",
+        "plugin/hooks/pre-edit-deps.sh",
+        "plugin/mcp.json",
+        "plugin/server/compat-matrices.json",
+        "plugin/server/server.py",
+        "plugin/skills/.gitignore",
+        "plugin/skills/audit-project-dependencies/SKILL.md",
+        "plugin/skills/catalog-entry/SKILL.md",
+        "plugin/skills/check-deps-vulnerabilities/SKILL.md",
+        "plugin/skills/check-deps/SKILL.md",
+        "plugin/skills/check-multiple-versions/SKILL.md",
+        "plugin/skills/check-version-compatibility/SKILL.md",
+        "plugin/skills/check-version-exists/SKILL.md",
+        "plugin/skills/compare-dependency-versions/SKILL.md",
+        "plugin/skills/dependency-changes/SKILL.md",
+        "plugin/skills/dependency-conflicts/SKILL.md",
+        "plugin/skills/dependency-health/SKILL.md",
+        "plugin/skills/dependency-license/SKILL.md",
+        "plugin/skills/dependency-vulnerabilities/SKILL.md",
+        "plugin/skills/eol-status/SKILL.md",
+        "plugin/skills/expand-bom/SKILL.md",
+        "plugin/skills/latest-version/SKILL.md",
+        "plugin/skills/license-compliance/SKILL.md",
+        "plugin/skills/scan-project-dependencies/SKILL.md",
+        "plugin/skills/search-artifacts/SKILL.md",
+        "plugin/skills/transitive-graph/SKILL.md",
+        "plugin/skills/upgrade-closure/SKILL.md",
+        "plugin/skills/vulnerability-paths/SKILL.md",
+        "pyproject.toml",
+        "scripts/check-versions.py",
+        "scripts/release_guard.py",
+        "tests/_helpers.py",
+        "tests/test_agent_plugin.py",
+        "tests/test_airgap.py",
+        "tests/test_base_is_develop.py",
+        "tests/test_bom.py",
+        "tests/test_catalog_entry.py",
+        "tests/test_changelog_providers.py",
+        "tests/test_compat.py",
+        "tests/test_credentials.py",
+        "tests/test_depsdev.py",
+        "tests/test_dispatch.py",
+        "tests/test_eol_status.py",
+        "tests/test_file_cache.py",
+        "tests/test_github.py",
+        "tests/test_gradle_resolve.py",
+        "tests/test_handlers.py",
+        "tests/test_hooks_json.py",
+        "tests/test_http.py",
+        "tests/test_http_transport.py",
+        "tests/test_license.py",
+        "tests/test_license_compliance.py",
+        "tests/test_live_canary.py",
+        "tests/test_map_parallel.py",
+        "tests/test_maven_search_osv.py",
+        "tests/test_mirrors.py",
+        "tests/test_output_schemas.py",
+        "tests/test_parsers.py",
+        "tests/test_post_edit_hook.py",
+        "tests/test_pre_edit_hook.py",
+        "tests/test_release_guard.py",
+        "tests/test_repo_discovery.py",
+        "tests/test_resolution.py",
+        "tests/test_search_backends.py",
+        "tests/test_smoke.py",
+        "tests/test_string_distance.py",
+        "tests/test_tls_proxy.py",
+        "tests/test_tools_schema.py",
+        "tests/test_upgrade_closure_depsdev.py",
+        "tests/test_upgrade_closure_diff.py",
+        "tests/test_upgrade_closure_gradle.py",
+        "tests/test_verify_coordinates.py",
+        "tests/test_version.py",
+        "tests/test_vulnerability_paths.py",
+        "tests/test_wheel.py",
+    }
+)
+
+
+def _require_sdist_members(path: Path) -> None:
+    seen: set[str] = set()
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            name = member.name
+            parts = name.split("/")
+            if (
+                not member.isfile()
+                or name.startswith("/")
+                or "\\" in name
+                or ".." in parts
+                or "" in parts
+                or len(parts) < 2
+            ):
+                raise GuardError("sdist-member")
+            rel = "/".join(parts[1:])
+            if rel not in SDIST_MEMBERS or rel in seen:
+                raise GuardError("sdist-member")
+            seen.add(rel)
+
+
 def _sdist_file(path: Path, suffix: str) -> bytes:
     found: Optional[bytes] = None
     with tarfile.open(path, "r:gz") as archive:
@@ -856,6 +1000,7 @@ def _sdist_file(path: Path, suffix: str) -> bytes:
 
 
 def inspect_sdist(path: Path, version: str, matrix: bytes, server: bytes) -> None:
+    _require_sdist_members(path)
     if sdist_version(path) != version:
         raise GuardError("sdist-version")
     if _sdist_file(path, "/plugin/server/server.py") != server:
