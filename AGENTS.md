@@ -323,7 +323,7 @@ A write-time **anti-slopsquatting** primitive: batch existence check plus a fuzz
 
 `plugin/` is one directory shipped in three formats that share `skills/`, `server/`, `mcp.json`, and `hooks/*.sh`:
 
-- **Claude Code / Grok Build** — `.claude-plugin/plugin.json`, `.mcp.json` (`${CLAUDE_PLUGIN_ROOT}`), `hooks/hooks.json`. Reference format; never remove it in favor of the others.
+- **Claude Code / Grok Build** — `.claude-plugin/plugin.json`, `.mcp.json` (`${CLAUDE_PLUGIN_ROOT}`), `hooks/hooks.json`. `.mcp.json` is an `mcpServers` object: Grok drops a flat server-name map (the file is discovered, the server is not registered). Claude Code accepts the wrapper. Reference format; never remove it in favor of the others.
 - **Codex** — `.codex-plugin/plugin.json` pointing at `./skills/`, `./hooks/hooks.json` (Codex reads the Claude hook format and sets `CLAUDE_PLUGIN_ROOT`), and `./mcp.json`. Edits arrive as `apply_patch` with the patch text in `tool_input.command`; Codex does not yet enforce `deny` for `apply_patch` and may not surface the reason (openai/codex#27833), so there the guard runs but does not block and can go unnoticed.
 - **Cursor** — `.cursor-plugin/plugin.json` (no unknown fields such as `displayName`; Cursor's validation rejects them) + `hooks/cursor-hooks.json` (`version: 1`, `preToolUse`, relative `./hooks/...` commands: Cursor has no plugin-root variable). MCP comes from the root `mcp.json`.
 

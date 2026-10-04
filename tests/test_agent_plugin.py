@@ -78,7 +78,12 @@ class McpJsonTest(unittest.TestCase):
 
     def test_mcp_json_matches_claude_mcp_json(self):
         portable = _load("mcp.json")["mcpServers"]
-        claude = _load(".mcp.json")
+        # Grok registers a plugin server only from this wrapper. A flat
+        # server-name map is discovered as a file and then dropped.
+        # Claude Code accepts the wrapper.
+        claude_file = _load(".mcp.json")
+        self.assertEqual(set(claude_file), {"mcpServers"})
+        claude = claude_file["mcpServers"]
         self.assertEqual(set(portable), set(claude))
         for server_id, cfg in claude.items():
             with self.subTest(server=server_id):
