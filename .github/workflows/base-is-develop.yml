@@ -1,0 +1,194 @@
+name: base-is-develop
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  post-base-check:
+    runs-on: ubuntu-latest
+    environment: pr-base
+    steps:
+      - name: Post base-is-develop as the PR-base app
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          APP_ID: ${{ vars.PR_BASE_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.PR_BASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_ID}" ] || [ -z "${APP_PRIVATE_KEY}" ]; then
+            echo "PR-base app id or private key is empty" >&2
+            exit 1
+          fi
+
+          if ! printf '%s' "${HEAD_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "HEAD_SHA is not 40 lowercase hex characters" >&2
+            exit 1
+          fi
+
+          # Fail closed for every BASE_REF, including main and empty.
+          : "${BASE_REF}"
+          conclusion=failure
+
+          umask 077
+          work=$(mktemp -d)
+          trap 'rm -rf "${work}"' EXIT
+          key_file="${work}/app.pem"
+          printf '%s\n' "${APP_PRIVATE_KEY}" > "${key_file}"
+          chmod 0600 "${key_file}"
+          unset APP_PRIVATE_KEY
+
+          jwt=$(KEY_FILE="${key_file}" python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+
+          def b64url(raw):
+              return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+          now = int(time.time())
+          header = b64url(
+              json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode()
+          )
+          payload = b64url(
+              json.dumps(
+                  {
+                      "iss": os.environ["APP_ID"],
+                      "iat": now - 60,
+                      "exp": now + (9 * 60),
+                  },
+                  separators=(",", ":"),
+              ).encode()
+          )
+          signing_input = (header + "." + payload).encode()
+          signature = subprocess.check_output(
+              ["openssl", "dgst", "-sha256", "-sign", os.environ["KEY_FILE"]],
+              input=signing_input,
+          )
+          sys.stdout.write(signing_input.decode("ascii") + "." + b64url(signature))
+          PY
+          )
+          # The PEM is only needed to sign. Remove it before any request.
+          rm -f "${key_file}"
+
+          auth="${jwt}"
+
+          api() {
+            method="$1"
+            url="$2"
+            outfile="$3"
+            data_file="${4:-}"
+            if [ -n "${data_file}" ]; then
+              curl --silent --show-error --max-time 30 \
+                -o "${outfile}" -w '%{http_code}' \
+                -X "${method}" \
+                -H "Authorization: Bearer ${auth}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                --data-binary @"${data_file}" \
+                "${url}"
+            else
+              curl --silent --show-error --max-time 30 \
+                -o "${outfile}" -w '%{http_code}' \
+                -X "${method}" \
+                -H "Authorization: Bearer ${auth}" \
+                -H "Accept: application/vnd.github+json" \
+                "${url}"
+            fi
+          }
+
+          inst_body="${work}/installation.json"
+          inst_code=$(api GET "https://api.github.com/repos/kirich1409/maven-mcp/installation" "${inst_body}")
+          if [ "${inst_code}" != "200" ]; then
+            echo "installation lookup returned ${inst_code}" >&2
+            exit 1
+          fi
+          inst_id=$(python3 - "${inst_body}" <<'PY'
+          import json
+          import sys
+
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          ident = data.get("id")
+          if not isinstance(ident, int):
+              raise SystemExit(1)
+          sys.stdout.write(str(ident))
+          PY
+          )
+          rm -f "${inst_body}"
+          if ! printf '%s' "${inst_id}" | grep -Eq '^[0-9]+$'; then
+            echo "installation id is not numeric" >&2
+            exit 1
+          fi
+
+          token_req="${work}/token-req.json"
+          printf '%s' '{"permissions":{"checks":"write"}}' > "${token_req}"
+          token_body="${work}/token.json"
+          token_code=$(api POST "https://api.github.com/app/installations/${inst_id}/access_tokens" "${token_body}" "${token_req}")
+          if [ "${token_code}" != "201" ]; then
+            echo "installation token request returned ${token_code}" >&2
+            exit 1
+          fi
+          token=$(python3 - "${token_body}" <<'PY'
+          import json
+          import sys
+
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          value = data.get("token")
+          if not isinstance(value, str) or not value:
+              raise SystemExit(1)
+          sys.stdout.write(value)
+          PY
+          )
+          rm -f "${token_body}" "${token_req}"
+          unset jwt
+          auth="${token}"
+
+          post_check() {
+            sha="$1"
+            if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "refusing to post a check on a non-hex sha" >&2
+              exit 1
+            fi
+            body="${work}/check.json"
+            CHECK_SHA="${sha}" CHECK_CONCLUSION="${conclusion}" python3 - > "${body}" <<'PY'
+          import json
+          import os
+          import sys
+
+          if os.environ["CHECK_CONCLUSION"] != "failure":
+              raise SystemExit(1)
+          json.dump(
+              {
+                  "name": "base-is-develop",
+                  "head_sha": os.environ["CHECK_SHA"],
+                  "status": "completed",
+                  "conclusion": "failure",
+                  "output": {
+                      "title": "Use gh pr create --base develop",
+                      "summary": "Open the pull request with gh pr create --base develop. main is not the integration branch.",
+                  },
+              },
+              sys.stdout,
+              separators=(",", ":"),
+          )
+          PY
+            code=$(api POST "https://api.github.com/repos/kirich1409/maven-mcp/check-runs" "${work}/check-response.json" "${body}")
+            rm -f "${body}" "${work}/check-response.json"
+            if [ "${code}" != "201" ]; then
+              echo "check-run POST returned ${code}" >&2
+              exit 1
+            fi
+          }
+
+          post_check "${HEAD_SHA}"
+          if printf '%s' "${MERGE_SHA}" | grep -Eq '^[0-9a-f]{40}$' && [ "${MERGE_SHA}" != "${HEAD_SHA}" ]; then
+            post_check "${MERGE_SHA}"
+          fi
+          unset token auth
