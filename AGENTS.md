@@ -68,13 +68,9 @@ coverage report --rcfile=pyproject.toml   # fail_under=75, ~90% measured
 
 1. One pull request sets a new `X.Y.Z` in every place `scripts/check-versions.py` compares, then lands on `develop` with the required checks green. The human chooses patch, minor, or major. `python3 scripts/check-versions.py X.Y.Z` exits 0. `tests/test_wheel.py` reads `[project].version` and is not edited for the bump.
 2. `tests/test_wheel.py` still passes: the wheel contains `server.py` and `compat-matrices.json` at install root, `License-Expression: MIT`, the README text, `Requires-Python: >=3.9`, and no `Requires-Dist`. PyPI JSON then reports `license_expression` `MIT` and leaves legacy `license` null.
-3. Tag that merge commit `vX.Y.Z` and create the GitHub Release on the same commit. The monorepo-era name `maven-mcp--vX.Y.Z` is retired. Do not move a tag that already points at a published commit.
-4. From a clean checkout of that tag, run `uv build --sdist --wheel` and `uv publish`. Treat the release as published only after `https://pypi.org/pypi/maven-mcp/X.Y.Z/json` returns HTTP 200 with that version, `license_expression` MIT, and `requires_python` `>=3.9`. Release notes may name `uvx maven-mcp` only after that response.
-5. Upload with `UV_PUBLISH_TOKEN` or a PyPI trusted publisher already registered for `kirich1409/maven-mcp`. The first upload of a project that does not exist yet needs an account-scoped token. Do not commit, log, or paste the token. There is no publish workflow in this repo. A version already on PyPI cannot be replaced; a bad wheel is the next version number.
+3. After the develop checks are green, dispatch Release on `main` with `sha` and `version`. Do not run `uv publish` locally. Do not push a tag. The workflow fast-forwards `main` to that sha, tags it `vX.Y.Z`, and creates the Release only after the JSON gate. Optional notes file: `docs/releases/vX.Y.Z.md`. There is no `UV_PUBLISH_TOKEN`. Do not print or store a PyPI token. A bad wheel is the next version number. Do not move a tag. The monorepo tag prefix stays retired. The release App is a bypass actor on Pull Request Only and on `refs/tags/v*` only. It is not a bypass actor on Main Protect. `actor_id` is the App ID. Agents do not fast-forward `main` themselves.
 
-This hand procedure is the one to follow while `.github/workflows/release.yml` is not the file on `main`.
-
-Marketplace installs read `main` and do not wait for PyPI. `uvx maven-mcp` installs the PyPI release.
+Marketplace installs read `main` and do not wait for PyPI. The default branch stays `main`, and `main` does not move until the JSON gate has passed. `uvx maven-mcp` installs the PyPI release.
 
 ## Architecture
 
