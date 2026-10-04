@@ -1,6 +1,6 @@
 {
   "name": "maven-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Maven dependency intelligence — dependency updates, vulnerability and license scanning, transitive dependency graphs, version compatibility checks, artifact search, and version-catalog management, exposed as skills and an MCP server. Plugin for Claude Code, Grok Build, Cursor, and Codex; no NPM setup.",
   "author": {
     "name": "kirich1409"

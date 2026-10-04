@@ -71,7 +71,7 @@ class WheelPackagingTest(unittest.TestCase):
                 ).decode("utf-8")
 
         self.assertIn("Name: maven-mcp\n", metadata)
-        self.assertIn("Version: 1.0.0\n", metadata)
+        self.assertIn("Version: 1.1.0\n", metadata)
         self.assertIn("License-Expression: MIT\n", metadata)
         self.assertIn("Requires-Python: >=3.9\n", metadata)
         self.assertNotIn("Requires-Dist:", metadata)
