@@ -25,8 +25,9 @@ _HOOKS_JSON = os.path.normpath(
 _HAS_JQ = shutil.which("jq") is not None
 
 _REMINDER_MSG = (
-    "Build dependency file was modified. Consider running /check-deps "
-    "to verify dependency versions are up to date."
+    "Build dependency file was modified; a version change is not transitively "
+    "checked by this reminder, and /check-deps previews the closure only for "
+    "the library batch the user confirms."
 )
 
 

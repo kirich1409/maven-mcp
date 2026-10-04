@@ -191,4 +191,4 @@ fi
 [ "$HAS_COORDS" -eq 1 ] || exit 0
 
 # ── Emit reminder ─────────────────────────────────────────────────────────────
-printf '%s\n' '{"systemMessage":"Build dependency file was modified. Consider running /check-deps to verify dependency versions are up to date."}'
+printf '%s\n' '{"systemMessage":"Build dependency file was modified; a version change is not transitively checked by this reminder, and /check-deps previews the closure only for the library batch the user confirms."}'
