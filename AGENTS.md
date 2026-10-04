@@ -52,7 +52,7 @@ coverage report --rcfile=pyproject.toml   # fail_under=75, ~90% measured
 
 ## Work and releases
 
-Ordinary changes keep the version already on `main`. A release is a separate cut, and only when the user asks for one. `1.0.0` is published: git tag `v1.0.0` is `02fa8f5` on `main`, and PyPI project `maven-mcp` serves that version. Do not rebuild, retag, or re-upload it.
+Ordinary changes keep the version already on `main`. A release is a separate cut, and only when the user asks for one. `1.1.0` is the current release. `1.0.0` stays published: git tag `v1.0.0` is `02fa8f5` on `main`, and PyPI project `maven-mcp` serves that version. Do not rebuild, retag, or re-upload `1.0.0`.
 
 ### Day-to-day
 
