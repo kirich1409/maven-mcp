@@ -11079,7 +11079,10 @@ import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 gradle.projectsEvaluated {
     gradle.rootProject.allprojects.each { p ->
         println("===MAVEN_MCP_MODULE=== " + p.path)
-        p.configurations.each { cfg ->
+        // Gradle 9 rejects resolving another project's configurations unless the
+        // project's mutable state is locked, so run the dump inside its lock.
+        p.owner.applyToMutableState { pp ->
+        pp.configurations.each { cfg ->
             if (!cfg.canBeResolved) {
                 return
             }
@@ -11103,11 +11106,13 @@ gradle.projectsEvaluated {
             }
             println("===MAVEN_MCP_CONFIG_END===")
         }
+        }
         println("===MAVEN_MCP_MODULE_END===")
     }
     println("===MAVEN_MCP_BUILDENV===")
     try {
-        def bscfg = gradle.rootProject.buildscript.configurations.findByName("classpath")
+        gradle.rootProject.owner.applyToMutableState { rp ->
+        def bscfg = rp.buildscript.configurations.findByName("classpath")
         if (bscfg != null && bscfg.canBeResolved) {
             bscfg.incoming.resolutionResult.root.dependencies.each { dep ->
                 if (dep instanceof ResolvedDependencyResult) {
@@ -11117,6 +11122,7 @@ gradle.projectsEvaluated {
                     }
                 }
             }
+        }
         }
     } catch (Exception e) {
         println("===MAVEN_MCP_BUILDENV_ERROR=== " + e.class.name + ": " + e.message)
@@ -11210,7 +11216,7 @@ def _gradle_resolve_dependencies(project_root: str) -> Dict:
         code, _stdout, stderr = _run_gradle_command(
             project_root,
             gradlew,
-            ["--init-script", init_path, "-q", "help"],
+            ["--no-configuration-cache", "--init-script", init_path, "-q", "help"],
             timeout=_gradle_resolve_timeout_seconds(),
         )
         stdout = _stdout
@@ -12410,11 +12416,13 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
     # the next. `partial`/`notes` are only added to the output when the
     # deadline actually fires (see below) — the common, fast case is
     # byte-for-byte unchanged.
-    deadline = _now() + TOOL_DEADLINE
     deadline_hit = False
     scan = scan_project(project_path)
     if scan.get("resolvedBy") != "gradle":
         apply_bom_managed_versions(scan, ctx)
+    # Start the budget after the scan: the Gradle resolve alone can take longer
+    # than TOOL_DEADLINE and would leave the fan-out phases no time at all.
+    deadline = _now() + TOOL_DEADLINE
 
     def is_included_in_production(dep: Dict) -> bool:
         source = dep["source"]
