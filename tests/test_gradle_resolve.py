@@ -90,6 +90,12 @@ class TestGenerateGradleResolveInitScript(unittest.TestCase):
         self.assertIn("canBeResolved", script)
         self.assertIn("projectsEvaluated", script)
 
+    def test_resolution_runs_inside_project_mutable_state(self):
+        # Gradle 9 rejects resolving a configuration without the owning
+        # project's exclusive lock ("attempted without an exclusive lock").
+        script = server._generate_gradle_resolve_init_script()
+        self.assertIn("applyToMutableState", script)
+
     def test_no_untrusted_interpolation(self):
         # Static script string, not an f-string / .format() with project data.
         script = server._generate_gradle_resolve_init_script()
@@ -203,6 +209,21 @@ class TestGradleResolveTimeoutOverride(unittest.TestCase):
                 with unittest.mock.patch.object(server, "_run_gradle_command", _fake_run):
                     server._gradle_resolve_dependencies(root)
         self.assertEqual(captured["timeout"], 900)
+
+    def test_gradle_resolve_dependencies_disables_configuration_cache(self):
+        # A configuration-cache hit skips the configuration phase, so the init
+        # script's projectsEvaluated hook never runs and the dump is empty.
+        captured = {}
+
+        def _fake_run(project_root, gradlew, args, timeout=server.GRADLE_RESOLVE_TIMEOUT):
+            captured["args"] = args
+            return 0, SINGLE_INVOCATION_FIXTURE, ""
+
+        with temp_project({}) as root:
+            write_fake_gradlew(root)
+            with unittest.mock.patch.object(server, "_run_gradle_command", _fake_run):
+                server._gradle_resolve_dependencies(root)
+        self.assertIn("--no-configuration-cache", captured["args"])
 
 
 class TestFindGradleWrapper(unittest.TestCase):
