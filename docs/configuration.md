@@ -17,10 +17,12 @@ Responses are stored under `${XDG_CACHE_HOME}/maven-central-mcp`, or `~/.cache/m
 | Maven metadata (version lists) | 1 hour |
 | POM files | 7 days |
 | Search results | 1 hour |
-| deps.dev graphs, licenses, and OpenSSF Scorecard | 1 hour |
+| deps.dev OpenSSF Scorecard and GetVersion license lookups | 1 hour |
 | AndroidX and AGP release-note pages | 7 days |
 | endoflife.date product documents | 7 days |
 | A definitive HTTP 404 | 5 minutes |
+
+Transitive graph tools read the artifact POM from the Gradle user cache (`GRADLE_USER_HOME` when set, otherwise `~/.gradle/caches/modules-2/files-2.1`), then `~/.m2/repository`, then the POM cache above. Scorecard still uses deps.dev.
 
 OSV vulnerability queries, GitHub API calls, and any response that used a private-repo credential are not stored. HTTP 429, 5xx, and transport errors are not stored either.
 
@@ -52,7 +54,7 @@ When no `settings.xml` mirror matches, and `~/.gradle/init.gradle`, `init.gradle
 
 Order: repositories declared in the build, then the public fallback when it applies, then `MAVEN_MCP_REPOSITORY_BASE`, then mirrors, then the offline drop of anything still pointing at a public host.
 
-Tools that call OSV, GitHub, deps.dev, developer.android.com, or endoflife.date return `capabilityUnavailable: "offline"` immediately in offline mode, so an empty CVE, health, changelog, graph, or end-of-life result is an unavailable check. A transport failure against those hosts returns `capabilityUnavailable: "unreachable"` after a short timeout. Point these variables at an internal mirror to keep the feature:
+Tools that call OSV, GitHub, deps.dev (OpenSSF Scorecard), developer.android.com, or endoflife.date return `capabilityUnavailable: "offline"` immediately in offline mode, so an empty CVE, health, changelog, Scorecard, or end-of-life result is an unavailable check. A transport failure against those hosts returns `capabilityUnavailable: "unreachable"` after a short timeout. A POM graph with nothing in the Gradle or Maven cache and no usable repository is `partial` with an explicit reason, including `capabilityUnavailable: "offline"` when public hosts are dropped and no mirror or `MAVEN_MCP_REPOSITORY_BASE` remains. Point these variables at an internal mirror to keep the enrichment feature:
 
 | Variable | Points at |
 |----------|-----------|

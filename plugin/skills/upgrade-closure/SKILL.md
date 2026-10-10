@@ -4,7 +4,7 @@ description: >-
   Use when the user asks what a direct dependency upgrade changes in the
   resolved closure, which transitives appear or disappear, or whether the
   candidate brings new vulnerabilities or license categories. Gradle when a
-  wrapper exists; otherwise one deps.dev upgrade. Not a safety verdict.
+  wrapper exists; otherwise one POM-graph upgrade. Not a safety verdict.
 disable-model-invocation: true
 ---
 
@@ -15,12 +15,12 @@ Call **`compare_upgrade_closure`**. Do not diff graphs yourself.
 `graphSource` defaults to `auto`:
 
 - `auto` — Gradle when the project is a Gradle build and `gradlew` exists,
-  otherwise deps.dev.
-- `gradle` — two sequential wrapper resolves. No deps.dev fallback if that fails.
-- `depsdev` — one isolated public graph pair. Exactly one upgrade.
+  otherwise the POM graph.
+- `gradle` — two sequential wrapper resolves. A failed Gradle run is not a POM graph.
+- `pom` — one isolated published-POM graph. Exactly one upgrade.
 
 Gradle accepts up to 20 substitutions (`substitution` `exact` or `module`,
-default `exact`). The server does not retry `exact` as `module`. deps.dev
+default `exact`). The server does not retry `exact` as `module`. The POM graph
 rejects more than one upgrade. `includeLicenses` defaults to true.
 
 ## Steps
@@ -28,9 +28,9 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
 1. Pass the library upgrades the user named (`groupId`, `artifactId`,
    `fromVersion`, `toVersion`) and `projectPath` when the project is not the
    working directory. Leave `graphSource` unset unless the user asked for
-   `gradle` or `depsdev`. Do not call the tool once per coordinate.
+   `gradle` or `pom`. Do not call the tool once per coordinate.
 
-2. If the selection would be deps.dev and the user named more than one upgrade,
+2. If the selection would be the POM graph and the user named more than one upgrade,
    say "a batch closure needs a Gradle wrapper" and do not call. Do not loop one
    call per coordinate. The confirm-step split lives in `/check-deps`: markers; the
    `runtimeClasspath` predicate only for Gradle configuration names; without a
@@ -85,8 +85,9 @@ rejects more than one upgrade. `includeLicenses` defaults to true.
      `vulnerabilities` list) — no coordinate change outside the target, then that
      target OSV result (`relation: target`). Quote the non-guarantee note from
      `notes`. Do not say safe. If the coordinate is a platform or carries
-     `managedBy`, and `graphSource` is `depsdev`, do not use that closure
-     sentence: an empty public-graph diff is not "no coordinate change". The
+     `managedBy`, and `graphSource` is `pom`, do not use that closure
+     sentence: an empty POM-subset diff is not "no coordinate change". Ranges,
+     profiles, and the consumer's `dependencyManagement` are not applied. The
      server has no `isPlatform` input.
    - **`none` when nothing was requested to change** — nothing was requested to
      change and the current coordinate was not re-queried. Do not say the graphs
@@ -120,16 +121,16 @@ One CVE, in this order. Same row as `/check-deps`. Do not paraphrase `summary`.
 
 ## Constraints and non-goals
 
-- Do not loop this tool. One Gradle batch, or one deps.dev upgrade.
-- Do not treat a failed Gradle result as a deps.dev graph.
+- Do not loop this tool. One Gradle batch, or one POM-graph upgrade.
+- Do not treat a failed Gradle result as a POM graph.
 - Do not diff two `get_transitive_graph` results. That wrapper drops `relation`,
   and the server already owns the matrix.
 - Do not run `mvn dependency:tree` or `./gradlew dependencies` and present the
   text as if OSV had been queried.
-- When `graphSource` is `depsdev`, say the graph is isolated: it does not see
-  `dependencyManagement`, `ResolutionStrategy`, strict versions,
-  `enforcedPlatform`, exclusions, or private artifacts. Do not say that about
-  a Gradle result.
+- When `graphSource` is `pom`, say the graph is isolated: it does not see
+  version ranges, profiles, the consumer's `dependencyManagement`,
+  `ResolutionStrategy`, strict versions, `enforcedPlatform`, or exclusions.
+  Do not say that about a Gradle result.
 - `landed: false` or `rewroteVersionless: true` is at least `review`. If
   `landed` is false, you may offer one retry with `substitution: "module"`.
   The server does not launch that second pair. Do not send it unless the user
@@ -137,7 +138,9 @@ One CVE, in this order. Same row as `/check-deps`. Do not paraphrase `summary`.
 - An empty OSV list is not verified-clean. Unchanged transitives were not queried.
 - License rows are heuristic signals, not legal advice. Only changed coordinates
   are licensed. On the Gradle path, license metadata is not taken from the
-  resolve; a missing deps.dev record is `review`, not a known license.
+  resolve; a missing license record is `review`, not a known license. The
+  Gradle path still reads that license metadata from deps.dev GetVersion. The
+  POM path reads `<licenses>` from the artifact POM.
 
 ## Fallback (MCP unavailable only)
 

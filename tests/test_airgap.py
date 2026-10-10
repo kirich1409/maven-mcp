@@ -6,11 +6,29 @@ results are never mistaken for verified-clean.
 """
 
 import json
+import os
+import tempfile
 import unittest
 import unittest.mock
 import urllib.error
+from pathlib import Path
 
 from _helpers import mock_urlopen, server
+
+
+def _isolate_user_caches():
+    """Point Gradle and Maven caches at an empty temp home."""
+    tmp = tempfile.TemporaryDirectory()
+    home = Path(tmp.name)
+    (home / ".gradle").mkdir()
+    (home / ".m2" / "repository").mkdir(parents=True)
+    home_patch = unittest.mock.patch.object(server.Path, "home", return_value=home)
+    env_patch = unittest.mock.patch.dict(
+        os.environ, {"GRADLE_USER_HOME": str(home / ".gradle")}, clear=False,
+    )
+    home_patch.start()
+    env_patch.start()
+    return tmp, home_patch, env_patch
 
 
 class ExternalEndpointResolutionTest(unittest.TestCase):
@@ -171,10 +189,15 @@ class OsvAirgapTest(unittest.TestCase):
 
 class DepsdevAirgapTest(unittest.TestCase):
     def test_offline_fetch_marks_capability(self):
+        tmp, home_patch, env_patch = _isolate_user_caches()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(home_patch.stop)
+        self.addCleanup(env_patch.stop)
         with unittest.mock.patch.dict(
             "os.environ", {"MAVEN_MCP_OFFLINE": "1"}, clear=False
         ):
             server.os.environ.pop("MAVEN_MCP_DEPSDEV_BASE", None)
+            server.os.environ.pop("MAVEN_MCP_REPOSITORY_BASE", None)
             with unittest.mock.patch("urllib.request.urlopen") as urlopen:
                 out = server.fetch_depsdev_dependencies("com.example", "lib", "1.0")
                 graph = server.get_transitive_graph("com.example", "lib", "1.0")
@@ -337,10 +360,15 @@ class GithubAndChangelogAirgapTest(unittest.TestCase):
 
 class LicenseComplianceAirgapTest(unittest.TestCase):
     def test_offline_compliance_marks_capability(self):
+        tmp, home_patch, env_patch = _isolate_user_caches()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(home_patch.stop)
+        self.addCleanup(env_patch.stop)
         with unittest.mock.patch.dict(
             "os.environ", {"MAVEN_MCP_OFFLINE": "1"}, clear=False
         ):
             server.os.environ.pop("MAVEN_MCP_DEPSDEV_BASE", None)
+            server.os.environ.pop("MAVEN_MCP_REPOSITORY_BASE", None)
             with unittest.mock.patch("urllib.request.urlopen") as urlopen:
                 out = server.check_license_compliance(
                     [

@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 # Transitive Graph
 
-Fetch the resolved transitive dependency graph for one Maven GAV via deps.dev.
+Fetch the resolved transitive dependency graph for one Maven GAV from its POM.
 
 ## Steps
 
@@ -24,9 +24,10 @@ Fetch the resolved transitive dependency graph for one Maven GAV via deps.dev.
    - `edges` — `{from, to}` pairs, indices into `nodes` (render as an indented tree or a
      `groupId:artifactId:version → groupId:artifactId:version` list, whichever fits the
      size better)
-   - If `partial: true` (deps.dev unreachable, returned an error, or the graph was
+   - If `partial: true` (a POM is missing, a declaration was skipped, or the graph was
      truncated by the node cap) — say so explicitly; do not present a partial graph as
-     complete.
+     complete. Offline with nothing cached and no usable repository is partial with an
+     explicit reason, not a complete empty graph.
 
 ## Constraints and non-goals
 
@@ -38,9 +39,12 @@ Fetch the resolved transitive dependency graph for one Maven GAV via deps.dev.
 
 ## Known limitations
 
-deps.dev resolves in isolation from this one root — project-level `dependencyManagement`,
-Gradle `ResolutionStrategy` / strict versions / exclusions are not modeled. State this when
-the graph is used to make a decision (e.g. "is X actually on the classpath").
+The walk is a documented Maven subset of published POMs, resolved in isolation from this
+one root. Version ranges, profiles, and the consumer's `dependencyManagement` are not
+applied. Gradle `ResolutionStrategy` / strict versions / `enforcedPlatform` are not
+modeled. State this when the graph is used to make a decision (e.g. "is X actually on
+the classpath"). A Gradle wrapper's classpath is a different question — use the Gradle
+scan, not this tool.
 
 ## Fallback (MCP unavailable only)
 

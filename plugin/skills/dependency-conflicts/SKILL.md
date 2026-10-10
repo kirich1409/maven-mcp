@@ -20,9 +20,9 @@ across a project's dependency graph, and report which version wins.
 
    - **Gradle projects** compare versions across Gradle-resolved scan usages
      (`resolvedBy: "gradle"`) — mediation is `highest-wins`.
-   - **Maven projects** fetch a deps.dev transitive graph per versioned direct dependency
-     and union `groupId:artifactId → {versions seen}` — mediation is `nearest-wins` (BFS
-     depth from each direct root; same-depth ties break to the highest version).
+   - **Maven projects** fetch a POM graph per versioned direct dependency and union
+     `groupId:artifactId → {versions seen}` — mediation is `nearest-wins` (BFS depth from
+     each direct root; same-depth ties break to the highest version).
 
 2. Present each conflict: the GA, `versions` seen, `resolvedTo` (what wins), `strategy`,
    and `risk` (`high`/`medium`/`low`). Sort by risk descending.
@@ -31,11 +31,12 @@ across a project's dependency graph, and report which version wins.
 
 ## Known limitations
 
-For Maven, this unions per-root deps.dev graphs resolved **in isolation** — it
-approximates but is not a full project-wide resolve. Project `dependencyManagement`,
-Gradle `ResolutionStrategy` / strict versions / `enforcedPlatform`, exclusions, and
-private/unpublished coordinates are not modeled. Surface `notes[]` / per-root `errors[]` /
-`partial` from the result when present rather than treating the report as exhaustive.
+For Maven, this unions per-root POM graphs resolved **in isolation** — it approximates
+but is not a full project-wide resolve. Version ranges, profiles, the consumer's
+`dependencyManagement`, Gradle `ResolutionStrategy` / strict versions / `enforcedPlatform`,
+and exclusions are not applied. A missing POM degrades that root (`errors[]` / `partial`)
+while the other roots still contribute. Surface `notes[]` when present rather than
+treating the report as exhaustive.
 
 ## Fallback (MCP unavailable only)
 
