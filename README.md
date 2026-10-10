@@ -21,20 +21,20 @@ Version lookups use the repositories the build file declares. Maven Central, Goo
 | `get_dependency_changes` | Show changes between versions (AndroidX docs, then AGP docs, then GitHub releases; `CHANGELOG.md` on the default branch when no release body is usable) |
 | `scan_project_dependencies` | Scan Gradle/Maven build files and Gradle version catalogs (`gradle/libs.versions.toml`) for dependencies |
 | `expand_bom` | Expand a Maven BOM into managed dependency versions |
-| `get_transitive_graph` | Resolved transitive dependency graph for a GAV via deps.dev |
-| `get_vulnerability_paths` | Shortest dependency path from a project root GAV to each transitively vulnerable node (deps.dev graph + OSV.dev) |
-| `detect_dependency_conflicts` | Flag GAs resolved at multiple versions (Gradle: from resolved scan usages; Maven: deps.dev per-root graphs with nearest-wins) |
+| `get_transitive_graph` | Resolved transitive dependency graph for a GAV from the artifact POM |
+| `get_vulnerability_paths` | Shortest dependency path from a project root GAV to each transitively vulnerable node (POM graph + OSV.dev) |
+| `detect_dependency_conflicts` | Flag GAs resolved at multiple versions (Gradle: from resolved scan usages; Maven: per-root POM graphs with nearest-wins) |
 | `check_version_compatibility` | Check Spring Boot / AGP / Kotlin / javax→jakarta compatibility |
 | `get_dependency_vulnerabilities` | Check for known CVEs via OSV.dev |
 | `get_dependency_health` | Assess adoption-worthiness: version/stability, GitHub activity, issue dynamics, license, owner — raw signals for a verdict |
 | `get_dependency_license` | SPDX / category license intelligence for direct dependencies |
-| `check_license_compliance` | Aggregate transitive licenses via deps.dev; flag copyleft/risky vs project policy |
+| `check_license_compliance` | Aggregate transitive licenses from artifact POMs; flag copyleft/risky vs project policy |
 | `search_artifacts` | Search artifacts (Maven Central Solr; Nexus/Artifactory in closed mode) |
 | `audit_project_dependencies` | Full audit: scan + version compare + vulnerability check |
 | `catalog_entry` | Generate/validate Gradle version-catalog entries (`libs.versions.toml`) with rule-correct aliases and minimal diffs |
 | `verify_coordinates` | Tri-state existence check + did-you-mean for hallucinated coordinates |
 | `get_eol_status` | End-of-life / support status for JDK (vendor-specific), Kotlin, Gradle, and Spring Boot via endoflife.date |
-| `compare_upgrade_closure` | Compare an upgrade's closure. Gradle when a wrapper exists; deps.dev is the single-upgrade fallback |
+| `compare_upgrade_closure` | Compare an upgrade's closure. Gradle when a wrapper exists; the POM graph is the single-upgrade path |
 
 ### Skills
 
@@ -76,7 +76,7 @@ capability through the MCP tool above:
 | `/license-compliance` | Aggregate transitive licenses vs a project license policy; flag copyleft/violations |
 | `/search-artifacts` | Search Maven Central (or Nexus/Artifactory in closed mode) by keyword |
 | `/eol-status` | Check end-of-life / support status for JDK, Kotlin, Gradle, or Spring Boot |
-| `/upgrade-closure` | Compare an upgrade closure (Gradle when a wrapper exists, otherwise one deps.dev upgrade); advisory only |
+| `/upgrade-closure` | Compare an upgrade closure (Gradle when a wrapper exists, otherwise one POM-graph upgrade); advisory only |
 
 ### Supported build systems
 

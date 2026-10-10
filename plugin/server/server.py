@@ -29,6 +29,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import zlib
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
@@ -2307,36 +2308,58 @@ def _interpolate_pom_props(value: Optional[str], props: Dict[str, str]) -> Optio
     return result
 
 
+def _resolved_parent_gav(
+    pom_xml: str, props: Dict[str, str]
+) -> Optional[Tuple[str, str, str]]:
+    """Parent coordinate after ``${}`` substitution, or None when it is not a GAV.
+
+    ``props`` are this POM's own properties. An unresolved fragment is not a
+    repository coordinate.
+    """
+    parent = _parse_maven_parent(pom_xml)
+    if not parent:
+        return None
+    group_id = _interpolate_pom_props(parent.get("groupId"), props)
+    artifact_id = _interpolate_pom_props(parent.get("artifactId"), props)
+    version = _interpolate_pom_props(parent.get("version"), props)
+    if not group_id or not artifact_id or not version:
+        return None
+    if "${" in group_id or "${" in artifact_id or "${" in version:
+        return None
+    return group_id, artifact_id, version
+
+
 def _collect_bom_properties(
     pom_xml: str,
     bom_version: str,
     ctx: "ResolutionContext",
     depth: int = 0,
+    *,
+    _pom_reader: Optional[Callable[..., Optional[str]]] = None,
 ) -> Dict[str, str]:
     """Merge parent POM properties under child (child wins). Parent is fetched
-    by GAV via `fetch_pom` — remote BOMs have no local relativePath."""
+    by GAV — remote BOMs have no local relativePath. ``_pom_reader`` defaults
+    to ``fetch_pom``; the POM-graph walk passes ``locate_pom``."""
+    reader = _pom_reader or fetch_pom
     props: Dict[str, str] = {}
-    parent = _parse_maven_parent(pom_xml)
-    parent_group_id = parent.get("groupId") if parent else None
-    parent_artifact_id = parent.get("artifactId") if parent else None
-    parent_version = parent.get("version") if parent else None
-    if (
-        parent_group_id
-        and parent_artifact_id
-        and parent_version
-        and depth < MAX_BOM_DEPTH
-    ):
-        parent_pom = fetch_pom(
-            parent_group_id, parent_artifact_id, parent_version, ctx
-        )
-        if parent_pom:
-            props.update(
-                _collect_bom_properties(
-                    parent_pom, parent_version, ctx, depth + 1
+    local: Dict[str, str] = {}
+    local.update(_pom_project_property_defaults(pom_xml, bom_version))
+    local.update(_parse_pom_properties(pom_xml))
+    if depth < MAX_BOM_DEPTH:
+        parent_gav = _resolved_parent_gav(pom_xml, local)
+        if parent_gav:
+            parent_pom = reader(parent_gav[0], parent_gav[1], parent_gav[2], ctx)
+            if parent_pom:
+                props.update(
+                    _collect_bom_properties(
+                        parent_pom,
+                        parent_gav[2],
+                        ctx,
+                        depth + 1,
+                        _pom_reader=reader,
+                    )
                 )
-            )
-    props.update(_pom_project_property_defaults(pom_xml, bom_version))
-    props.update(_parse_pom_properties(pom_xml))
+    props.update(local)
     return props
 
 
@@ -2404,6 +2427,9 @@ def expand_bom(
     *,
     _depth: int = 0,
     _seen: Optional[set] = None,
+    _pom_reader: Optional[Callable[..., Optional[str]]] = None,
+    _version_fallback: Optional[Dict[Tuple[str, str], str]] = None,
+    _props: Optional[Dict[str, str]] = None,
 ) -> List[Dict]:
     """Fetch a BOM POM and return managed ``[{groupId, artifactId, version}]``.
 
@@ -2412,6 +2438,12 @@ def expand_bom(
     Direct managed entries in the current BOM follow the same first-wins rule.
     Depth-capped and cycle-guarded on ``g:a:v``. Missing POM / unresolved
     ``${}`` versions are skipped — never raises (#286).
+
+    ``_pom_reader`` defaults to ``fetch_pom``. ``_version_fallback`` supplies a
+    version for a versionless import or managed entry (parent management);
+    callers that omit it keep the previous behavior. ``_props`` is the property
+    map already collected for this POM; when it is set the parent chain is not
+    walked again. Nested import BOMs do not receive it.
     """
     if _seen is None:
         _seen = set()
@@ -2419,24 +2451,34 @@ def expand_bom(
     if _depth > MAX_BOM_DEPTH or key in _seen:
         return []
     _seen.add(key)
-    pom = fetch_pom(group_id, artifact_id, version, ctx)
+    reader = _pom_reader or fetch_pom
+    pom = reader(group_id, artifact_id, version, ctx)
     if not pom:
         return []
-    props = _collect_bom_properties(pom, version, ctx, _depth)
+    if _props is None:
+        props = _collect_bom_properties(pom, version, ctx, _depth, _pom_reader=reader)
+    else:
+        props = _props
     entries = parse_dependency_management(pom, props=props)
     managed: List[Dict] = []
     managed_keys: set = set()
     for entry in entries:
         if entry["isImportBom"]:
-            if not entry.get("version"):
+            import_version = entry.get("version")
+            if not import_version and _version_fallback:
+                import_version = _version_fallback.get(
+                    (entry["groupId"], entry["artifactId"])
+                )
+            if not import_version:
                 continue
             nested = expand_bom(
                 entry["groupId"],
                 entry["artifactId"],
-                entry["version"],
+                import_version,
                 ctx,
                 _depth=_depth + 1,
                 _seen=_seen,
+                _pom_reader=reader,
             )
             for item in nested:
                 ga = (item["groupId"], item["artifactId"])
@@ -2445,7 +2487,12 @@ def expand_bom(
                 managed_keys.add(ga)
                 managed.append(item)
             continue
-        if not entry.get("version"):
+        managed_version = entry.get("version")
+        if not managed_version and _version_fallback:
+            managed_version = _version_fallback.get(
+                (entry["groupId"], entry["artifactId"])
+            )
+        if not managed_version:
             continue
         ga = (entry["groupId"], entry["artifactId"])
         if ga in managed_keys:
@@ -2454,9 +2501,723 @@ def expand_bom(
         managed.append({
             "groupId": entry["groupId"],
             "artifactId": entry["artifactId"],
-            "version": entry["version"],
+            "version": managed_version,
         })
     return managed
+
+
+# ---------------------------------------------------------------------------
+# POM transitive graph (Gradle cache, local Maven repo, then fetch_pom)
+# ---------------------------------------------------------------------------
+
+_POM_RANGE_CHARS = frozenset("[](),")
+_POM_KEPT_SCOPES = frozenset({"compile", "runtime"})
+_POM_SECTION_RE = re.compile(
+    r"<(profiles|build|reporting|dependencyManagement)\b[^>]*>[\s\S]*?</\1>",
+)
+
+
+def _gradle_user_home() -> Path:
+    """Gradle user home, read on every call.
+
+    ``GRADLE_HOME`` is the distribution directory and is not a module cache,
+    so it is intentionally never consulted.
+    """
+    raw = os.environ.get("GRADLE_USER_HOME")
+    if raw is not None and raw.strip():
+        return Path(raw.strip())
+    return Path.home() / ".gradle"
+
+
+def _read_pom_file(path: Path) -> Optional[str]:
+    try:
+        if not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _pom_absence_reason(
+    ctx: "ResolutionContext",
+    group_id: str,
+    artifact_id: str,
+    version: str,
+) -> Tuple[str, Optional[str]]:
+    """Why a POM was not found. Offline with nothing left to query is explicit.
+
+    The text is built from the coordinate and a fixed sentence. Exception
+    strings and URL userinfo are never interpolated.
+    """
+    if ctx.offline and not ctx.repository_base and not ctx.mirrors:
+        repos = _repos_for(group_id, artifact_id, ctx)
+        if not repos:
+            return (
+                "no queryable repositories (offline/closed mode with no mirror "
+                "or MAVEN_MCP_REPOSITORY_BASE)",
+                "offline",
+            )
+    return f"POM not found for {group_id}:{artifact_id}:{version}", None
+
+
+def _pom_segment_ok(segment: str) -> bool:
+    """One path segment. ``.``, ``..``, separators, and absolute pieces are not."""
+    if not segment or segment in (".", ".."):
+        return False
+    if "/" in segment or "\\" in segment or "\x00" in segment:
+        return False
+    return not Path(segment).is_absolute()
+
+
+def _pom_coordinate_local_safe(group_id: str, artifact_id: str, version: str) -> bool:
+    """False when joining the coordinate onto a cache root can escape that root.
+
+    ``group_path`` turns ``.`` into ``/``, so a ``groupId`` of ``..`` or ``.git``
+    becomes an absolute path. ``artifactId`` and ``version`` are single segments
+    (a dotted version stays one segment).
+    """
+    if not _pom_segment_ok(artifact_id) or not _pom_segment_ok(version):
+        return False
+    if (
+        not group_id
+        or "/" in group_id
+        or "\\" in group_id
+        or "\x00" in group_id
+        or Path(group_id).is_absolute()
+    ):
+        return False
+    parts = group_id.split(".")
+    return bool(parts) and all(_pom_segment_ok(part) for part in parts)
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def locate_pom(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+) -> Optional[str]:
+    """Return POM text from the Gradle user cache, then ``~/.m2``, then ``fetch_pom``.
+
+    Stops at the first readable file that stays under the cache root. A local
+    hit does not call ``fetch_pom``. A coordinate that can escape either root
+    returns None and does not read a file or call ``fetch_pom``.
+    ``GRADLE_USER_HOME`` is read on every call; an empty value uses
+    ``Path.home() / ".gradle"``.
+    """
+    if not _pom_coordinate_local_safe(group_id, artifact_id, version):
+        return None
+    cache_root = (
+        _gradle_user_home() / "caches" / "modules-2" / "files-2.1"
+    )
+    cache_dir = cache_root / group_id / artifact_id / version
+    cached: List[Path] = []
+    if _path_is_under(cache_dir, cache_root):
+        try:
+            cached = sorted(
+                path for path in cache_dir.glob("*/*.pom") if path.is_file()
+            )
+        except OSError:
+            cached = []
+    for path in cached:
+        if not _path_is_under(path, cache_dir):
+            continue
+        text = _read_pom_file(path)
+        if text is not None:
+            return text
+    m2_root = Path.home() / ".m2" / "repository"
+    m2_path = (
+        m2_root
+        / group_path(group_id)
+        / artifact_id
+        / version
+        / f"{artifact_id}-{version}.pom"
+    )
+    if _path_is_under(m2_path, m2_root):
+        text = _read_pom_file(m2_path)
+        if text is not None:
+            return text
+    return fetch_pom(group_id, artifact_id, version, ctx)
+
+
+def _license_strings_from_pom(pom_xml: str) -> List[str]:
+    """POM ``<licenses>`` names (url when the name is absent), in document order."""
+    found: List[str] = []
+    for lic in extract_licenses_from_pom(pom_xml):
+        raw = lic.get("name") or lic.get("url")
+        if raw:
+            found.append(raw)
+    return found
+
+
+def _pom_dependency_xml(pom_xml: str) -> str:
+    """Project ``<dependencies>`` only.
+
+    Comments, profiles, build/plugin dependencies, reporting, and
+    ``dependencyManagement`` are removed first so managed pins are not edges.
+    """
+    xml = _strip_xml_comments(pom_xml)
+    return _POM_SECTION_RE.sub("", xml)
+
+
+def _pom_exclusions(dep_block: str, props: Dict[str, str]) -> List[Tuple[str, str]]:
+    block_m = re.search(r"<exclusions>([\s\S]*?)</exclusions>", dep_block)
+    if not block_m:
+        return []
+    found: List[Tuple[str, str]] = []
+    for ex_m in re.finditer(r"<exclusion>([\s\S]*?)</exclusion>", block_m.group(1)):
+        ex = ex_m.group(1)
+        gid = _extract_tag(ex, "groupId")
+        aid = _extract_tag(ex, "artifactId")
+        if not gid or not aid:
+            continue
+        group_id = _interpolate_pom_props(gid.strip(), props) or ""
+        artifact_id = _interpolate_pom_props(aid.strip(), props) or ""
+        if not group_id or not artifact_id:
+            continue
+        if "${" in group_id or "${" in artifact_id:
+            continue
+        found.append((group_id, artifact_id))
+    return found
+
+
+def _pom_ga_excluded(ga: Tuple[str, str], exclusions) -> bool:
+    """True when any stored exclusion matches ``ga``. ``*`` matches that field."""
+    group_id, artifact_id = ga
+    for pattern_group, pattern_artifact in exclusions:
+        group_match = pattern_group == "*" or pattern_group == group_id
+        artifact_match = pattern_artifact == "*" or pattern_artifact == artifact_id
+        if group_match and artifact_match:
+            return True
+    return False
+
+
+def _parse_direct_pom_dependencies(
+    pom_xml: str, props: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Compile and runtime dependencies in document order.
+
+    Empty scope is compile. ``test``, ``provided``, ``system``, and ``import``
+    are dropped. The version is interpolated and may still be empty, a range,
+    or an unresolved ``${}``.
+    """
+    xml = _pom_dependency_xml(pom_xml)
+    results: List[Dict[str, Any]] = []
+    for deps_m in re.finditer(r"<dependencies>([\s\S]*?)</dependencies>", xml):
+        for dep_m in re.finditer(r"<dependency>([\s\S]*?)</dependency>", deps_m.group(1)):
+            block = dep_m.group(1)
+            gid_raw = _extract_tag(block, "groupId")
+            aid_raw = _extract_tag(block, "artifactId")
+            if not gid_raw or not aid_raw:
+                continue
+            group_id = _interpolate_pom_props(gid_raw.strip(), props) or ""
+            artifact_id = _interpolate_pom_props(aid_raw.strip(), props) or ""
+            if not group_id or not artifact_id:
+                continue
+            scope_raw = _extract_tag(block, "scope")
+            scope = _interpolate_pom_props(scope_raw.strip(), props) if scope_raw else "compile"
+            scope = (scope or "compile").strip().lower()
+            if scope not in _POM_KEPT_SCOPES:
+                continue
+            if "${" in group_id or "${" in artifact_id or "${" in scope:
+                results.append({
+                    "groupId": group_id,
+                    "artifactId": artifact_id,
+                    "version": None,
+                    "optional": False,
+                    "exclusions": [],
+                    "skip": "unresolved property in coordinate",
+                })
+                continue
+            ver_raw = _extract_tag(block, "version")
+            version = _interpolate_pom_props(ver_raw.strip(), props) if ver_raw else None
+            opt_raw = _extract_tag(block, "optional")
+            optional = bool(opt_raw and opt_raw.strip().lower() == "true")
+            results.append({
+                "groupId": group_id,
+                "artifactId": artifact_id,
+                "version": version,
+                "optional": optional,
+                "exclusions": _pom_exclusions(block, props),
+                "skip": None,
+            })
+    return results
+
+
+def _resolve_declared_version(
+    declared: Optional[str],
+    managed: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Explicit concrete version wins. Empty or ``${}`` falls through to management.
+
+    A Maven range is not resolved and is not replaced by management.
+    """
+
+    def reason(version: Optional[str]) -> str:
+        if version and any(ch in _POM_RANGE_CHARS for ch in version):
+            return "version range is not resolved"
+        if version and "${" in version:
+            return "unresolved property in version"
+        return "version not specified"
+
+    if declared and any(ch in _POM_RANGE_CHARS for ch in declared):
+        return None, reason(declared)
+    if declared and "${" not in declared:
+        return declared, None
+    managed_concrete = None
+    if (
+        managed
+        and "${" not in managed
+        and not any(ch in _POM_RANGE_CHARS for ch in managed)
+    ):
+        managed_concrete = managed
+    if managed_concrete and (not declared or "${" in declared):
+        return managed_concrete, None
+    if declared and "${" in declared and not managed_concrete:
+        return None, reason(declared if not managed else managed or declared)
+    if managed and not managed_concrete:
+        return None, reason(managed)
+    return None, reason(declared)
+
+
+def _managed_version_map(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+    reader: Callable[..., Optional[str]],
+    depth: int = 0,
+    seen: Optional[Set[str]] = None,
+    props: Optional[Dict[str, str]] = None,
+) -> Dict[Tuple[str, str], str]:
+    """Effective dependencyManagement for one POM. Child wins over parent.
+
+    Import BOMs stay inside ``expand_bom`` (first-wins). Parent management is
+    the fallback for versions this POM does not set. ``props``, when passed,
+    is the map already collected for this POM so ``expand_bom`` does not walk
+    the same parent again. The recursive parent call collects its own.
+    """
+    if seen is None:
+        seen = set()
+    key = f"{group_id}:{artifact_id}:{version}"
+    if depth > MAX_BOM_DEPTH or key in seen:
+        return {}
+    seen.add(key)
+    pom = reader(group_id, artifact_id, version, ctx)
+    # "" is a readable empty file (a cache hit). Only a real miss is None.
+    if pom is None:
+        return {}
+    out: Dict[Tuple[str, str], str] = {}
+    local: Dict[str, str] = {}
+    local.update(_pom_project_property_defaults(pom, version))
+    local.update(_parse_pom_properties(pom))
+    if depth < MAX_BOM_DEPTH:
+        parent_gav = _resolved_parent_gav(pom, local)
+        if parent_gav:
+            out.update(
+                _managed_version_map(
+                    parent_gav[0],
+                    parent_gav[1],
+                    parent_gav[2],
+                    ctx,
+                    reader,
+                    depth + 1,
+                    seen,
+                )
+            )
+    if props is None:
+        props = _collect_bom_properties(
+            pom, version, ctx, depth, _pom_reader=reader,
+        )
+    for item in expand_bom(
+        group_id,
+        artifact_id,
+        version,
+        ctx,
+        _depth=depth,
+        _pom_reader=reader,
+        _version_fallback=out,
+        _props=props,
+    ):
+        out[(item["groupId"], item["artifactId"])] = item["version"]
+    return out
+
+
+def _empty_pom_graph() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "nodes": [],
+        "edges": [],
+        "partial": True,
+        "truncated": False,
+        "error": None,
+        "nodeErrors": [],
+    }
+
+
+def resolve_pom_graph(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+) -> Dict[str, Any]:
+    """Transitive graph of one Maven GAV from published POMs.
+
+    Documented subset, not a full Maven resolver: compile and runtime scopes,
+    parent and import-BOM ``dependencyManagement``, exclusions, optional edges
+    that are not walked, and BFS nearest-wins. Version ranges, profiles, and
+    classifiers are out of scope. Never raises. ``error`` never contains
+    exception text or URL userinfo.
+    """
+    try:
+        return _resolve_pom_graph_impl(group_id, artifact_id, version, ctx)
+    except Exception as exc:
+        out = _empty_pom_graph()
+        out["error"] = type(exc).__name__
+        return out
+
+
+def _resolve_pom_graph_impl(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+) -> Dict[str, Any]:
+    cache: Dict[Tuple[str, str, str], Optional[str]] = {}
+
+    def reader(g: str, a: str, v: str, c: "ResolutionContext") -> Optional[str]:
+        key = (g, a, v)
+        if key not in cache:
+            cache[key] = locate_pom(g, a, v, c)
+        return cache[key]
+
+    root_pom = reader(group_id, artifact_id, version, ctx)
+    if root_pom is None:
+        err, cap = _pom_absence_reason(ctx, group_id, artifact_id, version)
+        out = _empty_pom_graph()
+        out["error"] = err
+        if cap:
+            out["capabilityUnavailable"] = cap
+        return out
+
+    partial = False
+    truncated = False
+    capability: Optional[str] = None
+    skipped: List[Dict[str, Any]] = []
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    ga_index: Dict[Tuple[str, str], int] = {}
+    managed_cache: Dict[Tuple[str, str, str], Dict[Tuple[str, str], str]] = {}
+
+    def note_capability(cap: Optional[str]) -> None:
+        nonlocal capability
+        if cap and capability is None:
+            capability = cap
+
+    def load_pom(node: Dict[str, Any]) -> Optional[str]:
+        nonlocal partial
+        if node.get("_loaded"):
+            return node.get("_pom")
+        pom = reader(node["groupId"], node["artifactId"], node["version"], ctx)
+        node["_loaded"] = True
+        node["_pom"] = pom
+        if pom is None:
+            # The declaring POM already named this GAV, so the node stays.
+            # Children are not walked, and the miss does not fail the graph.
+            err, cap = _pom_absence_reason(
+                ctx, node["groupId"], node["artifactId"], node["version"]
+            )
+            node["errors"].append(err)
+            node["pomLicenses"] = []
+            partial = True
+            note_capability(cap)
+            return None
+        node["pomLicenses"] = _license_strings_from_pom(pom)
+        return pom
+
+    def managed_for(
+        node: Dict[str, Any], props: Dict[str, str]
+    ) -> Dict[Tuple[str, str], str]:
+        key = (node["groupId"], node["artifactId"], node["version"])
+        if key not in managed_cache:
+            managed_cache[key] = _managed_version_map(
+                node["groupId"],
+                node["artifactId"],
+                node["version"],
+                ctx,
+                reader,
+                props=props,
+            )
+        return managed_cache[key]
+
+    root: Dict[str, Any] = {
+        "groupId": group_id,
+        "artifactId": artifact_id,
+        "version": version,
+        "relation": "SELF",
+        "errors": [],
+        "pomLicenses": [],
+        "exclusions": set(),
+        "walk": True,
+        "depth": 0,
+        "_loaded": True,
+        "_pom": root_pom,
+    }
+    root["pomLicenses"] = _license_strings_from_pom(root_pom)
+    nodes.append(root)
+    ga_index[(group_id, artifact_id)] = 0
+
+    def exclusion_set(intros: List[Dict[str, Any]]) -> set:
+        # A required introduction walks the node. Optional edges are not part
+        # of that intersection: an empty optional set must not clear an
+        # exclusion on a required edge. All-optional keeps the old intersection.
+        required = [dep for dep in intros if not dep["optional"]]
+        pool = required or intros
+        return set.intersection(*(set(dep["exclusions"]) for dep in pool))
+
+    def group_declared(
+        declared: List[Dict[str, Any]],
+    ) -> Tuple[Dict[Tuple[str, str], List[Dict[str, Any]]], List[Tuple[str, str]]]:
+        groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        order: List[Tuple[str, str]] = []
+        for dep in declared:
+            ga = (dep["groupId"], dep["artifactId"])
+            if ga not in groups:
+                groups[ga] = []
+                order.append(ga)
+            groups[ga].append(dep)
+        return groups, order
+
+    expanded_nodes: set = set()
+
+    def collect_from(index: int, declared: List[Dict[str, Any]]) -> None:
+        nonlocal partial
+        if index in expanded_nodes:
+            return
+        node = nodes[index]
+        if not node.get("walk"):
+            return
+        expanded_nodes.add(index)
+        pom = node.get("_pom")
+        if not pom:
+            return
+        props = _collect_bom_properties(
+            pom, node["version"], ctx, _pom_reader=reader
+        )
+        managed = managed_for(node, props)
+        for dep in _parse_direct_pom_dependencies(pom, props):
+            ga = (dep["groupId"], dep["artifactId"])
+            if dep.get("skip"):
+                partial = True
+                skipped.append({
+                    "groupId": dep["groupId"],
+                    "artifactId": dep["artifactId"],
+                    "version": dep.get("version") or "",
+                    "errors": [dep["skip"]],
+                })
+                continue
+            if _pom_ga_excluded(ga, node["exclusions"]):
+                continue
+            resolved, reason = _resolve_declared_version(
+                dep.get("version"), managed.get(ga)
+            )
+            if reason or not resolved:
+                partial = True
+                skipped.append({
+                    "groupId": dep["groupId"],
+                    "artifactId": dep["artifactId"],
+                    "version": dep.get("version") or "",
+                    "errors": [reason or "version not specified"],
+                })
+                continue
+            child_excl = set(node["exclusions"])
+            child_excl.update(dep.get("exclusions") or [])
+            declared.append({
+                "parent": index,
+                "groupId": dep["groupId"],
+                "artifactId": dep["artifactId"],
+                "version": resolved,
+                "optional": bool(dep.get("optional")),
+                "exclusions": child_excl,
+            })
+
+    def schedule(depth: int, index: int, pending: Dict[int, List[int]]) -> None:
+        if index in expanded_nodes:
+            return
+        bucket = pending.setdefault(depth, [])
+        if index not in bucket:
+            bucket.append(index)
+
+    pending: Dict[int, List[int]] = {0: [0]}
+    # New GAs held back while a shallower optional node is still unexpanded.
+    # Creating them in the same pass lets the farther version occupy ga_index.
+    deferred: List[Tuple[int, List[Dict[str, Any]]]] = []
+
+    def promote_same_depth(depth: int, declared: List[Dict[str, Any]]) -> None:
+        # A required edge to an optional node at this same depth walks that
+        # node now. Its children join this depth's introductions and are not
+        # pushed onto the next depth.
+        progressed = True
+        while progressed:
+            progressed = False
+            groups, _order = group_declared(declared)
+            for ga, intros in groups.items():
+                if ga not in ga_index:
+                    continue
+                winner = ga_index[ga]
+                if winner in expanded_nodes:
+                    continue
+                winner_node = nodes[winner]
+                if winner_node["depth"] != depth or winner_node["errors"]:
+                    continue
+                if winner_node["walk"]:
+                    continue
+                if not any(not dep["optional"] for dep in intros):
+                    continue
+                winner_node["exclusions"] = exclusion_set(intros)
+                winner_node["walk"] = True
+                collect_from(winner, declared)
+                progressed = True
+                break
+
+    def mediate(
+        depth: int, declared: List[Dict[str, Any]], defer_new: bool
+    ) -> List[Dict[str, Any]]:
+        nonlocal partial, truncated
+        fresh: List[Dict[str, Any]] = []
+        groups, order = group_declared(declared)
+        for ga in order:
+            intros = groups[ga]
+            if ga in ga_index:
+                winner = ga_index[ga]
+                winner_node = nodes[winner]
+                for dep in intros:
+                    edges.append({
+                        "from": dep["parent"],
+                        "to": winner,
+                        "requirement": winner_node["version"],
+                    })
+                # Shallower than this frontier: expand it at its own depth so
+                # its children are mediated there, not with this frontier's
+                # children. Same-depth promotions were expanded above.
+                if (
+                    not winner_node["walk"]
+                    and not winner_node["errors"]
+                    and any(not dep["optional"] for dep in intros)
+                ):
+                    winner_node["exclusions"] = exclusion_set(intros)
+                    winner_node["walk"] = True
+                    schedule(winner_node["depth"], winner, pending)
+                continue
+            if defer_new:
+                fresh.extend(intros)
+                continue
+            if len(nodes) >= MAX_TRANSITIVE_GRAPH_NODES:
+                truncated = True
+                partial = True
+                continue
+            winner_version = intros[0]["version"]
+            for dep in intros[1:]:
+                if compare_versions(dep["version"], winner_version) > 0:
+                    winner_version = dep["version"]
+            walk = any(not dep["optional"] for dep in intros)
+            parent_rel = nodes[intros[0]["parent"]]["relation"]
+            node = {
+                "groupId": ga[0],
+                "artifactId": ga[1],
+                "version": winner_version,
+                "relation": "DIRECT" if parent_rel == "SELF" else "INDIRECT",
+                "errors": [],
+                "pomLicenses": [],
+                "exclusions": exclusion_set(intros),
+                "walk": walk,
+                "depth": depth + 1,
+                "_loaded": False,
+                "_pom": None,
+            }
+            load_pom(node)
+            if node["errors"]:
+                node["walk"] = False
+            nodes.append(node)
+            new_index = len(nodes) - 1
+            ga_index[ga] = new_index
+            for dep in intros:
+                edges.append({
+                    "from": dep["parent"],
+                    "to": new_index,
+                    "requirement": winner_version,
+                })
+            if node["walk"]:
+                schedule(depth + 1, new_index, pending)
+        return fresh
+
+    while pending or deferred:
+        # Apply a held frontier only once every still-pending bucket is at
+        # least as deep, so the shallower node's children occupy ga_index first.
+        if deferred and (
+            not pending or min(pending) >= min(item[0] for item in deferred)
+        ):
+            pick = min(range(len(deferred)), key=lambda i: deferred[i][0])
+            depth, declared = deferred.pop(pick)
+            # Uncollected nodes at this depth introduce children in the same
+            # BFS layer. One mediation has to see both sides before a GA is
+            # recorded; otherwise the held version sticks and the other POM
+            # is never read.
+            for index in pending.pop(depth, []):
+                collect_from(index, declared)
+        else:
+            depth = min(pending)
+            batch = pending.pop(depth)
+            declared = []
+            for index in batch:
+                collect_from(index, declared)
+        promote_same_depth(depth, declared)
+        groups, order = group_declared(declared)
+        defer_new = False
+        for ga in order:
+            if ga not in ga_index:
+                continue
+            winner = ga_index[ga]
+            winner_node = nodes[winner]
+            if (
+                winner_node["depth"] < depth
+                and winner not in expanded_nodes
+                and not winner_node["walk"]
+                and not winner_node["errors"]
+                and any(not dep["optional"] for dep in groups[ga])
+            ):
+                defer_new = True
+                break
+        held = mediate(depth, declared, defer_new)
+        if defer_new and held:
+            deferred.append((depth, held))
+
+    public_nodes = []
+    for node in nodes:
+        public_nodes.append({
+            "groupId": node["groupId"],
+            "artifactId": node["artifactId"],
+            "version": node["version"],
+            "relation": node["relation"],
+            "errors": list(node["errors"]),
+            "pomLicenses": list(node.get("pomLicenses") or []),
+        })
+    out = {
+        "ok": True,
+        "nodes": public_nodes,
+        "edges": edges,
+        "partial": partial,
+        "truncated": truncated,
+        "error": None,
+        "nodeErrors": skipped,
+    }
+    return _with_capability(out, capability)
 
 
 def apply_bom_managed_versions(scan: Dict, ctx: "ResolutionContext") -> Dict:
@@ -2953,9 +3714,16 @@ def get_transitive_graph(
     group_id: str,
     artifact_id: str,
     version: str,
+    ctx: Optional["ResolutionContext"] = None,
 ) -> Dict[str, Any]:
-    """Resolved transitive graph for one GAV via deps.dev (#287)."""
-    fetched = fetch_depsdev_dependencies(group_id, artifact_id, version)
+    """Resolved transitive graph for one GAV from published POMs.
+
+    ``projectPath`` on ``ctx`` selects repositories for ``fetch_pom``. It does
+    not launch Gradle. A direct call with no context uses the working directory.
+    """
+    if ctx is None:
+        ctx = build_resolution_context({})
+    fetched = resolve_pom_graph(group_id, artifact_id, version, ctx)
     result: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -2971,21 +3739,19 @@ def get_transitive_graph(
         "partial": fetched["partial"],
         "truncated": fetched["truncated"],
     }
-    if fetched.get("graphError"):
-        result["graphError"] = fetched["graphError"]
     if fetched.get("capabilityUnavailable"):
         result["capabilityUnavailable"] = fetched["capabilityUnavailable"]
     if not fetched["ok"]:
         result["partial"] = True
-        result["error"] = fetched.get("error") or "deps.dev unavailable"
-        # Surface node-level errors when present even on ok path above; here
-        # the graph is empty.
+        result["error"] = fetched.get("error") or "POM graph unavailable"
     else:
-        # Attach per-node errors only when any exist (keep happy-path lean).
         node_errors = []
         for i, n in enumerate(fetched["nodes"]):
             if n.get("errors"):
                 node_errors.append({"index": i, "errors": n["errors"]})
+        for item in fetched.get("nodeErrors") or []:
+            if isinstance(item, dict) and "index" not in item:
+                node_errors.append(item)
         if node_errors:
             result["nodeErrors"] = node_errors[:MAX_DEPSDEV_ERRORS_REPORTED]
     return result
@@ -3034,27 +3800,31 @@ def _reconstruct_path(
     return path
 
 
-def get_vulnerability_paths(group_id: str, artifact_id: str, version: str) -> Dict[str, Any]:
+def get_vulnerability_paths(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: Optional["ResolutionContext"] = None,
+) -> Dict[str, Any]:
     """Dependency path from a project root GAV to each vulnerable transitive node (#413).
 
-    Fetches the deps.dev transitive graph ONCE via ``fetch_depsdev_dependencies``
-    — the same cached call ``get_transitive_graph`` wraps, called directly here
-    rather than through that wrapper because the wrapper's trimmed node shape
-    drops the ``relation`` field this needs to locate the root — dedupes nodes
-    by ``groupId:artifactId:version``, batches every unique GAV through
-    ``query_osv_batch`` ONCE, then BFS's from the root over the ``edges``
-    index-pairs to find the SHORTEST path to every node with >=1 known
-    vulnerability.
+    Fetches the POM transitive graph ONCE via ``resolve_pom_graph`` — called
+    directly rather than through ``get_transitive_graph`` because that
+    wrapper's trimmed node shape drops the ``relation`` field this needs to
+    locate the root — dedupes nodes by ``groupId:artifactId:version``, batches
+    every unique GAV through ``query_osv_batch`` ONCE, then BFS's from the
+    root over the ``edges`` index-pairs to find the SHORTEST path to every
+    node with >=1 known vulnerability.
 
-    Root identification: the node whose ``relation`` is ``SELF``. deps.dev
-    sometimes leaves ``relation`` empty on an untagged first node (the same
-    quirk ``check_license_compliance`` documents and falls back on), so an
-    unmatched relation falls back to node 0.
+    Root identification: the node whose ``relation`` is ``SELF``. An empty
+    relation falls back to node 0.
 
-    Never raises for network/HTTP/parse failures — degrades like the
-    underlying graph/OSV calls (``partial`` / ``capabilityUnavailable``).
+    Never raises for a missing POM or an OSV failure — degrades like the
+    underlying calls (``partial`` / ``capabilityUnavailable``).
     """
-    fetched = fetch_depsdev_dependencies(group_id, artifact_id, version)
+    if ctx is None:
+        ctx = build_resolution_context({})
+    fetched = resolve_pom_graph(group_id, artifact_id, version, ctx)
     result: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -3065,11 +3835,9 @@ def get_vulnerability_paths(group_id: str, artifact_id: str, version: str) -> Di
     }
     if fetched.get("capabilityUnavailable"):
         result["capabilityUnavailable"] = fetched["capabilityUnavailable"]
-    if fetched.get("graphError"):
-        result["graphError"] = fetched["graphError"]
     if not fetched.get("ok"):
         result["partial"] = True
-        result["error"] = fetched.get("error") or "deps.dev unavailable"
+        result["error"] = fetched.get("error") or "POM graph unavailable"
         return result
 
     nodes = fetched.get("nodes") or []
@@ -3389,7 +4157,7 @@ def _closure_paths(
     fallback root, but only through nodes that have a usage in that same
     module and configuration. A shared GAV must not carry the walk into
     another configuration. ``sideEffect`` is omitted when ``project_graph``
-    is false (deps.dev has no cross-tree effects).
+    is false (a single-root POM graph has no cross-tree effects).
     """
     nodes = list(graph.get("nodes") or [])
     edges = list(graph.get("edges") or [])
@@ -4383,7 +5151,7 @@ def _advisory_for_upgrade(
     return result
 
 
-# auto resolves to gradle when gradlew exists, else one deps.dev upgrade.
+# auto resolves to gradle when gradlew exists, else one POM-graph upgrade.
 # Coordinates are checked after selection and before any resolve.
 _UPGRADE_GA_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _UPGRADE_VERSION_RE = re.compile(r"^[A-Za-z0-9_.+\-]+$")
@@ -4409,17 +5177,17 @@ _GRADLE_UPGRADE_REQUEST = "===MAVEN_MCP_REQUEST==="
 
 
 def _select_upgrade_graph_source(args: Dict, project_path: str) -> str:
-    """Pick ``gradle`` or ``depsdev`` before any resolve.
+    """Pick ``gradle`` or ``pom`` before any resolve.
 
     ``auto`` (the default) is Gradle only when the project is a Gradle build
-    and a wrapper exists. A Gradle file without ``gradlew`` still falls
-    through to deps.dev. Nothing here retries a failed Gradle run as deps.dev.
+    and a wrapper exists. A Gradle file without ``gradlew`` uses the POM
+    graph. A failed Gradle run is not replaced with a POM graph.
     """
     requested = args.get("graphSource") or "auto"
-    if requested not in ("auto", "depsdev", "gradle"):
-        raise ValueError("graphSource must be auto, depsdev, or gradle")
-    if requested == "depsdev":
-        return "depsdev"
+    if requested not in ("auto", "pom", "gradle"):
+        raise ValueError("graphSource must be auto, pom, or gradle")
+    if requested == "pom":
+        return "pom"
     if requested == "gradle":
         return "gradle"
     # auto: one filesystem check, not one per coordinate.
@@ -4428,7 +5196,7 @@ def _select_upgrade_graph_source(args: Dict, project_path: str) -> str:
         and _find_gradle_wrapper(project_path)
     ):
         return "gradle"
-    return "depsdev"
+    return "pom"
 
 
 def _upgrade_project_path(args: Dict) -> str:
@@ -4439,7 +5207,7 @@ def _upgrade_project_path(args: Dict) -> str:
 
 
 def _upgrade_substitution(args: Dict) -> str:
-    """``exact`` or ``module``. Ignored by the deps.dev fetcher, still validated."""
+    """``exact`` or ``module``. Ignored on the POM graph, still validated."""
     raw = args.get("substitution", "exact")
     if raw is None:
         return "exact"
@@ -4507,29 +5275,45 @@ def _license_note(prefix: str) -> str:
     return prefix
 
 
-def _depsdev_closure_notes(include_licenses: bool) -> List[str]:
-    """Isolation paragraph, plus license caveats when that fetch is in scope."""
+def _pom_closure_notes(include_licenses: bool) -> List[str]:
+    """Isolation paragraph, plus POM-license caveats when that fetch is in scope."""
     notes = [_license_note("Graphs are resolved per root in isolation")]
     if include_licenses:
-        notes.extend(_shared_license_notes())
+        notes.extend([
+            _license_note("License data comes from the artifact POM"),
+            _license_note("Verdicts are heuristic"),
+            _license_note("A POM license name is normalized"),
+            _UPGRADE_CHANGED_ONLY_LICENSE_NOTE,
+        ])
     return notes
 
 
-def _shared_license_notes() -> List[str]:
-    """Heuristic, SPDX, and changed-only sentences used by both graph sources."""
-    return [
-        _license_note("License data comes from deps.dev"),
-        _license_note("Verdicts are heuristic"),
-        _license_note("deps.dev may return SPDX"),
-        _UPGRADE_CHANGED_ONLY_LICENSE_NOTE,
-    ]
-
-
 def _gradle_closure_notes(include_licenses: bool) -> List[str]:
-    """Gradle classpath notes. The deps.dev isolation paragraph does not apply."""
+    """Gradle classpath notes. License rows still come from deps.dev GetVersion.
+
+    The POM isolation paragraph does not apply: this path is a project resolve.
+    These sentences are hardcoded so a POM-worded compliance note cannot be
+    selected by a shared prefix.
+    """
     if not include_licenses:
         return []
-    return _shared_license_notes() + [_GRADLE_LICENSE_METADATA_NOTE]
+    return [
+        (
+            "License data comes from deps.dev GetVersion (package metadata SPDX "
+            "expressions), not from a full legal review of license text."
+        ),
+        (
+            "Verdicts are heuristic policy signals, not legal advice. Independently "
+            "verify licenses before redistributing."
+        ),
+        (
+            "deps.dev may return SPDX expressions (e.g. Apache-2.0 OR MIT) or "
+            "'non-standard'; expression operators beyond a single id are treated "
+            "conservatively (review when not an exact known SPDX id)."
+        ),
+        _UPGRADE_CHANGED_ONLY_LICENSE_NOTE,
+        _GRADLE_LICENSE_METADATA_NOTE,
+    ]
 
 
 def _log_upgrade_closure(
@@ -4653,22 +5437,24 @@ def _node_errors_from_depsdev(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any
     return out
 
 
-def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy a GetDependencies payload onto the shared side shape.
+def _side_from_pom_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a POM-graph payload onto the shared side shape.
 
-    ``ok`` stays true when the graph is truncated or carries ``graphError``;
-    those bits only clear ``diffReliable``. A capability flag is a hard failure.
+    ``ok`` stays true when the graph is truncated or a node has errors; those
+    bits only clear ``diffReliable``. A capability flag is a hard failure.
+    Skipped declarations (ranges, unresolved properties) are node errors too,
+    so a diff that dropped an edge is not reported as reliable. ``trees`` keep
+    the raw nodes, including ``pomLicenses``.
     """
     raw_cap = fetched.get("capabilityUnavailable")
     capability = raw_cap if isinstance(raw_cap, str) and raw_cap else None
     ok = bool(fetched.get("ok")) and capability is None
     truncated = bool(fetched.get("truncated"))
-    raw_graph_error = fetched.get("graphError")
-    graph_error = raw_graph_error.strip() if isinstance(raw_graph_error, str) else None
-    if graph_error == "":
-        graph_error = None
     nodes = [node for node in (fetched.get("nodes") or []) if isinstance(node, dict)]
-    node_errors = _node_errors_from_depsdev(nodes)
+    declared = [
+        item for item in (fetched.get("nodeErrors") or []) if isinstance(item, dict)
+    ]
+    node_errors = _node_errors_from_depsdev(nodes + declared)
     trees: List[Dict[str, Any]] = []
     graph: Dict[str, Any] = {"nodes": [], "edges": []}
     if ok:
@@ -4681,13 +5467,12 @@ def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
     raw_error = fetched.get("error")
     error = None
     if not ok:
-        error = raw_error if isinstance(raw_error, str) and raw_error else "deps.dev graph unavailable"
+        error = raw_error if isinstance(raw_error, str) and raw_error else "POM graph unavailable"
     return {
         "ok": ok,
         "truncated": truncated,
-        "diffReliable": ok and not truncated and graph_error is None and not node_errors,
+        "diffReliable": ok and not truncated and not node_errors,
         "error": error,
-        "graphError": graph_error,
         "nodeErrors": node_errors,
         "capabilityUnavailable": capability,
         "exitCode": None,
@@ -4696,26 +5481,26 @@ def _side_from_depsdev_graph(fetched: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _fetch_depsdev_closure_sides(
+def _fetch_pom_closure_sides(
     upgrade: Dict[str, str],
+    ctx: "ResolutionContext",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     versions = [upgrade["fromVersion"], upgrade["toVersion"]]
 
     def fetch(version: str) -> Dict[str, Any]:
         try:
-            return fetch_depsdev_dependencies(
-                upgrade["groupId"], upgrade["artifactId"], version,
+            return resolve_pom_graph(
+                upgrade["groupId"], upgrade["artifactId"], version, ctx,
             )
         except Exception:
             # Do not interpolate exception text: urlopen errors can embed userinfo.
             return {
                 "ok": False,
-                "error": "deps.dev graph fetch failed",
+                "error": "POM graph fetch failed",
                 "capabilityUnavailable": "unreachable",
                 "nodes": [],
                 "edges": [],
                 "truncated": False,
-                "graphError": None,
                 "partial": True,
             }
 
@@ -4725,14 +5510,13 @@ def _fetch_depsdev_closure_sides(
         if not isinstance(row, dict):
             row = {
                 "ok": False,
-                "error": "deps.dev graph fetch did not finish before the deadline",
+                "error": "POM graph fetch did not finish before the deadline",
                 "capabilityUnavailable": "unreachable",
                 "nodes": [],
                 "edges": [],
                 "truncated": False,
-                "graphError": None,
             }
-        sides.append(_side_from_depsdev_graph(row))
+        sides.append(_side_from_pom_graph(row))
     return sides[0], sides[1]
 
 
@@ -4745,7 +5529,7 @@ def _license_row_for_gav(gav: Dict[str, str], row: Optional[Dict[str, Any]]) -> 
         "licenses": [],
     }
     if row is None:
-        base["error"] = "deps.dev license fetch did not finish before the deadline"
+        base["error"] = "license fetch did not finish before the deadline"
         base["capabilityUnavailable"] = "unreachable"
         return base
     base["ok"] = bool(row.get("ok"))
@@ -4754,17 +5538,17 @@ def _license_row_for_gav(gav: Dict[str, str], row: Optional[Dict[str, Any]]) -> 
         base["status"] = row["status"]
     raw_error = row.get("error")
     if raw_error:
-        base["error"] = raw_error if isinstance(raw_error, str) else "deps.dev license fetch failed"
+        base["error"] = raw_error if isinstance(raw_error, str) else "license fetch failed"
     if row.get("capabilityUnavailable"):
         base["capabilityUnavailable"] = row["capabilityUnavailable"]
     elif not base["ok"] and row.get("status") != 404:
-        # 404 is a missing deps.dev record. 5xx, bad JSON, and a deadline
-        # miss are a coverage gap the ranker already treats as review.
+        # 404 is a missing record. 5xx, bad JSON, and a deadline miss are a
+        # coverage gap the ranker already treats as review.
         base["capabilityUnavailable"] = "unreachable"
     return base
 
 
-def _fetch_one_upgrade_license(gav: Dict[str, str]) -> Dict[str, Any]:
+def _fetch_one_depsdev_license(gav: Dict[str, str]) -> Dict[str, Any]:
     try:
         row = fetch_depsdev_licenses(gav["groupId"], gav["artifactId"], gav["version"])
     except Exception:
@@ -4777,14 +5561,84 @@ def _fetch_one_upgrade_license(gav: Dict[str, str]) -> Dict[str, Any]:
     return _license_row_for_gav(gav, row if isinstance(row, dict) else None)
 
 
-def _fetch_upgrade_license_delta(
+def _pom_upgrade_license_delta(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
     diff: Dict[str, Any],
     upgrades: List[Dict[str, str]],
     *,
     project_license: Optional[str],
     disallow: Optional[List[str]],
 ) -> Optional[Dict[str, Any]]:
-    """GetVersion for the closure delta only. One GAV skips ``_map_parallel``."""
+    """License the POM closure delta from ``pomLicenses`` already on the nodes.
+
+    ``trees`` still hold the ``resolve_pom_graph`` nodes. No second POM read
+    and no ``_map_parallel``. A GAV missing from both graphs is a 404 review.
+    """
+    selected = _select_delta_gavs(
+        upgrades,
+        diff,
+        include_targets=False,
+        cap=MAX_UPGRADE_LICENSE_NODES,
+    )
+    gavs = selected["gavs"]
+    if not gavs:
+        return None
+    index: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for side in (before, after):
+        for tree in side.get("trees") or []:
+            for node in tree.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                group_id = node.get("groupId") or ""
+                artifact_id = node.get("artifactId") or ""
+                version = node.get("version") or ""
+                if not group_id or not artifact_id or not version:
+                    continue
+                key = (group_id, artifact_id, version)
+                if key in index:
+                    continue
+                errors = [err for err in (node.get("errors") or []) if err]
+                row: Dict[str, Any] = {
+                    "ok": not errors,
+                    "licenses": list(node.get("pomLicenses") or []),
+                    "error": str(errors[0]) if errors else None,
+                    # 404 keeps a node error from looking like a transport failure.
+                    "status": 200 if not errors else 404,
+                }
+                index[key] = row
+    fetched: List[Dict[str, Any]] = []
+    for gav in gavs:
+        key = (gav["groupId"], gav["artifactId"], gav["version"])
+        row = index.get(key)
+        if row is None:
+            row = {
+                "ok": False,
+                "status": 404,
+                "licenses": [],
+                "error": "POM licenses were not on the graph node",
+            }
+        fetched.append(_license_row_for_gav(gav, row))
+    delta = _license_delta(
+        diff,
+        fetched,
+        project_license=project_license,
+        disallow=disallow,
+    )
+    if selected.get("truncated"):
+        delta["truncated"] = True
+    return delta
+
+
+def _fetch_upgrade_license_delta(
+    diff: Dict[str, Any],
+    upgrades: List[Dict[str, str]],
+    *,
+    project_license: Optional[str],
+    disallow: Optional[List[str]],
+    fetch_one: Callable[[Dict[str, str]], Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """License the closure delta only. One GAV skips ``_map_parallel``."""
     selected = _select_delta_gavs(
         upgrades,
         diff,
@@ -4795,11 +5649,11 @@ def _fetch_upgrade_license_delta(
     if not gavs:
         return None
     if len(gavs) == 1:
-        fetched = [_fetch_one_upgrade_license(gavs[0])]
+        fetched = [fetch_one(gavs[0])]
     else:
         rows, _partial = _map_parallel(
             gavs,
-            _fetch_one_upgrade_license,
+            fetch_one,
             deadline=_now() + TOOL_DEADLINE,
         )
         fetched = []
@@ -5494,15 +6348,15 @@ def _partition_upgrade_requests(
 def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
     """Compare a direct upgrade before and after the candidate version.
 
-    ``auto`` uses Gradle when a wrapper exists, otherwise one deps.dev pair.
-    A Gradle failure is not replaced with deps.dev. ``advisory`` is not a
+    ``auto`` uses Gradle when a wrapper exists, otherwise one POM-graph pair.
+    A Gradle failure is not replaced with a POM graph. ``advisory`` is not a
     safety verdict. ``get_transitive_graph`` is not used (it drops ``relation``).
     """
     project_path = _upgrade_project_path(args)
     graph_source = _select_upgrade_graph_source(args, project_path)
     upgrades = _parse_upgrade_requests(args.get("upgrades"))
-    if graph_source == "depsdev" and len(upgrades) != 1:
-        raise ValueError("deps.dev compares exactly one upgrade")
+    if graph_source == "pom" and len(upgrades) != 1:
+        raise ValueError("pom compares exactly one upgrade")
     substitution = _upgrade_substitution(args)
     upgrades_out, libraries = _partition_upgrade_requests(upgrades)
 
@@ -5530,6 +6384,7 @@ def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
     project_license, disallow = _upgrade_license_policy_args(args)
     launched_gradle = False
     requests: Optional[List[Dict[str, Any]]] = None
+    pom_ctx: Optional["ResolutionContext"] = None
     if graph_source == "gradle":
         fetched = _gradle_closure_trees(project_path, libraries, substitution)
         before = fetched["before"]
@@ -5537,7 +6392,8 @@ def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
         requests = list(fetched.get("requests") or [])
         launched_gradle = bool(fetched.get("launched"))
     else:
-        before, after = _fetch_depsdev_closure_sides(libraries[0])
+        pom_ctx = build_resolution_context({"projectPath": project_path})
+        before, after = _fetch_pom_closure_sides(libraries[0], pom_ctx)
 
     if not before["ok"] or not after["ok"]:
         ranked = _advisory_for_upgrade(
@@ -5578,16 +6434,27 @@ def compare_upgrade_closure(args: Dict) -> Dict[str, Any]:
     classified = _classify_vuln_delta(compared, diff, records)
     license_delta = None
     if include_licenses:
-        license_delta = _fetch_upgrade_license_delta(
-            diff,
-            compared,
-            project_license=project_license,
-            disallow=disallow,
-        )
+        if graph_source == "pom":
+            license_delta = _pom_upgrade_license_delta(
+                before,
+                after,
+                diff,
+                compared,
+                project_license=project_license,
+                disallow=disallow,
+            )
+        else:
+            license_delta = _fetch_upgrade_license_delta(
+                diff,
+                compared,
+                project_license=project_license,
+                disallow=disallow,
+                fetch_one=_fetch_one_depsdev_license,
+            )
     if graph_source == "gradle":
         notes = _gradle_closure_notes(include_licenses)
     else:
-        notes = _depsdev_closure_notes(include_licenses)
+        notes = _pom_closure_notes(include_licenses)
     if any(row.get("rewroteVersionless") for row in compared):
         notes = list(notes) + [_VERSIONLESS_ARM_NOTE]
     ranked = _advisory_for_upgrade(
@@ -5709,13 +6576,14 @@ def detect_dependency_conflicts(
 ) -> Dict[str, Any]:
     """Detect GAs resolved at ≥2 versions across direct deps' transitive graphs.
 
-    For each versioned direct dependency (capped at ``MAX_CONFLICT_SCAN_ROOTS``),
-    fetches the deps.dev graph and unions every ``g:a → {versions…}`` seen.
+    Gradle scans compare versions already on the resolved classpath. Maven
+    scans fetch a POM graph per versioned direct dependency (capped at
+    ``MAX_CONFLICT_SCAN_ROOTS``) and union every ``g:a → {versions…}`` seen.
     When a GA appears at multiple versions, reports the conflict with the
     version the active build system's mediation strategy would pick.
 
-    This is an approximation of a full project resolve: deps.dev resolves each
-    root in isolation (no project-wide dependencyManagement / resolutionStrategy
+    This is an approximation of a full project resolve: each POM graph is
+    rooted in isolation (no consumer dependencyManagement / resolutionStrategy
     / enforcedPlatform). Documented in ``notes``.
     """
     if ctx is None:
@@ -5766,6 +6634,7 @@ def detect_dependency_conflicts(
     errors: List[str] = []
     graphs_ok = 0
     graphs_failed = 0
+    graphs_incomplete = False
     capability: Optional[str] = None
 
     # #400: fetch every root's transitive graph in parallel (pure, independent
@@ -5776,8 +6645,8 @@ def detect_dependency_conflicts(
     # keeping it sequential is purely for a minimal/obviously-correct diff,
     # not a correctness requirement.
     def _fetch_conflict_root_graph(root: Dict[str, str]) -> Dict[str, Any]:
-        return fetch_depsdev_dependencies(
-            root["groupId"], root["artifactId"], root["version"]
+        return resolve_pom_graph(
+            root["groupId"], root["artifactId"], root["version"], ctx,
         )
 
     root_graphs, _partial = _map_parallel(
@@ -5794,8 +6663,19 @@ def detect_dependency_conflicts(
                 errors.append(f"{root_label}: {fetched.get('error') or 'unavailable'}")
             continue
         graphs_ok += 1
-        if fetched.get("graphError") and len(errors) < MAX_DEPSDEV_ERRORS_REPORTED:
-            errors.append(f"{root_label}: graph error: {fetched['graphError']}")
+        node_errors = fetched.get("nodeErrors") or []
+        has_node_errors = isinstance(node_errors, list) and bool(node_errors)
+        if fetched.get("partial") or fetched.get("truncated") or has_node_errors:
+            graphs_incomplete = True
+            if len(errors) < MAX_DEPSDEV_ERRORS_REPORTED:
+                reasons: List[str] = []
+                if fetched.get("truncated"):
+                    reasons.append("truncated")
+                if has_node_errors:
+                    reasons.append("skipped declaration")
+                if fetched.get("partial") and not reasons:
+                    reasons.append("partial")
+                errors.append(f"{root_label}: {', '.join(reasons)}")
 
         depths = _edge_depth_map(fetched["edges"], 0)
         for idx, node in enumerate(fetched["nodes"]):
@@ -5852,13 +6732,13 @@ def detect_dependency_conflicts(
     )
 
     notes = [
-        "Conflict detection unions deps.dev graphs for each direct dependency "
+        "Conflict detection unions POM graphs for each direct dependency "
         + "resolved in isolation — not a full project-wide Maven/Gradle resolve.",
         "Maven nearest-wins uses BFS depth from each direct root; declaration-"
         + "order tie-breaks inside the same depth are approximated by highest version.",
         "Gradle highest-wins ignores project ResolutionStrategy / strict versions / "
         + "enforcedPlatform overrides.",
-        "Private/unpublished coordinates and deps.dev coverage gaps degrade per-root "
+        "Private/unpublished coordinates and missing POMs degrade per-root "
         + "(see errors[]); remaining roots still contribute.",
     ]
     if truncated_roots:
@@ -5874,7 +6754,9 @@ def detect_dependency_conflicts(
         "scannedRoots": len(unique_roots),
         "graphsFetched": graphs_ok,
         "graphsFailed": graphs_failed,
-        "partial": bool(truncated_roots or graphs_failed or errors),
+        "partial": bool(
+            truncated_roots or graphs_failed or graphs_incomplete or errors
+        ),
         "errors": errors,
         "notes": notes,
     }
@@ -6941,26 +7823,26 @@ _LICENSE_CATEGORY_TOKENS = frozenset({
 
 _LICENSE_COMPLIANCE_NOTES = [
     (
-        "License data comes from deps.dev GetVersion (package metadata SPDX "
-        "expressions), not from a full legal review of license text."
+        "License data comes from the artifact POM (name or URL, normalized "
+        "to an SPDX id when the name is known), not from a full legal review "
+        "of license text."
     ),
     (
-        "GetDependencies does not include licenses; each unique GAV in the "
-        "resolved graph requires a separate GetVersion call (cached, capped)."
+        "Licenses are read from the same POM that supplied the graph node. "
+        "A missing or empty license list is review, not a known-clean license."
     ),
     (
-        "Graphs are resolved per root in isolation via deps.dev — not a full "
-        "Maven/Gradle project resolve (exclusions, dependencyManagement, "
-        "ResolutionStrategy, private coordinates are not modeled)."
+        "Graphs are resolved per root in isolation from published POMs — not a full "
+        "Maven/Gradle project resolve (version ranges, profiles, and consumer "
+        "dependencyManagement are not applied)."
     ),
     (
         "Verdicts are heuristic policy signals, not legal advice. Independently "
         "verify licenses before redistributing."
     ),
     (
-        "deps.dev may return SPDX expressions (e.g. Apache-2.0 OR MIT) or "
-        "'non-standard'; expression operators beyond a single id are treated "
-        "conservatively (review when not an exact known SPDX id)."
+        "A POM license name is normalized to a single SPDX id when it matches "
+        "a known name; compound expressions and unrecognized names are review."
     ),
 ]
 
@@ -7124,7 +8006,7 @@ def license_compliance_verdict(
             }
         return {
             "verdict": "review",
-            "reason": "no SPDX license declared by deps.dev; verify manually",
+            "reason": "no SPDX license declared; verify manually",
         }
     if category in disallow:
         return {
@@ -7143,16 +8025,17 @@ def check_license_compliance(
     dependencies: List[Dict[str, Any]],
     project_license: Optional[str] = None,
     disallow: Optional[List[str]] = None,
+    ctx: Optional["ResolutionContext"] = None,
 ) -> Dict[str, Any]:
     """Aggregate transitive licenses and flag policy violations (#289).
 
-    For each versioned root, fetches the deps.dev GetDependencies graph, then
-    GetVersion licenses for each unique GAV (capped). Marks ``viaTransitive``
-    from deps.dev ``relation`` (SELF/DIRECT → false, else true).
+    For each versioned root, fetches the POM graph, then reads licenses from
+    the POM already attached to each node (capped). Marks ``viaTransitive``
+    from ``relation`` (SELF/DIRECT → false, else true).
 
     #400/#402 concurrency note: the per-ROOT graph fetch below (bounded by
-    MAX_LICENSE_COMPLIANCE_ROOTS, a pure independent network call per root) IS
-    parallelized. The per-NODE license fetch/dedup walk (_ensure_license /
+    MAX_LICENSE_COMPLIANCE_ROOTS, a pure independent call per root) IS
+    parallelized. The per-NODE license/dedup walk (_ensure_license /
     _add_result, up to MAX_LICENSE_COMPLIANCE_NODES) deliberately stays
     SEQUENTIAL: its dedup is order-sensitive (`seen_result_keys`'s
     "first-seen wins for viaTransitive=false, upgrade in place otherwise"
@@ -7166,6 +8049,8 @@ def check_license_compliance(
     `partial: true` rather than blocking indefinitely — which is exactly what
     #402 asks for on this specific tool.
     """
+    if ctx is None:
+        ctx = build_resolution_context({})
     deadline = _now() + TOOL_DEADLINE
     deadline_hit = False
     policy = resolve_license_policy(project_license, disallow)
@@ -7181,7 +8066,7 @@ def check_license_compliance(
     truncated_roots = len(roots) > MAX_LICENSE_COMPLIANCE_ROOTS
     roots = roots[:MAX_LICENSE_COMPLIANCE_ROOTS]
 
-    # Dedup GetVersion calls across roots: g:a:v → license fetch result.
+    # Dedup license rows across roots: g:a:v → license payload.
     license_cache: Dict[str, Dict[str, Any]] = {}
     results: List[Dict[str, Any]] = []
     seen_result_keys: set = set()
@@ -7194,7 +8079,12 @@ def check_license_compliance(
     def _gav_key(g: str, a: str, v: str) -> str:
         return f"{g}:{a}:{v}"
 
-    def _ensure_license(g: str, a: str, v: str) -> Dict[str, Any]:
+    def _ensure_license(
+        g: str,
+        a: str,
+        v: str,
+        known: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         nonlocal nodes_fetched, truncated_nodes, partial, capability
         key = _gav_key(g, a, v)
         if key in license_cache:
@@ -7206,13 +8096,22 @@ def check_license_compliance(
                 "ok": False,
                 "licenses": [],
                 "error": (
-                    f"GetVersion fan-out capped at {MAX_LICENSE_COMPLIANCE_NODES}"
+                    f"license fan-out capped at {MAX_LICENSE_COMPLIANCE_NODES}"
                 ),
             }
             license_cache[key] = entry
             return entry
         nodes_fetched += 1
-        entry = fetch_depsdev_licenses(g, a, v)
+        # known is the license list already read with the graph POM. A node
+        # without that key degrades here. This does not read the POM again.
+        if known is not None:
+            entry = dict(known)
+        else:
+            entry = {
+                "ok": False,
+                "licenses": [],
+                "error": "POM licenses were not on the graph node",
+            }
         if entry.get("capabilityUnavailable") and capability is None:
             capability = entry["capabilityUnavailable"]
         license_cache[key] = entry
@@ -7226,6 +8125,7 @@ def check_license_compliance(
         via_transitive: bool,
         relation: str,
         root: Dict[str, str],
+        known: Optional[Dict[str, Any]] = None,
     ) -> None:
         nonlocal partial
         key = _gav_key(g, a, v)
@@ -7246,7 +8146,7 @@ def check_license_compliance(
                         break
             return
         seen_result_keys.add(key)
-        fetched = _ensure_license(g, a, v)
+        fetched = _ensure_license(g, a, v, known)
         primary = _primary_license_from_depsdev(fetched.get("licenses") or [])
         missing = not (fetched.get("licenses") or [])
         verdict_info = license_compliance_verdict(
@@ -7279,7 +8179,7 @@ def check_license_compliance(
                 "artifactId": root["artifactId"],
                 "version": root["version"],
             },
-            "source": "deps.dev",
+            "source": "pom",
         }
         if fetched.get("error"):
             row["error"] = fetched["error"]
@@ -7292,8 +8192,8 @@ def check_license_compliance(
     # deterministic regardless of which root's fetch actually completed
     # first.
     def _fetch_root_graph(root: Dict[str, str]) -> Dict[str, Any]:
-        return fetch_depsdev_dependencies(
-            root["groupId"], root["artifactId"], root["version"],
+        return resolve_pom_graph(
+            root["groupId"], root["artifactId"], root["version"], ctx,
         )
 
     root_graphs, root_fetch_partial = _map_parallel(
@@ -7331,12 +8231,20 @@ def check_license_compliance(
 
         if not fetched.get("ok"):
             partial = True
-            err = fetched.get("error") or "deps.dev unavailable"
+            err = fetched.get("error") or "POM graph unavailable"
             if len(errors) < MAX_DEPSDEV_ERRORS_REPORTED:
                 errors.append(
                     f"{root['groupId']}:{root['artifactId']}:{root['version']}: {err}"
                 )
-            # Still emit a review row for the root itself so callers see it.
+            # Seed the license payload so the synthetic root row does not
+            # fetch the POM a second time (and does not retry a dead network).
+            known_root: Dict[str, Any] = {
+                "ok": False,
+                "licenses": [],
+                "error": err,
+            }
+            if cap:
+                known_root["capabilityUnavailable"] = cap
             _add_result(
                 root["groupId"],
                 root["artifactId"],
@@ -7344,6 +8252,7 @@ def check_license_compliance(
                 via_transitive=False,
                 relation="SELF",
                 root=root,
+                known=known_root,
             )
             # Force review on the synthetic root row when graph fetch failed.
             for row in results:
@@ -7358,13 +8267,6 @@ def check_license_compliance(
                     break
             continue
 
-        if fetched.get("graphError"):
-            partial = True
-            if len(errors) < MAX_DEPSDEV_ERRORS_REPORTED:
-                errors.append(
-                    f"{root['groupId']}:{root['artifactId']}:{root['version']}: "
-                    f"graph error: {fetched['graphError']}"
-                )
         if fetched.get("truncated") or fetched.get("partial"):
             partial = True
 
@@ -7391,7 +8293,22 @@ def check_license_compliance(
             # non-empty as transitive to avoid under-flagging.
             if relation == "":
                 via = False
-            _add_result(g, a, v, via_transitive=via, relation=relation or "DIRECT", root=root)
+            known_node: Optional[Dict[str, Any]] = None
+            if "pomLicenses" in node:
+                node_errors = [err for err in (node.get("errors") or []) if err]
+                known_node = {
+                    "ok": not node_errors,
+                    "licenses": list(node.get("pomLicenses") or []),
+                }
+                if node_errors:
+                    known_node["error"] = str(node_errors[0])
+            _add_result(
+                g, a, v,
+                via_transitive=via,
+                relation=relation or "DIRECT",
+                root=root,
+                known=known_node,
+            )
 
     by_verdict = {"ok": 0, "review": 0, "violation": 0}
     by_category: Dict[str, int] = {}
@@ -7410,7 +8327,7 @@ def check_license_compliance(
         )
     if truncated_nodes:
         notes.append(
-            f"GetVersion calls capped at {MAX_LICENSE_COMPLIANCE_NODES} "
+            f"License lookups capped at {MAX_LICENSE_COMPLIANCE_NODES} "
             f"(MAX_LICENSE_COMPLIANCE_NODES); results are partial."
         )
     if deadline_hit:
@@ -11952,12 +12869,18 @@ def handle_expand_bom(args: Dict) -> Any:
 
 def handle_get_transitive_graph(args: Dict) -> Any:
     """MCP handler for ``get_transitive_graph`` (#287)."""
-    return get_transitive_graph(args["groupId"], args["artifactId"], args["version"])
+    ctx = build_resolution_context(args)
+    return get_transitive_graph(
+        args["groupId"], args["artifactId"], args["version"], ctx,
+    )
 
 
 def handle_get_vulnerability_paths(args: Dict) -> Any:
     """MCP handler for ``get_vulnerability_paths`` (#413)."""
-    return get_vulnerability_paths(args["groupId"], args["artifactId"], args["version"])
+    ctx = build_resolution_context(args)
+    return get_vulnerability_paths(
+        args["groupId"], args["artifactId"], args["version"], ctx,
+    )
 
 
 def handle_detect_dependency_conflicts(args: Dict) -> Any:
@@ -12271,10 +13194,12 @@ def handle_check_license_compliance(args: Dict) -> Any:
     disallow = args.get("disallow")
     if disallow is not None and not isinstance(disallow, list):
         disallow = [str(disallow)]
+    ctx = build_resolution_context(args)
     return check_license_compliance(
         deps,
         project_license=project_license,
         disallow=disallow,
+        ctx=ctx,
     )
 
 
@@ -13535,7 +14460,7 @@ TOOLS = [
     },
     {
         "name": "get_transitive_graph",
-        "description": "Fetch the resolved transitive dependency graph for a Maven GAV via deps.dev GetDependencies. Returns nodes (g/a/v) and edges (from/to indices). Partial results are flagged when deps.dev is unreachable, returns errors, or the graph is truncated by the node cap.",
+        "description": "Fetch the resolved transitive dependency graph for a Maven GAV from the artifact POM (Gradle cache, then the local Maven repository, then the project's repositories). Returns nodes (g/a/v) and edges (from/to indices). This is a documented Maven subset: compile and runtime scopes, nearest-wins mediation, no version ranges or profiles. Partial results are flagged when a POM is missing, a declaration is skipped, or the graph is truncated by the node cap.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -13543,6 +14468,7 @@ TOOLS = [
                 "groupId": {"type": "string", "description": "Maven group ID"},
                 "artifactId": {"type": "string", "description": "Maven artifact ID"},
                 "version": {"type": "string", "description": "Maven version"},
+                "projectPath": {"type": "string", "description": "Project root used to resolve declared repositories for POM download. Defaults to the current working directory. Does not launch Gradle."},
             },
             "required": ["groupId", "artifactId", "version"],
         },
@@ -13562,7 +14488,6 @@ TOOLS = [
                 },
                 "partial": {"type": "boolean"},
                 "truncated": {"type": "boolean"},
-                "graphError": {"type": "string"},
                 "capabilityUnavailable": {"type": "string"},
                 "error": {"type": "string"},
                 "nodeErrors": {"type": "array", "items": {"type": "object"}},
@@ -13573,7 +14498,7 @@ TOOLS = [
     },
     {
         "name": "get_vulnerability_paths",
-        "description": "Show the dependency path from a project root Maven GAV to each vulnerable transitive node. Fetches the deps.dev transitive graph, checks every unique node for known CVE/GHSA advisories via OSV.dev, and returns the shortest root-to-node path for each vulnerable dependency found — so a CVE deep in the tree can be traced back to which direct dependency pulls it in. An empty vulnerabilityPaths list means no known vulnerability was found in the graph; it is not a safety guarantee (same OSV coverage caveat as get_dependency_vulnerabilities). Partial results are flagged when deps.dev/OSV is unreachable, the graph is truncated by the node cap, or the unique-dependency count is truncated before querying OSV.",
+        "description": "Show the dependency path from a project root Maven GAV to each vulnerable transitive node. Builds the POM transitive graph, checks every unique node for known CVE/GHSA advisories via OSV.dev, and returns the shortest root-to-node path for each vulnerable dependency found — so a CVE deep in the tree can be traced back to which direct dependency pulls it in. An empty vulnerabilityPaths list means no known vulnerability was found in the graph; it is not a safety guarantee (same OSV coverage caveat as get_dependency_vulnerabilities). Partial results are flagged when a POM is missing, OSV is unreachable, the graph is truncated by the node cap, or the unique-dependency count is truncated before querying OSV.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -13581,6 +14506,7 @@ TOOLS = [
                 "groupId": {"type": "string", "description": "Maven group ID of the project root"},
                 "artifactId": {"type": "string", "description": "Maven artifact ID of the project root"},
                 "version": {"type": "string", "description": "Maven version of the project root"},
+                "projectPath": {"type": "string", "description": "Project root used to resolve declared repositories for POM download. Defaults to the current working directory. Does not launch Gradle."},
             },
             "required": ["groupId", "artifactId", "version"],
         },
@@ -13614,7 +14540,7 @@ TOOLS = [
     },
     {
         "name": "detect_dependency_conflicts",
-        "description": "Detect version conflicts by unioning deps.dev transitive graphs for each direct project dependency. Flags GAs appearing at ≥2 versions and reports the version Maven nearest-wins or Gradle highest-wins would pick. Approximation of a full project resolve — see notes[] for limitations.",
+        "description": "Detect version conflicts. Gradle projects compare versions already on the resolved scan. Maven projects union a POM graph for each direct dependency. Flags GAs appearing at ≥2 versions and reports the version Maven nearest-wins or Gradle highest-wins would pick. Approximation of a full project resolve — see notes[] for limitations.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -13915,7 +14841,7 @@ TOOLS = [
     },
     {
         "name": "check_license_compliance",
-        "description": "Aggregate SPDX licenses across the transitive closure of one or more Maven GAVs (deps.dev GetDependencies + GetVersion) and flag risky/incompatible licenses against a projectLicense posture or an explicit disallow list (SPDX ids and/or categories). Verdicts: ok / review / violation. Missing license metadata degrades to review, never a false ok. Heuristic policy signal — not legal advice; see notes[].",
+        "description": "Aggregate SPDX licenses across the transitive closure of one or more Maven GAVs. The graph and each node's license come from the artifact POM. Flags risky/incompatible licenses against a projectLicense posture or an explicit disallow list (SPDX ids and/or categories). Verdicts: ok / review / violation. Missing license metadata degrades to review, never a false ok. Heuristic policy signal — not legal advice; see notes[].",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -14298,10 +15224,11 @@ TOOLS = [
             "Compare a direct upgrade's closure before and after the candidate "
             "version. graphSource defaults to auto: Gradle when the project has a "
             "Gradle build and gradlew (two sequential resolves, up to 20 "
-            "substitutions); otherwise deps.dev for exactly one upgrade. Gradle "
-            "does not fall back to deps.dev after a failure. deps.dev is an "
-            "isolated public graph, not a project resolve. advisory is not a "
-            "safety verdict; none and unknown do not mean the coordinate is safe."
+            "substitutions); otherwise one POM graph for exactly one upgrade. "
+            "Gradle does not fall back to the POM graph after a failure. The POM "
+            "graph is an isolated published-POM walk, not a project resolve. "
+            "advisory is not a safety verdict; none and unknown do not mean the "
+            "coordinate is safe."
         ),
         "inputSchema": {
             "type": "object",
@@ -14311,7 +15238,7 @@ TOOLS = [
                     "type": "array",
                     "maxItems": MAX_UPGRADE_SUBSTITUTIONS,
                     "description": (
-                        "Coordinates to preview. Gradle accepts up to 20. deps.dev "
+                        "Coordinates to preview. Gradle accepts up to 20. The POM graph "
                         "accepts exactly one. More than 20 is rejected, not truncated."
                     ),
                     "items": {
@@ -14335,11 +15262,11 @@ TOOLS = [
                 },
                 "graphSource": {
                     "type": "string",
-                    "enum": ["auto", "gradle", "depsdev"],
+                    "enum": ["auto", "gradle", "pom"],
                     "description": (
                         "auto (default) uses Gradle when gradlew exists, otherwise "
-                        "deps.dev. gradle never falls back to deps.dev. deps.dev "
-                        "rejects more than one upgrade."
+                        "the POM graph. gradle never falls back to the POM graph. "
+                        "pom rejects more than one upgrade."
                     ),
                 },
                 "substitution": {
@@ -14348,7 +15275,7 @@ TOOLS = [
                     "description": (
                         "Gradle only, default exact. exact rewrites fromVersion and "
                         "versionless requests. module rewrites every request for that "
-                        "coordinate. Ignored on deps.dev. exact is not retried as module."
+                        "coordinate. Ignored on the POM graph. exact is not retried as module."
                     ),
                 },
                 "includeLicenses": {
@@ -14370,7 +15297,7 @@ TOOLS = [
         "outputSchema": {
             "type": "object",
             "properties": {
-                "graphSource": {"type": "string", "enum": ["gradle", "depsdev"]},
+                "graphSource": {"type": "string", "enum": ["gradle", "pom"]},
                 "advisory": {
                     "type": "string",
                     "enum": ["stop", "review", "info", "none", "unknown"],

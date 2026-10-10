@@ -188,9 +188,13 @@ class GradleClosureMockTest(unittest.TestCase):
             lic = stack.enter_context(
                 unittest.mock.patch.object(server, "fetch_depsdev_licenses"),
             )
+            pom = stack.enter_context(
+                unittest.mock.patch.object(server, "resolve_pom_graph"),
+            )
             if env:
                 stack.enter_context(unittest.mock.patch.dict(os.environ, env))
             out = server.compare_upgrade_closure(args)
+        pom.assert_not_called()
         return out, spy, deps, lic
 
     def test_calls_do_not_overlap_and_env_is_scrubbed(self):
@@ -302,12 +306,14 @@ class GradleClosureMockTest(unittest.TestCase):
             handle.write("plugins { id 'java' }\n")
         with unittest.mock.patch.object(server, "_gradle_run") as run, \
                 unittest.mock.patch.object(server, "fetch_depsdev_dependencies") as deps, \
+                unittest.mock.patch.object(server, "resolve_pom_graph") as pom, \
                 unittest.mock.patch.object(server, "query_osv_batch") as osv:
             out = server.compare_upgrade_closure(_args(
                 [_upgrade()], projectPath=root, graphSource="gradle",
             ))
         run.assert_not_called()
         deps.assert_not_called()
+        pom.assert_not_called()
         osv.assert_not_called()
         self.assertEqual(out["graphSource"], "gradle")
         self.assertEqual(out["advisory"], "unknown")
@@ -326,7 +332,7 @@ class GradleClosureMockTest(unittest.TestCase):
             calls["detect"] += 1
             return real_detect(path)
 
-        def fetch(group_id, artifact_id, version):
+        def fetch(group_id, artifact_id, version, ctx=None):
             return {
                 "ok": True,
                 "nodes": [{
@@ -337,17 +343,23 @@ class GradleClosureMockTest(unittest.TestCase):
                 }],
                 "edges": [],
                 "truncated": False,
-                "graphError": None,
             }
 
         with unittest.mock.patch.object(server, "_detect_build_system", detect), \
                 unittest.mock.patch.object(server, "_gradle_run") as run, \
-                unittest.mock.patch.object(server, "fetch_depsdev_dependencies", fetch), \
+                unittest.mock.patch.object(
+                    server, "resolve_pom_graph", side_effect=fetch,
+                ) as pom, \
                 unittest.mock.patch.object(server, "query_osv_batch", _clean_osv):
             out = server.compare_upgrade_closure(_args([_upgrade()], projectPath=root))
         run.assert_not_called()
+        self.assertEqual(pom.call_count, 2)
+        self.assertEqual(
+            sorted(call.args[2] for call in pom.call_args_list),
+            ["4.12.0", "4.9.3"],
+        )
         self.assertEqual(calls["detect"], 1)
-        self.assertEqual(out["graphSource"], "depsdev")
+        self.assertEqual(out["graphSource"], "pom")
         self.assertEqual(out["advisory"], "none")
 
     def test_rejects_more_than_twenty_and_a_depsdev_batch(self):
@@ -365,7 +377,7 @@ class GradleClosureMockTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not truncated"):
                 server.compare_upgrade_closure(_args(many, projectPath=root, graphSource="gradle"))
             with self.assertRaisesRegex(ValueError, "exactly one"):
-                server.compare_upgrade_closure(_args(two, projectPath=root, graphSource="depsdev"))
+                server.compare_upgrade_closure(_args(two, projectPath=root, graphSource="pom"))
         run.assert_not_called()
         deps.assert_not_called()
 
@@ -441,7 +453,7 @@ class GradleClosureMockTest(unittest.TestCase):
 
     def test_unknown_graph_source_is_rejected(self):
         with unittest.mock.patch.object(server, "_gradle_run") as run, \
-                self.assertRaisesRegex(ValueError, "graphSource must be auto, depsdev, or gradle"):
+                self.assertRaisesRegex(ValueError, "graphSource must be auto, pom, or gradle"):
             server.compare_upgrade_closure(_args(
                 [_upgrade()], graphSource="gradel",
             ))
@@ -653,11 +665,13 @@ class GradleWrapperFixtureTest(unittest.TestCase):
                 unittest.mock.patch.object(server, "_gradle_run", spy_run), \
                 unittest.mock.patch.object(server, "query_osv_batch", _clean_osv), \
                 unittest.mock.patch.object(server, "fetch_depsdev_dependencies") as deps, \
+                unittest.mock.patch.object(server, "resolve_pom_graph") as pom, \
                 unittest.mock.patch.object(server, "fetch_depsdev_licenses", return_value={
                     "ok": True, "licenses": ["MIT"], "error": None,
                 }):
             out = server.compare_upgrade_closure(_args([upgrade], projectPath=project))
         deps.assert_not_called()
+        pom.assert_not_called()
         self.assertEqual(seen["max"], 1)
         self.assertEqual(len(seen["scripts"]), 2)
         self.assertEqual(seen["scripts"][0], seen["scripts"][1])

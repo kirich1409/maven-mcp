@@ -343,7 +343,7 @@ _FIXTURES = {
                 "groupId": "com.example", "artifactId": "app", "version": "1.0",
                 "license": "Apache-2.0", "licenses": ["Apache-2.0"], "category": "permissive",
                 "viaTransitive": False, "relation": "SELF", "verdict": "ok", "reason": "permissive license",
-                "root": {"groupId": "com.example", "artifactId": "app", "version": "1.0"}, "source": "deps.dev",
+                "root": {"groupId": "com.example", "artifactId": "app", "version": "1.0"}, "source": "pom",
             },
         ],
         "partial": False, "notes": [],
@@ -460,7 +460,7 @@ _FIXTURES = {
         ],
     },
     "compare_upgrade_closure": {
-        "graphSource": "depsdev",
+        "graphSource": "pom",
         "advisory": "info",
         "partial": False,
         "diffReliable": True,
@@ -495,7 +495,7 @@ _FIXTURES = {
         }],
         "notes": [
             "The closure added, changed, or removed coordinates.",
-            "Graphs are resolved per root in isolation via deps.dev — not a full Maven/Gradle project resolve.",
+            "Graphs are resolved per root in isolation from published POMs — not a full Maven/Gradle project resolve.",
         ],
     },
 }

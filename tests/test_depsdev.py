@@ -1,9 +1,12 @@
 """Tests for deps.dev transitive graphs + conflict detection (#287)."""
 
 import json
+import os
+import tempfile
 import unittest
 import unittest.mock
 import urllib.error
+from pathlib import Path
 
 from _helpers import mock_gradle_resolve, mock_urlopen, server, temp_project, write_fake_gradlew
 
@@ -25,25 +28,16 @@ def _graph(nodes, edges, error: str = "") -> bytes:
     return json.dumps({"nodes": nodes, "edges": edges, "error": error}).encode()
 
 
-# Diamond: root → A:1.0, root → B:1.0; A → conflict:1.0 (depth 2);
-# B → mid → conflict:2.0 (depth 3). Nearest-wins → 1.0; highest-wins → 2.0.
-_DIAMOND = _graph(
-    [
-        _node("com.example:root", "1.0", "SELF"),
-        _node("com.example:a", "1.0", "DIRECT"),
-        _node("com.example:b", "1.0", "DIRECT"),
-        _node("com.example:conflict", "1.0", "INDIRECT"),
-        _node("com.example:mid", "1.0", "INDIRECT"),
-        _node("com.example:conflict", "2.0", "INDIRECT"),
-    ],
-    [
-        {"fromNode": 0, "toNode": 1, "requirement": "1.0"},
-        {"fromNode": 0, "toNode": 2, "requirement": "1.0"},
-        {"fromNode": 1, "toNode": 3, "requirement": "1.0"},
-        {"fromNode": 2, "toNode": 4, "requirement": "1.0"},
-        {"fromNode": 4, "toNode": 5, "requirement": "2.0"},
-    ],
-)
+def _pom_ok(nodes, edges) -> dict:
+    return {
+        "ok": True,
+        "nodes": nodes,
+        "edges": edges,
+        "partial": False,
+        "truncated": False,
+        "error": None,
+        "nodeErrors": [],
+    }
 
 
 class TestDepsdevUrlAndParse(unittest.TestCase):
@@ -296,10 +290,31 @@ class TestResolveConflictVersion(unittest.TestCase):
 
 class TestGetTransitiveGraph(unittest.TestCase):
     def test_handler_shape(self):
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=mock_urlopen([(200, _DIAMOND)]),
-        ):
+        def fetch(group_id, artifact_id, version, _ctx):
+            return _pom_ok(
+                [
+                    {
+                        "groupId": group_id,
+                        "artifactId": artifact_id,
+                        "version": version,
+                        "relation": "SELF",
+                    },
+                    {
+                        "groupId": "com.example",
+                        "artifactId": "conflict",
+                        "version": "1.0",
+                        "relation": "DIRECT",
+                    },
+                ],
+                [{"from": 0, "to": 1, "requirement": "1.0"}],
+            )
+
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch), \
+                unittest.mock.patch.object(
+                    server,
+                    "fetch_depsdev_dependencies",
+                    side_effect=AssertionError("deps.dev"),
+                ):
             out = server.handle_get_transitive_graph({
                 "groupId": "com.example",
                 "artifactId": "root",
@@ -316,18 +331,36 @@ class TestGetTransitiveGraph(unittest.TestCase):
         self.assertNotIn("requirement", out["edges"][0])
 
     def test_handler_degrades_on_unreachable(self):
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=mock_urlopen([urllib.error.URLError("down")]),
-        ):
+        # fetch_pom swallows URLError, so a transport miss is "POM not found".
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / ".gradle").mkdir()
+        (home / ".m2" / "repository").mkdir(parents=True)
+        with unittest.mock.patch.object(server.Path, "home", return_value=home), \
+                unittest.mock.patch.dict(
+                    os.environ, {"GRADLE_USER_HOME": str(home / ".gradle")},
+                ), \
+                unittest.mock.patch.object(server, "_sleep"), \
+                unittest.mock.patch(
+                    "urllib.request.urlopen",
+                    side_effect=urllib.error.URLError("down"),
+                ), \
+                unittest.mock.patch.object(
+                    server,
+                    "fetch_depsdev_dependencies",
+                    side_effect=AssertionError("deps.dev"),
+                ):
             out = server.handle_get_transitive_graph({
                 "groupId": "com.example",
                 "artifactId": "root",
                 "version": "1.0",
             })
         self.assertTrue(out["partial"])
-        self.assertIn("error", out)
+        self.assertIn("POM not found", out["error"])
+        self.assertNotIn("down", out["error"])
         self.assertEqual(out["nodes"], [])
+        self.assertNotIn("capabilityUnavailable", out)
 
 
 class TestDetectDependencyConflicts(unittest.TestCase):
@@ -356,43 +389,52 @@ class TestDetectDependencyConflicts(unittest.TestCase):
             """,
         }
 
-    def _left_graph(self) -> bytes:
-        return _graph(
-            [
-                _node("com.example:left", "1.0", "SELF"),
-                _node("com.example:conflict", "1.0", "DIRECT"),
-            ],
-            [{"fromNode": 0, "toNode": 1, "requirement": "1.0"}],
-        )
+    def _pom_node(self, artifact_id: str, version: str, relation: str) -> dict:
+        return {
+            "groupId": "com.example",
+            "artifactId": artifact_id,
+            "version": version,
+            "relation": relation,
+        }
 
-    def _right_graph(self) -> bytes:
-        return _graph(
-            [
-                _node("com.example:right", "1.0", "SELF"),
-                _node("com.example:mid", "1.0", "DIRECT"),
-                _node("com.example:conflict", "2.0", "INDIRECT"),
-            ],
-            [
-                {"fromNode": 0, "toNode": 1, "requirement": "1.0"},
-                {"fromNode": 1, "toNode": 2, "requirement": "2.0"},
-            ],
-        )
+    def _route_pom(self, _group_id, artifact_id, _version, _ctx):
+        if artifact_id == "left":
+            return _pom_ok(
+                [
+                    self._pom_node("left", "1.0", "SELF"),
+                    self._pom_node("conflict", "1.0", "DIRECT"),
+                ],
+                [{"from": 0, "to": 1}],
+            )
+        if artifact_id == "right":
+            return _pom_ok(
+                [
+                    self._pom_node("right", "1.0", "SELF"),
+                    self._pom_node("mid", "1.0", "DIRECT"),
+                    self._pom_node("conflict", "2.0", "INDIRECT"),
+                ],
+                [{"from": 0, "to": 1}, {"from": 1, "to": 2}],
+            )
+        return {
+            "ok": False,
+            "nodes": [],
+            "edges": [],
+            "partial": True,
+            "truncated": False,
+            "error": "POM not found",
+            "nodeErrors": [],
+        }
 
     def test_maven_nearest_wins(self):
         files = self._two_root_project()
-        # #400: detect_dependency_conflicts now fetches each root's deps.dev
-        # graph in parallel via a ThreadPoolExecutor, so urlopen calls are no
-        # longer guaranteed to happen in input (left, then right) order --
-        # route by URL (which embeds the artifactId, percent-encoded) instead
-        # of a position-based queue.
-        def _route(req, *args, **kwargs):
-            url = req.full_url if hasattr(req, "full_url") else str(req)
-            if "left" in url:
-                return mock_urlopen([(200, self._left_graph())])(req, *args, **kwargs)
-            return mock_urlopen([(200, self._right_graph())])(req, *args, **kwargs)
-
         with temp_project(files) as root:
-            with unittest.mock.patch("urllib.request.urlopen", side_effect=_route):
+            with unittest.mock.patch.object(
+                server, "resolve_pom_graph", self._route_pom,
+            ), unittest.mock.patch.object(
+                server,
+                "fetch_depsdev_dependencies",
+                side_effect=AssertionError("deps.dev"),
+            ):
                 out = server.handle_detect_dependency_conflicts({
                     "projectPath": root,
                     "buildSystem": "maven",
@@ -434,11 +476,14 @@ class TestDetectDependencyConflicts(unittest.TestCase):
                     "usages": [{"module": ":core", "configuration": "releaseRuntimeClasspath"}],
                 },
             ]
-            with mock_gradle_resolve(resolved):
+            with mock_gradle_resolve(resolved), unittest.mock.patch.object(
+                server, "resolve_pom_graph",
+            ) as pom:
                 out = server.handle_detect_dependency_conflicts({
                     "projectPath": root,
                     "buildSystem": "gradle",
                 })
+        pom.assert_not_called()
         self.assertEqual(out["strategy"], "highest-wins")
         self.assertEqual(out["graphsFetched"], 0)
         c = next(
@@ -450,14 +495,22 @@ class TestDetectDependencyConflicts(unittest.TestCase):
 
     def test_partial_when_one_root_fails(self):
         files = self._two_root_project()
+
+        def fetch(_group_id, artifact_id, _version, _ctx):
+            if artifact_id == "left":
+                return self._route_pom(_group_id, artifact_id, _version, _ctx)
+            return {
+                "ok": False,
+                "nodes": [],
+                "edges": [],
+                "partial": True,
+                "truncated": False,
+                "error": "POM not found",
+                "nodeErrors": [],
+            }
+
         with temp_project(files) as root:
-            with unittest.mock.patch(
-                "urllib.request.urlopen",
-                side_effect=mock_urlopen([
-                    (200, self._left_graph()),
-                    (404, b""),
-                ]),
-            ):
+            with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
                 out = server.handle_detect_dependency_conflicts({
                     "projectPath": root,
                     "buildSystem": "maven",
@@ -466,6 +519,57 @@ class TestDetectDependencyConflicts(unittest.TestCase):
         self.assertEqual(out["graphsFailed"], 1)
         self.assertEqual(out["graphsFetched"], 1)
         self.assertTrue(out["errors"])
+
+    def test_maven_partial_graph_marks_partial(self):
+        files = {
+            "pom.xml": """
+            <project>
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>com.example</groupId>
+              <artifactId>app</artifactId>
+              <version>1.0</version>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>lib</artifactId>
+                  <version>1.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            """,
+        }
+
+        def fetch(_group_id, _artifact_id, _version, _ctx):
+            return {
+                "ok": True,
+                "nodes": [self._pom_node("lib", "1.0", "SELF")],
+                "edges": [],
+                "partial": True,
+                "truncated": True,
+                "error": None,
+                "nodeErrors": [{
+                    "groupId": "com.example",
+                    "artifactId": "skipped",
+                    "version": "[1,2)",
+                    "errors": ["version range is not resolved"],
+                }],
+            }
+
+        with temp_project(files) as root:
+            with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
+                out = server.handle_detect_dependency_conflicts({
+                    "projectPath": root,
+                    "buildSystem": "maven",
+                })
+        self.assertTrue(out["partial"])
+        self.assertEqual(out["graphsFailed"], 0)
+        self.assertEqual(out["graphsFetched"], 1)
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertIn("com.example:lib:1.0", out["errors"][0])
+        self.assertIn("truncated", out["errors"][0])
+        self.assertIn("skipped declaration", out["errors"][0])
+        self.assertNotIn("http://", out["errors"][0])
+        self.assertNotIn("https://", out["errors"][0])
 
 
 class TestEdgeDepthMap(unittest.TestCase):

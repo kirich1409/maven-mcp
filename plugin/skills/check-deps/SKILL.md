@@ -75,7 +75,7 @@ Do not call `compare_upgrade_closure` in step 1 or step 2. The audit stays direc
 
 After the user confirms a concrete set, and before editing a build file, preview that
 batch once with **`compare_upgrade_closure`**. Do not diff graphs yourself. Do not union
-several deps.dev calls. The pre-edit and post-edit hooks do not call this tool.
+several POM-graph calls. The pre-edit and post-edit hooks do not call this tool.
 
 `fromVersion` is the audited current version. `toVersion` is the version the user just
 confirmed. Pass `projectPath` when the project is not the working directory. Leave
@@ -118,13 +118,13 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
    only. An empty `upgrades` list is rejected; do not quote that error as `unknown`.
 
 2. **No `gradlew`** (Maven project, or Gradle files without a wrapper). Do not call
-   the tool once per coordinate. `auto` would select deps.dev.
-   - Exactly one library upgrade left: one call with `graphSource: "depsdev"`.
+   the tool once per coordinate. `auto` would select the POM graph.
+   - Exactly one library upgrade left: one call with `graphSource: "pom"`.
    - More than one: say "a batch closure needs a Gradle wrapper" and do not call.
    - If that audit row has `isPlatform` or `managedBy`, add the BOM caveat on this
      call. The server has no `isPlatform` input; do not pass one. An empty
-     public-graph diff is not "no coordinate change" for a platform or a managed
-     row: deps.dev does not show versions that BOM moves elsewhere.
+     POM-subset diff is not "no coordinate change" for a platform or a managed
+     row: ranges, profiles, and the consumer's `dependencyManagement` are not applied.
 
 3. **`gradlew` exists and at least one library upgrade remains.** One call. Omit
    `graphSource` (`auto`). At most 20 library upgrades. The server rejects a longer
@@ -177,8 +177,8 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
    - **`none` after a compare** (`diffReliable: true`, and the target has a
      `vulnerabilities` list, empty when nothing came back) — no coordinate change
      outside the target, then that target OSV result (`relation: target`). Quote
-     the non-guarantee note from `notes`. Do not say safe. On a deps.dev platform
-     or `managedBy` row, do not use that closure sentence: an empty public-graph
+     the non-guarantee note from `notes`. Do not say safe. On a POM-graph platform
+     or `managedBy` row, do not use that closure sentence: an empty POM-subset
      diff is not "no coordinate change".
    - **`none` from all-identity** (`vulnerabilities` omitted on the target, not
      `[]`) — nothing was requested to change and the current coordinate was not
@@ -259,7 +259,7 @@ Surface failures immediately. Attempt trivial fixes; otherwise revert that entry
 - Step 1 stays direct: `audit_project_dependencies` is first-level production dependencies, not the closure. The closure preview runs only after confirm, for the library batch, and is not a safety verdict.
 - The write hooks do not call `compare_upgrade_closure`. Do not add that call.
 - This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
-- Gradle resolution in step 1 needs `gradlew`. Maven projects are in scope: `audit_project_dependencies` still returns their rows, and the no-wrapper preview is one deps.dev call, or no call when the batch is larger or no library upgrade remains.
+- Gradle resolution in step 1 needs `gradlew`. Maven projects are in scope: `audit_project_dependencies` still returns their rows, and the no-wrapper preview is one POM-graph call, or no call when the batch is larger or no library upgrade remains. The Gradle wrapper path stays on Gradle and does not fall back to the POM graph.
 
 ## Fallback (MCP unavailable only)
 

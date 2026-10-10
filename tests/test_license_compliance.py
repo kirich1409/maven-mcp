@@ -1,7 +1,7 @@
 """Transitive license compliance tests (#289).
 
-Covers policy resolution, verdicts, deps.dev GetVersion license fetch,
-and aggregation across a mocked GetDependencies graph.
+Covers policy resolution, verdicts, POM license rows, and aggregation
+across a mocked POM graph. GetVersion HTTP tests stay in this module.
 """
 
 import json
@@ -201,27 +201,45 @@ class TestCheckLicenseCompliance(unittest.TestCase):
 
         return side_effect
 
+    def _pom_fetch(self, rows):
+        nodes = []
+        for artifact, version, relation, licenses in rows:
+            nodes.append({
+                "groupId": "com.example",
+                "artifactId": artifact,
+                "version": version,
+                "relation": relation,
+                "errors": [],
+                "pomLicenses": licenses,
+            })
+
+        def fetch(_group_id, _artifact_id, _version, _ctx=None):
+            return {
+                "ok": True,
+                "nodes": nodes,
+                "edges": [],
+                "partial": False,
+                "truncated": False,
+                "error": None,
+            }
+
+        return fetch
+
     def test_flags_transitive_gpl_in_permissive_project(self):
-        graph = _graph(
-            [
-                _node("com.example:root", "1.0", "SELF"),
-                _node("com.example:direct", "1.0", "DIRECT"),
-                _node("com.example:gpl-lib", "2.0", "INDIRECT"),
-            ],
-            [
-                {"fromNode": 0, "toNode": 1, "requirement": "1.0"},
-                {"fromNode": 1, "toNode": 2, "requirement": "2.0"},
-            ],
-        )
-        version_map = {
-            "com.example:root": ["Apache-2.0"],
-            "com.example:direct": ["MIT"],
-            "com.example:gpl-lib": ["GPL-3.0-only"],
-        }
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=self._router(graph, version_map),
-        ):
+        fetch = self._pom_fetch([
+            ("root", "1.0", "SELF", ["Apache-2.0"]),
+            ("direct", "1.0", "DIRECT", ["MIT"]),
+            ("gpl-lib", "2.0", "INDIRECT", ["GPL-3.0-only"]),
+        ])
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch), \
+                unittest.mock.patch.object(
+                    server, "fetch_depsdev_licenses",
+                    side_effect=AssertionError("deps.dev licenses"),
+                ), \
+                unittest.mock.patch.object(
+                    server, "fetch_depsdev_dependencies",
+                    side_effect=AssertionError("deps.dev graph"),
+                ):
             out = server.check_license_compliance(
                 [{"groupId": "com.example", "artifactId": "root", "version": "1.0"}],
                 project_license="Apache-2.0",
@@ -240,23 +258,14 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         self.assertEqual(by_ga["com.example:direct"]["verdict"], "ok")
         self.assertIn("notes", out)
         self.assertTrue(any("not legal advice" in n.lower() for n in out["notes"]))
+        self.assertEqual(by_ga["com.example:root"]["source"], "pom")
 
     def test_missing_license_is_review(self):
-        graph = _graph(
-            [
-                _node("com.example:root", "1.0", "SELF"),
-                _node("com.example:mystery", "1.0", "DIRECT"),
-            ],
-            [{"fromNode": 0, "toNode": 1, "requirement": "1.0"}],
-        )
-        version_map = {
-            "com.example:root": ["MIT"],
-            "com.example:mystery": [],
-        }
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=self._router(graph, version_map),
-        ):
+        fetch = self._pom_fetch([
+            ("root", "1.0", "SELF", ["MIT"]),
+            ("mystery", "1.0", "DIRECT", []),
+        ])
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
             out = server.check_license_compliance(
                 [{"groupId": "com.example", "artifactId": "root", "version": "1.0"}],
                 project_license="MIT",
@@ -268,21 +277,11 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         self.assertNotEqual(mystery["verdict"], "ok")
 
     def test_custom_disallow_overrides_default(self):
-        graph = _graph(
-            [
-                _node("com.example:root", "1.0", "SELF"),
-                _node("com.example:lgpl", "1.0", "DIRECT"),
-            ],
-            [{"fromNode": 0, "toNode": 1, "requirement": "1.0"}],
-        )
-        version_map = {
-            "com.example:root": ["MIT"],
-            "com.example:lgpl": ["LGPL-2.1-only"],
-        }
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=self._router(graph, version_map),
-        ):
+        fetch = self._pom_fetch([
+            ("root", "1.0", "SELF", ["MIT"]),
+            ("lgpl", "1.0", "DIRECT", ["LGPL-2.1-only"]),
+        ])
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
             # Default permissive policy does NOT disallow weak-copyleft.
             out_default = server.check_license_compliance(
                 [{"groupId": "com.example", "artifactId": "root", "version": "1.0"}],
@@ -303,10 +302,17 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         self.assertEqual(lgpl_custom["verdict"], "violation")
 
     def test_graph_fetch_failure_degrades(self):
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=mock_urlopen([urllib.error.URLError("offline")]),
-        ):
+        def fetch(_group_id, _artifact_id, _version, _ctx=None):
+            return {
+                "ok": False,
+                "nodes": [],
+                "edges": [],
+                "partial": True,
+                "truncated": False,
+                "error": "POM not found for com.example:root:1.0",
+            }
+
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
             out = server.check_license_compliance(
                 [{"groupId": "com.example", "artifactId": "root", "version": "1.0"}],
                 project_license="MIT",
@@ -318,12 +324,10 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         self.assertEqual(out["results"][0]["verdict"], "review")
 
     def _mock_urlopen_always_offline(self, *args, **kwargs):
-        """Fails every urlopen call instantly (no real network I/O). The
-        not-ok recovery branch's _add_result -> _ensure_license ->
-        fetch_depsdev_licenses call goes through urlopen directly (it is
-        NOT covered by a fetch_depsdev_dependencies mock), so any deadline
-        test that reaches that branch needs this too, or it silently
-        depends on real network access and real-world latency."""
+        """Fails every urlopen call instantly (no real network I/O). A
+        deadline test that still reaches the network needs this, or it
+        depends on real latency. A not-ok POM graph seeds the root license
+        row and does not fetch again."""
         raise urllib.error.URLError("offline")
 
     def test_deadline_marks_partial_without_hanging(self):
@@ -335,13 +339,13 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         # has more than one item to bound. The call must return promptly
         # (not block for the full artificial delay) with partial: true and
         # an explanatory note.
-        def _slow_graph(group_id, artifact_id, version):
+        def _slow_graph(group_id, artifact_id, version, ctx=None):
             time.sleep(0.2)
             return {"ok": True, "nodes": [], "edges": []}
 
         with unittest.mock.patch.object(server, "TOOL_DEADLINE", 0.02), \
                 unittest.mock.patch.object(
-                    server, "fetch_depsdev_dependencies", side_effect=_slow_graph,
+                    server, "resolve_pom_graph", side_effect=_slow_graph,
                 ), \
                 unittest.mock.patch.object(server, "_sleep"), \
                 unittest.mock.patch(
@@ -374,7 +378,7 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         # a tiny deadline reproduced partial:True but len(results) == 0.
         # Every root in the input must still get exactly one row (review or
         # error-shaped) even when none of the fetches complete in time.
-        def _slow_graph(group_id, artifact_id, version):
+        def _slow_graph(group_id, artifact_id, version, ctx=None):
             time.sleep(0.2)
             return {"ok": True, "nodes": [], "edges": []}
 
@@ -384,7 +388,7 @@ class TestCheckLicenseCompliance(unittest.TestCase):
         ]
         with unittest.mock.patch.object(server, "TOOL_DEADLINE", 0.02), \
                 unittest.mock.patch.object(
-                    server, "fetch_depsdev_dependencies", side_effect=_slow_graph,
+                    server, "resolve_pom_graph", side_effect=_slow_graph,
                 ), \
                 unittest.mock.patch.object(server, "_sleep"), \
                 unittest.mock.patch(
@@ -401,14 +405,10 @@ class TestCheckLicenseCompliance(unittest.TestCase):
             self.assertEqual(r["verdict"], "review")
 
     def test_handler_wires_args(self):
-        graph = _graph(
-            [_node("com.example:root", "1.0", "SELF")],
-            [],
-        )
-        with unittest.mock.patch(
-            "urllib.request.urlopen",
-            side_effect=self._router(graph, {"com.example:root": ["Apache-2.0"]}),
-        ):
+        fetch = self._pom_fetch([
+            ("root", "1.0", "SELF", ["Apache-2.0"]),
+        ])
+        with unittest.mock.patch.object(server, "resolve_pom_graph", fetch):
             out = server.handle_check_license_compliance({
                 "dependencies": [
                     {
