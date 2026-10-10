@@ -5610,15 +5610,15 @@ def _pom_upgrade_license_delta(
     fetched: List[Dict[str, Any]] = []
     for gav in gavs:
         key = (gav["groupId"], gav["artifactId"], gav["version"])
-        row = index.get(key)
-        if row is None:
-            row = {
+        known = index.get(key)
+        if known is None:
+            known = {
                 "ok": False,
                 "status": 404,
                 "licenses": [],
                 "error": "POM licenses were not on the graph node",
             }
-        fetched.append(_license_row_for_gav(gav, row))
+        fetched.append(_license_row_for_gav(gav, known))
     delta = _license_delta(
         diff,
         fetched,
