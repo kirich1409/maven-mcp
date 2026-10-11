@@ -131,6 +131,10 @@ TTL_SEARCH = 3600       # 1 hour — Maven Central Solr search index
 # positive TTLs above — an absent artifact can become present the moment it
 # is published, unlike a resolved metadata/POM document, which is immutable.
 TTL_NEGATIVE_404 = 300  # 5 minutes
+# In-memory only (#41): a transport timeout or a 5xx from a repository probe
+# is remembered so the next audit does not pay the full tool deadline again.
+# FileCache stays 200/404 — 429 and other statuses are not remembered here.
+TTL_REPO_FAILURE = 300  # 5 minutes
 
 CACHE_MAX_ENTRIES = 2000
 
@@ -465,6 +469,7 @@ def _read_response_body(resp: Any) -> bytes:
 def _request_with_retry(
     req: urllib.request.Request,
     timeout: Optional[float] = None,
+    deadline_monotonic: Optional[float] = None,
 ) -> Tuple[int, bytes]:
     """Issue ``req`` with bounded retry/backoff on transient failures.
 
@@ -481,12 +486,24 @@ def _request_with_retry(
     if timeout is None:
         timeout = HTTP_TIMEOUT
     deadline = time.monotonic() + HTTP_TOTAL_RETRY_BUDGET
+    # Optional per-probe wall clock (#41). The total-retry budget above only
+    # skips the sleep, so a silent host still runs every attempt at the full
+    # timeout. When the caller passes a monotonic deadline, an attempt that
+    # cannot finish inside it is not started.
+    if deadline_monotonic is not None:
+        deadline = min(deadline, deadline_monotonic)
     last_result: Optional[Tuple[int, bytes]] = None
     last_exc: Optional[BaseException] = None
     for attempt in range(HTTP_MAX_ATTEMPTS):
+        attempt_timeout = timeout
+        if deadline_monotonic is not None:
+            remaining_attempt = deadline_monotonic - time.monotonic()
+            if remaining_attempt <= 0:
+                break
+            attempt_timeout = min(timeout, remaining_attempt)
         retry_after: Optional[float] = None
         try:
-            with _urlopen(req, timeout) as resp:
+            with _urlopen(req, attempt_timeout) as resp:
                 status, body = resp.status, _read_response_body(resp)
                 if not _is_retryable_status(status):
                     return status, body
@@ -533,6 +550,7 @@ def http_get(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     timeout: Optional[float] = None,
+    deadline_monotonic: Optional[float] = None,
 ) -> Tuple[int, bytes]:
     """Returns (status_code, body_bytes). Retries transient failures internally
     (see _request_with_retry); raises urllib.error.URLError / socket.timeout only
@@ -540,7 +558,7 @@ def http_get(
     before any network/filesystem open (#348)."""
     _assert_http_url(url)
     req = urllib.request.Request(url, headers=headers or _make_headers())
-    return _request_with_retry(req, timeout=timeout)
+    return _request_with_retry(req, timeout=timeout, deadline_monotonic=deadline_monotonic)
 
 
 def http_post_json(
@@ -739,6 +757,7 @@ def http_get_cached(
     ttl_seconds: float,
     headers: Optional[Dict[str, str]] = None,
     timeout: Optional[float] = None,
+    deadline_monotonic: Optional[float] = None,
 ) -> Tuple[int, bytes]:
     """Cached GET: returns a cached (200, body) on hit, else delegates to http_get.
 
@@ -764,14 +783,14 @@ def http_get_cached(
     return/raise, same as before this change.
     """
     if _headers_have_authorization(headers):
-        return http_get(url, headers, timeout=timeout)
+        return http_get(url, headers, timeout=timeout, deadline_monotonic=deadline_monotonic)
     host = urllib.parse.urlparse(url).hostname or ""
     if host in _CACHE_DENYLIST:
-        return http_get(url, headers, timeout=timeout)
+        return http_get(url, headers, timeout=timeout, deadline_monotonic=deadline_monotonic)
     result = _file_cache.get(url, ttl_seconds, negative_ttl=TTL_NEGATIVE_404)
     if result is not None:
         return result
-    status, body = http_get(url, headers, timeout=timeout)
+    status, body = http_get(url, headers, timeout=timeout, deadline_monotonic=deadline_monotonic)
     if status in (200, 404):
         _file_cache.set(url, status, body)
     return (status, body)
@@ -1165,14 +1184,18 @@ def _repo_http_get(
     entry: Dict[str, Any],
     url: str,
     ttl_seconds: Optional[float] = None,
+    timeout: Optional[float] = None,
+    deadline_monotonic: Optional[float] = None,
 ) -> Tuple[int, bytes]:
     """GET a Maven-repo URL with per-repo auth headers. When ``ttl_seconds`` is
     set, uses ``http_get_cached`` (auth-bearing responses still bypass the
     disk cache)."""
     headers = _repo_request_headers(entry)
     if ttl_seconds is None:
-        return http_get(url, headers)
-    return http_get_cached(url, ttl_seconds, headers)
+        return http_get(url, headers, timeout=timeout, deadline_monotonic=deadline_monotonic)
+    return http_get_cached(
+        url, ttl_seconds, headers, timeout=timeout, deadline_monotonic=deadline_monotonic,
+    )
 
 
 def _auth_required_message(entry: Dict[str, Any], status: int) -> str:
@@ -1923,6 +1946,7 @@ class ResolutionContext:
         offline: bool = False,
         repository_base: Optional[str] = None,
         mirrors: Optional[List[Dict[str, str]]] = None,
+        tool_deadline: Optional[float] = None,
     ) -> None:
         self.project_path = project_path
         self.scoped_repos = scoped_repos
@@ -1930,6 +1954,9 @@ class ResolutionContext:
         self.offline = offline
         self.repository_base = repository_base
         self.mirrors = list(mirrors) if mirrors else []
+        # Audit-only wall clock (#41). None on every other handler, so
+        # fetch_metadata keeps the full HTTP_TIMEOUT retry cycle.
+        self.tool_deadline = tool_deadline
 
 
 def _public_fallback_enabled() -> bool:
@@ -2114,6 +2141,117 @@ def _to_resolved_from(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# In-memory repo-probe failures (#41). Not FileCache: a timeout never reaches
+# FileCache.set, and a 5xx is intentionally not a disk status. 429 is not
+# stored. Keyed by metadata URL; bounded so a long-lived stdio process cannot
+# grow it without limit. Honors MAVEN_MCP_CACHE_DISABLE like the disk cache.
+_REPO_FAILURE_MAX = 256
+_repo_failure_cache: Dict[str, Tuple[float, str]] = {}
+_repo_failure_lock = threading.Lock()
+# Audit worker → (repository it is blocked on, whether a later declared
+# repository has not been contacted). The collector thread reads this; the
+# worker writes it. The flag is not ``len(repos) >= 2``: the last repository
+# can already have accepted a GET when the deadline slot is abandoned (#41).
+_repo_probe_labels: Dict[int, Tuple[str, bool]] = {}
+_repo_probe_lock = threading.Lock()
+_audit_probe = threading.local()
+
+
+def _cache_disabled() -> bool:
+    return os.environ.get("MAVEN_MCP_CACHE_DISABLE", "").lower() in ("1", "true", "yes", "on")
+
+
+def _repo_failure_lookup(url: str) -> Optional[str]:
+    """Return the remembered failure message, or None on miss / expiry."""
+    if _cache_disabled():
+        return None
+    now = _now()
+    with _repo_failure_lock:
+        hit = _repo_failure_cache.get(url)
+        if hit is None:
+            return None
+        ts, message = hit
+        if now - ts > TTL_REPO_FAILURE:
+            _repo_failure_cache.pop(url, None)
+            return None
+        return message
+
+
+def _repo_failure_remember(url: str, message: str) -> None:
+    """Remember a timeout or 5xx. No-op when the disk cache is disabled."""
+    if _cache_disabled():
+        return
+    now = _now()
+    with _repo_failure_lock:
+        _repo_failure_cache[url] = (now, message)
+        if len(_repo_failure_cache) <= _REPO_FAILURE_MAX:
+            return
+        oldest = sorted(_repo_failure_cache.items(), key=lambda item: item[1][0])
+        for key, _hit in oldest[: len(_repo_failure_cache) - _REPO_FAILURE_MAX // 2]:
+            _repo_failure_cache.pop(key, None)
+
+
+def _note_repo_probe(label: Optional[str], later: bool = False) -> None:
+    """Publish the repository the current audit worker is contacting.
+
+    ``later`` is true when a declared repository after this one has not been
+    contacted. A deadline placeholder must not infer that from ``len(repos)
+    >= 2`` alone: the worker may already be blocked on the last repository.
+    """
+    dep_id = getattr(_audit_probe, "dep_id", None)
+    if dep_id is None:
+        return
+    with _repo_probe_lock:
+        if label is None:
+            _repo_probe_labels.pop(dep_id, None)
+        else:
+            _repo_probe_labels[dep_id] = (label, later)
+
+
+def _repo_probe_state(dep_id: int) -> Optional[Tuple[str, bool]]:
+    with _repo_probe_lock:
+        return _repo_probe_labels.get(dep_id)
+
+
+def _metadata_probe_limits(
+    deadline: Optional[float], repos_left: int,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Per-attempt timeout and a monotonic deadline for one metadata probe.
+
+    ``(None, None)`` keeps HTTP_TIMEOUT and the normal retry cycle. With a
+    tool deadline, each remaining repository gets an equal share so a silent
+    first host cannot spend ``HTTP_TIMEOUT * HTTP_MAX_ATTEMPTS`` (that sum is
+    larger than ``TOOL_DEADLINE``) before the next declared repository runs.
+    """
+    if deadline is None:
+        return None, None
+    remaining = deadline - _now()
+    if remaining <= 0 or repos_left <= 0:
+        return None, time.monotonic()
+    share = remaining if repos_left <= 1 else remaining / repos_left
+    gaps = max(0, HTTP_MAX_ATTEMPTS - 1)
+    max_gap = HTTP_BACKOFF_BASE + HTTP_BACKOFF_JITTER
+    per_attempt = (share - gaps * max_gap) / HTTP_MAX_ATTEMPTS
+    if per_attempt <= 0:
+        # Share cannot fit a retry sleep. One attempt; the monotonic deadline
+        # stops the second attempt from starting.
+        per_attempt = share
+    per_attempt = min(HTTP_TIMEOUT, max(per_attempt, 0.001))
+    return per_attempt, time.monotonic() + share
+
+
+def _untried_probe(exc: BaseException) -> bool:
+    """True when retry returned without a real transport error or HTTP status.
+
+    That synthetic URLError must not be remembered: the next audit would skip
+    a repository that was never contacted.
+    """
+    return (
+        isinstance(exc, urllib.error.URLError)
+        and "no response and no transport error" in str(exc)
+    )
+
+
 def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") -> Dict[str, Any]:
     """Query every repo in ``ctx`` and MERGE results across those answering 200:
     version sets are unioned, deduped and sorted ascending so a private repo's
@@ -2148,10 +2286,41 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     # First repo (in _repos_for order: declared repos before any public-fallback
     # append) that answers 200 — surfaced as resolvedFrom for #317 provenance.
     resolved_from: Optional[Dict[str, Any]] = None
-    for entry in repos:
+    for index, entry in enumerate(repos):
+        # entry["name"] can be the literal repo URL for maven("url")
+        # declarations (name == url); redact before it reaches tool-facing text.
+        name = _strip_userinfo(entry["name"])
+        _note_repo_probe(name, index + 1 < len(repos))
+        tool_deadline = getattr(ctx, "tool_deadline", None)
+        if tool_deadline is not None and _now() >= tool_deadline:
+            # A later repository was never tried. Name the one we stopped on
+            # instead of a deadline-only phrase (#41).
+            if last_err:
+                last_err = (
+                    f"{last_err}; skipped {name} after the "
+                    f"{TOOL_DEADLINE}s tool deadline"
+                )
+            else:
+                last_err = (
+                    f"timed out contacting {name} before the "
+                    f"{TOOL_DEADLINE}s tool deadline; "
+                    f"later repositories were not queried"
+                )
+            break
         url = _metadata_url(entry["url"], group_id, artifact_id)
+        if tool_deadline is not None:
+            remembered = _repo_failure_lookup(url)
+            if remembered is not None:
+                last_err = remembered
+                continue
+        timeout, mono_deadline = _metadata_probe_limits(
+            tool_deadline, len(repos) - index,
+        )
         try:
-            status, body = _repo_http_get(entry, url, TTL_METADATA)
+            status, body = _repo_http_get(
+                entry, url, TTL_METADATA,
+                timeout=timeout, deadline_monotonic=mono_deadline,
+            )
             if status == 200:
                 # "answered" is gated on HTTP 200 itself, not on a non-empty
                 # version list — a 200 with empty <versions> still counts as a
@@ -2170,10 +2339,11 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
                 # rather than a bare HTTP code (#291). Never include secrets.
                 last_err = _auth_required_message(entry, status)
             else:
-                # entry["name"] can be the literal repo URL for maven("url")
-                # declarations (name == url); redact before it reaches the
-                # exception message, which flows into tool-facing "error" fields.
-                last_err = f"HTTP {status} from {_strip_userinfo(entry['name'])}"
+                last_err = f"HTTP {status} from {name}"
+                # 429 stays uncached (rate-limit must re-hit). 5xx is remembered
+                # in memory only — FileCache.set still refuses it.
+                if tool_deadline is not None and 500 <= status < 600:
+                    _repo_failure_remember(url, last_err)
         except Exception as e:
             # Never interpolate str(e) here: a userinfo URL (https://user:pass@host)
             # makes urlopen raise http.client.InvalidURL — NOT a urllib.error.URLError,
@@ -2183,7 +2353,13 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             # scheme://user:pass@host URL, not a credential fragment embedded in
             # free text). Build the message from known-safe components instead:
             # the exception type name plus the already-redacted repo name.
-            last_err = f"{type(e).__name__} from {_strip_userinfo(entry['name'])}"
+            last_err = f"{type(e).__name__} from {name}"
+            if (
+                tool_deadline is not None
+                and not _untried_probe(e)
+                and isinstance(e, (urllib.error.URLError, socket.timeout))
+            ):
+                _repo_failure_remember(url, last_err)
     if not answered:
         raise ValueError(f"Could not fetch metadata for {group_id}:{artifact_id}: {last_err}")
     versions = sorted(set(merged_versions), key=functools.cmp_to_key(compare_versions))
@@ -9091,13 +9267,16 @@ def _fetch_osv_vuln(vuln_id: str) -> Optional[Dict]:
         return None
 
 
-def _hydrate_osv_vulns(vuln_ids: List[str]) -> Dict[str, Dict]:
+def _hydrate_osv_vulns(
+    vuln_ids: List[str], deadline: Optional[float] = None,
+) -> Dict[str, Dict]:
     """Fetch full OSV records for unique IDs (first-seen order), capped.
 
     Returns id → full vuln dict for successful hydrations only. IDs skipped by
-    the cap or failed fetches are absent — callers keep the bare querybatch
-    entry for those. Counts each network attempt toward MAX_OSV_VULN_HYDRATIONS
-    (same operational-bound pattern as MAX_GATED_SOLR_CALLS_PER_BATCH).
+    the cap, a passed ``deadline``, or failed fetches are absent — callers keep
+    the bare querybatch entry for those. Counts each network attempt toward
+    MAX_OSV_VULN_HYDRATIONS (same operational-bound pattern as
+    MAX_GATED_SOLR_CALLS_PER_BATCH).
     """
     out: Dict[str, Dict] = {}
     seen: set = set()
@@ -9108,6 +9287,8 @@ def _hydrate_osv_vulns(vuln_ids: List[str]) -> Dict[str, Dict]:
         seen.add(vid)
         if attempts >= MAX_OSV_VULN_HYDRATIONS:
             continue
+        if deadline is not None and _now() >= deadline:
+            break
         attempts += 1
         full = _fetch_osv_vuln(vid)
         if full is not None:
@@ -9184,7 +9365,7 @@ def _compute_safe_upgrade(vulnerabilities: List[Dict]) -> Optional[Dict[str, Any
     return {"version": best_version, "fixesAllKnown": True}
 
 
-def query_osv_batch(deps: List[Dict]) -> List[Dict]:
+def query_osv_batch(deps: List[Dict], deadline: Optional[float] = None) -> List[Dict]:
     """deps: list of {groupId, artifactId, version}. Returns list of {groupId, artifactId, version, vulnerabilities}.
 
     Chunks into ≤OSV_QUERYBATCH_MAX queries per POST (OSV.dev documented limit)
@@ -9229,7 +9410,12 @@ def query_osv_batch(deps: List[Dict]) -> List[Dict]:
             vid = v.get("id") or ""
             if vid:
                 ids_ordered.append(vid)
-    hydrated = _hydrate_osv_vulns(ids_ordered)
+    # #41: querybatch already ran; do not start the per-id GET fan-out once
+    # the shared tool deadline has passed. Bare ids stay on the entries.
+    if deadline is not None and _now() >= deadline:
+        hydrated = {}
+    else:
+        hydrated = _hydrate_osv_vulns(ids_ordered, deadline)
     # Phase 3: merge hydrated records and extract public fields.
     out: List[Dict] = []
     for dep, vulns_raw, unreachable in bare_pairs:
@@ -13320,6 +13506,37 @@ def _has_audit_issue(entry: Dict[str, Any]) -> bool:
     return False
 
 
+def _audit_deadline_skip_error(dep: Dict, ctx: "ResolutionContext") -> str:
+    """Deadline placeholder that names the repository still being contacted.
+
+    A bare "exceeded the deadline" hides which host the worker was on (#41).
+    "later repositories were not queried" is added only when a declared
+    repository after the in-flight one was not contacted. Two repositories
+    in scope is not enough: the worker may already be blocked on the last
+    one, whose GET has been accepted.
+    """
+    message = f"skipped: exceeded the {TOOL_DEADLINE}s tool deadline"
+    try:
+        repos = _repos_for(dep["groupId"], dep["artifactId"], ctx)
+    except Exception:
+        repos = []
+    state = _repo_probe_state(id(dep))
+    if state is None:
+        # The worker never published a probe, so it did not reach a later host.
+        label = ""
+        if repos:
+            label = _strip_userinfo(repos[0].get("name") or repos[0].get("url") or "")
+        later = len(repos) >= 2
+    else:
+        label, later = state
+    if not label:
+        return message
+    message = f"{message} while waiting for {label}"
+    if later:
+        message += "; later repositories were not queried"
+    return message
+
+
 def handle_audit_project_dependencies(args: Dict) -> Any:
     project_path = args.get("projectPath") or os.getcwd()
     include_vulns = args.get("includeVulnerabilities", True)
@@ -13347,7 +13564,10 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         apply_bom_managed_versions(scan, ctx)
     # Start the budget after the scan: the Gradle resolve alone can take longer
     # than TOOL_DEADLINE and would leave the fan-out phases no time at all.
+    # fetch_metadata reads tool_deadline so one silent repository cannot spend
+    # the whole budget before the next declared repository is queried (#41).
     deadline = _now() + TOOL_DEADLINE
+    ctx.tool_deadline = deadline
 
     def is_included_in_production(dep: Dict) -> bool:
         source = dep["source"]
@@ -13418,6 +13638,7 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         # #317 finding 1 fix applied to handle_check_multiple_dependencies /
         # handle_compare_dependency_versions.
         resolved_from = None
+        _audit_probe.dep_id = id(dep)
         try:
             with metadata_cache_lock:
                 metadata = metadata_cache.get(ga_key)
@@ -13454,6 +13675,12 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             # current/get_upgrade_type are pure version-string functions that
             # never embed a repo URL.
             return _audit_error_entry(dep, current_version, str(e), resolved_from)
+        finally:
+            # Pop only after the result is about to be published. A slot _map_parallel
+            # leaves as None is still inside this function, so the label is readable.
+            with _repo_probe_lock:
+                _repo_probe_labels.pop(id(dep), None)
+            _audit_probe.dep_id = None
 
     # #400/#402: bounded parallel fan-out, order preserved, bounded by the
     # shared tool-wide deadline. A dep left unprocessed when the deadline
@@ -13469,7 +13696,7 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         if entry is None:
             entry = _audit_error_entry(
                 dep, _effective_version(dep),
-                f"skipped: exceeded the {TOOL_DEADLINE}s tool deadline",
+                _audit_deadline_skip_error(dep, ctx),
             )
         audit_deps.append(entry)
 
@@ -13487,9 +13714,12 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             entry["platformKind"] = dep.get("platformKind")
         audit_deps.append(entry)
 
-    # Vulnerability check — deduplicate per GAV
+    # Vulnerability check — deduplicate per GAV.
+    # #41: do not start querybatch or hydration once the shared budget is gone.
     osv_capability: Optional[str] = None
-    if include_vulns and deps_with_version:
+    if include_vulns and deps_with_version and (deadline_hit or _now() >= deadline):
+        deadline_hit = True
+    elif include_vulns and deps_with_version:
         gav_map: Dict[str, List[Dict]] = {}
         for a in audit_deps:
             if not a.get("currentVersion"):
@@ -13530,32 +13760,39 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             for first, resolved in zip(firsts, resolved_list)
         ]
 
-        vuln_results = query_osv_batch(unique_gavs)
-        for i, key in enumerate(unique_keys):
-            targets = gav_map.get(key, [])
-            mapped_vulns = [
-                {
-                    "id": v["id"],
-                    "severity": v.get("severity"),
-                    "fixedVersion": v.get("fixedVersion"),
-                    # Forwarded explicitly (#322): this dict is a narrower
-                    # reconstruction of query_osv_batch's vuln_info, not a
-                    # pass-through, so a new vuln_info field does not reach here
-                    # for free.
-                    "malicious": v.get("malicious", False),
-                }
-                for v in vuln_results[i].get("vulnerabilities", [])
-            ]
-            resolved = resolved_impls.get(key)
-            entry_cap = vuln_results[i].get("capabilityUnavailable")
-            if entry_cap and osv_capability is None:
-                osv_capability = entry_cap
-            for target in targets:
-                target["vulnerabilities"] = mapped_vulns
-                if entry_cap:
-                    target["capabilityUnavailable"] = entry_cap
-                if resolved:
-                    target["resolvedImplementation"] = resolved
+        vuln_results: Optional[List[Dict]] = None
+        if deadline_hit or _now() >= deadline:
+            deadline_hit = True
+        else:
+            vuln_results = query_osv_batch(unique_gavs, deadline)
+            if _now() >= deadline:
+                deadline_hit = True
+        if vuln_results is not None:
+            for i, key in enumerate(unique_keys):
+                targets = gav_map.get(key, [])
+                mapped_vulns = [
+                    {
+                        "id": v["id"],
+                        "severity": v.get("severity"),
+                        "fixedVersion": v.get("fixedVersion"),
+                        # Forwarded explicitly (#322): this dict is a narrower
+                        # reconstruction of query_osv_batch's vuln_info, not a
+                        # pass-through, so a new vuln_info field does not reach here
+                        # for free.
+                        "malicious": v.get("malicious", False),
+                    }
+                    for v in vuln_results[i].get("vulnerabilities", [])
+                ]
+                resolved = resolved_impls.get(key)
+                entry_cap = vuln_results[i].get("capabilityUnavailable")
+                if entry_cap and osv_capability is None:
+                    osv_capability = entry_cap
+                for target in targets:
+                    target["vulnerabilities"] = mapped_vulns
+                    if entry_cap:
+                        target["capabilityUnavailable"] = entry_cap
+                    if resolved:
+                        target["resolvedImplementation"] = resolved
 
     licenses_section: Optional[Dict[str, Any]] = None
     new_license_categories: Optional[List[str]] = None
