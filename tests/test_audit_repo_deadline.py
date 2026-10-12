@@ -537,6 +537,66 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
         self.assertGreaterEqual(len(waiting), 1, by_artifact)
         self.assertIn("a8", by_artifact)
 
+    def test_cached_200_beats_remembered_failure_and_a_passed_deadline(self):
+        # A timeout/5xx remembered in memory must not hide a metadata document
+        # already on disk, including when the tool deadline has already passed.
+        # A cache hit does not contact the repository.
+        log = _Log()
+        bad = self._start(_metadata_handler(log, b"", status=500))
+        bad_url = _base(bad)
+        pom = _pom([("bad", bad_url)], ["one"])
+        meta_url = server._metadata_url(bad_url, "com.example", "one")
+        body = _metadata_xml(("2.0.0",))
+
+        with temp_project({"pom.xml": pom}) as root, temp_cache_dir():
+            with unittest.mock.patch.dict(os.environ, self._env(self._start(_osv_handler(_Log())))):
+                server._repo_failure_remember(meta_url, "HTTP 500 from bad")
+                server._file_cache.set(meta_url, 200, body)
+                out = self._audit(root)
+                self.assertEqual(log.snapshot(), [])
+                dep = out["dependencies"][0]
+                self.assertEqual(dep["latestVersion"], "2.0.0")
+                self.assertNotIn("error", dep)
+                self.assertIsNone(server._repo_failure_lookup(meta_url))
+
+                server._repo_failure_remember(meta_url, "HTTP 500 from bad")
+                with unittest.mock.patch.object(server, "TOOL_DEADLINE", -1.0):
+                    late = self._audit(root)
+                self.assertEqual(log.snapshot(), [])
+                self.assertEqual(late["dependencies"][0]["latestVersion"], "2.0.0")
+                self.assertNotIn("error", late["dependencies"][0])
+                self.assertIsNone(server._repo_failure_lookup(meta_url))
+
+    def test_discarded_finished_worker_keeps_the_last_probe_label(self):
+        # _map_parallel can drop a finished worker's return value (the slot
+        # stays None). The deadline phrase must name the repository that
+        # worker actually contacted, not the first declared one, and must not
+        # invent "later repositories were not queried" from len(repos) >= 2.
+        bad_log = _Log()
+        fast_log = _Log()
+        bad = self._start(_metadata_handler(bad_log, b"", status=500))
+        fast = self._start(_metadata_handler(fast_log, _metadata_xml()))
+        osv = self._start(_osv_handler(_Log()))
+        pom = _pom([("bad", _base(bad)), ("fast", _base(fast))], ["one", "two"])
+
+        def discard(items, fn, max_workers=8, deadline=None):
+            for item in items:
+                fn(item)
+            return [None] * len(items), True
+
+        with temp_project({"pom.xml": pom}) as root, temp_cache_dir():
+            with unittest.mock.patch.dict(os.environ, self._env(osv)), \
+                    unittest.mock.patch.object(server, "_map_parallel", discard):
+                out = self._audit(root)
+
+        self.assertGreaterEqual(len(fast_log.snapshot()), 2)
+        for dep in out["dependencies"]:
+            self.assertEqual(
+                dep["error"],
+                f"skipped: exceeded the {server.TOOL_DEADLINE}s tool deadline "
+                "while waiting for fast",
+            )
+
     def _assert_versions(self, out, fast_url, elapsed):
         self.assertNotIn("partial", out)
         self.assertLess(elapsed, 3.0)
