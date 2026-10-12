@@ -2191,6 +2191,60 @@ def _repo_failure_remember(url: str, message: str) -> None:
             _repo_failure_cache.pop(key, None)
 
 
+def _repo_failure_forget(url: str) -> None:
+    """Drop a remembered timeout or 5xx once a 200 or 404 is known.
+
+    `get_latest_version` and the other non-audit callers do not consult this
+    map, and a 200 they store must not stay hidden behind the memory entry.
+    """
+    with _repo_failure_lock:
+        _repo_failure_cache.pop(url, None)
+
+
+class _AuditProbeBoard:
+    """Per-audit labels for the repository a worker is blocked on.
+
+    `_map_parallel` can discard a worker's return value and leave the slot
+    None. Popping the label in the worker `finally` made that missing label
+    look like "never started", and the deadline fallback then invented
+    "later repositories were not queried" from `len(repos) >= 2`. The label
+    stays until the collector copies it. A still-running worker cannot
+    replace a label the collector has already taken.
+    """
+
+    def __init__(self) -> None:
+        self.labels: Dict[int, Tuple[str, bool]] = {}
+        self.closed: Set[int] = set()
+        self.lock = threading.Lock()
+
+    def note(self, dep_id: int, label: Optional[str], later: bool) -> None:
+        with self.lock:
+            if dep_id in self.closed:
+                return
+            if label is None:
+                self.labels.pop(dep_id, None)
+            else:
+                self.labels[dep_id] = (label, later)
+
+    def take(self, dep_id: int) -> Optional[Tuple[str, bool]]:
+        with self.lock:
+            self.closed.add(dep_id)
+            return self.labels.pop(dep_id, None)
+
+    def discard(self, dep_id: int) -> None:
+        """The worker's result was kept. Drop the label; nothing will read it."""
+        with self.lock:
+            self.labels.pop(dep_id, None)
+            self.closed.discard(dep_id)
+
+    def release(self, dep_id: int) -> None:
+        """Worker `finally`. Leave an untaken label for the collector."""
+        with self.lock:
+            if dep_id in self.closed:
+                self.labels.pop(dep_id, None)
+                self.closed.discard(dep_id)
+
+
 def _note_repo_probe(label: Optional[str], later: bool = False) -> None:
     """Publish the repository the current audit worker is contacting.
 
@@ -2200,6 +2254,10 @@ def _note_repo_probe(label: Optional[str], later: bool = False) -> None:
     """
     dep_id = getattr(_audit_probe, "dep_id", None)
     if dep_id is None:
+        return
+    board = getattr(_audit_probe, "board", None)
+    if isinstance(board, _AuditProbeBoard):
+        board.note(dep_id, label, later)
         return
     with _repo_probe_lock:
         if label is None:
@@ -2238,6 +2296,22 @@ def _metadata_probe_limits(
         per_attempt = share
     per_attempt = min(HTTP_TIMEOUT, max(per_attempt, 0.001))
     return per_attempt, time.monotonic() + share
+
+
+def _peek_metadata_cache(
+    entry: Dict[str, Any], url: str,
+) -> Optional[Tuple[int, bytes]]:
+    """Fresh metadata from disk, or None. Does not contact the network.
+
+    Auth-bearing and denylisted GETs bypass the disk cache, the same rule as
+    `http_get_cached`. A hit does not cost the audit deadline.
+    """
+    if _headers_have_authorization(_repo_request_headers(entry)):
+        return None
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host in _CACHE_DENYLIST:
+        return None
+    return _file_cache.get(url, TTL_METADATA, negative_ttl=TTL_NEGATIVE_404)
 
 
 def _untried_probe(exc: BaseException) -> bool:
@@ -2290,75 +2364,89 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
         # entry["name"] can be the literal repo URL for maven("url")
         # declarations (name == url); redact before it reaches tool-facing text.
         name = _strip_userinfo(entry["name"])
-        _note_repo_probe(name, index + 1 < len(repos))
-        tool_deadline = getattr(ctx, "tool_deadline", None)
-        if tool_deadline is not None and _now() >= tool_deadline:
-            # A later repository was never tried. Name the one we stopped on
-            # instead of a deadline-only phrase (#41).
-            if last_err:
-                last_err = (
-                    f"{last_err}; skipped {name} after the "
-                    f"{TOOL_DEADLINE}s tool deadline"
-                )
-            else:
-                last_err = (
-                    f"timed out contacting {name} before the "
-                    f"{TOOL_DEADLINE}s tool deadline; "
-                    f"later repositories were not queried"
-                )
-            break
         url = _metadata_url(entry["url"], group_id, artifact_id)
-        if tool_deadline is not None:
-            remembered = _repo_failure_lookup(url)
-            if remembered is not None:
-                last_err = remembered
-                continue
-        timeout, mono_deadline = _metadata_probe_limits(
-            tool_deadline, len(repos) - index,
-        )
-        try:
-            status, body = _repo_http_get(
-                entry, url, TTL_METADATA,
-                timeout=timeout, deadline_monotonic=mono_deadline,
+        tool_deadline = getattr(ctx, "tool_deadline", None)
+        # Disk wins over both short-circuits below. A remembered timeout must
+        # not hide a 200 stored later by another tool, and a passed deadline
+        # must not skip a document that is already local (#41 follow-up).
+        cached = _peek_metadata_cache(entry, url) if tool_deadline is not None else None
+        if cached is not None:
+            _repo_failure_forget(url)
+            status, body = cached
+        else:
+            if tool_deadline is not None and _now() >= tool_deadline:
+                # A later repository was never tried. Name the one we stopped on
+                # instead of a deadline-only phrase (#41). Do not publish a
+                # probe label: this GET is not sent.
+                if last_err:
+                    last_err = (
+                        f"{last_err}; skipped {name} after the "
+                        f"{TOOL_DEADLINE}s tool deadline"
+                    )
+                else:
+                    last_err = (
+                        f"timed out contacting {name} before the "
+                        f"{TOOL_DEADLINE}s tool deadline; "
+                        f"later repositories were not queried"
+                    )
+                break
+            if tool_deadline is not None:
+                remembered = _repo_failure_lookup(url)
+                if remembered is not None:
+                    last_err = remembered
+                    continue
+            # Publish only once the request is about to be sent.
+            _note_repo_probe(name, index + 1 < len(repos))
+            timeout, mono_deadline = _metadata_probe_limits(
+                tool_deadline, len(repos) - index,
             )
-            if status == 200:
-                # "answered" is gated on HTTP 200 itself, not on a non-empty
-                # version list — a 200 with empty <versions> still counts as a
-                # reachable repo, matching the legacy first-hit contract.
-                answered = True
-                if resolved_from is None:
-                    resolved_from = _to_resolved_from(entry)
-                parsed = _parse_metadata_xml(body.decode("utf-8", errors="replace"), group_id, artifact_id)
-                merged_versions.extend(parsed["versions"])
-                lu = parsed.get("lastUpdated")
-                if lu and (last_updated is None or lu > last_updated):
-                    last_updated = lu
-            elif status in (401, 403):
-                # Private/corporate repos reject unauthenticated (or wrong-cred)
-                # probes with 401/403 — surface a clear "auth required" signal
-                # rather than a bare HTTP code (#291). Never include secrets.
-                last_err = _auth_required_message(entry, status)
-            else:
-                last_err = f"HTTP {status} from {name}"
-                # 429 stays uncached (rate-limit must re-hit). 5xx is remembered
-                # in memory only — FileCache.set still refuses it.
-                if tool_deadline is not None and 500 <= status < 600:
+            try:
+                status, body = _repo_http_get(
+                    entry, url, TTL_METADATA,
+                    timeout=timeout, deadline_monotonic=mono_deadline,
+                )
+            except Exception as e:
+                # Never interpolate str(e) here: a userinfo URL (https://user:pass@host)
+                # makes urlopen raise http.client.InvalidURL — NOT a urllib.error.URLError,
+                # so it lands in this generic branch — whose message embeds the raw
+                # password (e.g. "nonnumeric port: 'pass@host'"), a string shape
+                # _strip_userinfo cannot redact (it only redacts a value that IS a bare
+                # scheme://user:pass@host URL, not a credential fragment embedded in
+                # free text). Build the message from known-safe components instead:
+                # the exception type name plus the already-redacted repo name.
+                last_err = f"{type(e).__name__} from {name}"
+                if (
+                    tool_deadline is not None
+                    and not _untried_probe(e)
+                    and isinstance(e, (urllib.error.URLError, socket.timeout))
+                ):
                     _repo_failure_remember(url, last_err)
-        except Exception as e:
-            # Never interpolate str(e) here: a userinfo URL (https://user:pass@host)
-            # makes urlopen raise http.client.InvalidURL — NOT a urllib.error.URLError,
-            # so it lands in this generic branch — whose message embeds the raw
-            # password (e.g. "nonnumeric port: 'pass@host'"), a string shape
-            # _strip_userinfo cannot redact (it only redacts a value that IS a bare
-            # scheme://user:pass@host URL, not a credential fragment embedded in
-            # free text). Build the message from known-safe components instead:
-            # the exception type name plus the already-redacted repo name.
-            last_err = f"{type(e).__name__} from {name}"
-            if (
-                tool_deadline is not None
-                and not _untried_probe(e)
-                and isinstance(e, (urllib.error.URLError, socket.timeout))
-            ):
+                continue
+            if status in (200, 404):
+                _repo_failure_forget(url)
+        if status == 200:
+            # "answered" is gated on HTTP 200 itself, not on a non-empty
+            # version list — a 200 with empty <versions> still counts as a
+            # reachable repo, matching the legacy first-hit contract.
+            answered = True
+            if resolved_from is None:
+                resolved_from = _to_resolved_from(entry)
+            parsed = _parse_metadata_xml(body.decode("utf-8", errors="replace"), group_id, artifact_id)
+            merged_versions.extend(parsed["versions"])
+            lu = parsed.get("lastUpdated")
+            if lu and (last_updated is None or lu > last_updated):
+                last_updated = lu
+        elif status in (401, 403):
+            # Private/corporate repos reject unauthenticated (or wrong-cred)
+            # probes with 401/403 — surface a clear "auth required" signal
+            # rather than a bare HTTP code (#291). Never include secrets.
+            last_err = _auth_required_message(entry, status)
+        else:
+            last_err = f"HTTP {status} from {name}"
+            # 429 stays uncached (rate-limit must re-hit). 5xx is remembered
+            # in memory only — FileCache.set still refuses it. A cached 404
+            # is a definitive absence, not a failure to remember.
+            if tool_deadline is not None and 500 <= status < 600:
                 _repo_failure_remember(url, last_err)
     if not answered:
         raise ValueError(f"Could not fetch metadata for {group_id}:{artifact_id}: {last_err}")
@@ -13506,21 +13594,31 @@ def _has_audit_issue(entry: Dict[str, Any]) -> bool:
     return False
 
 
-def _audit_deadline_skip_error(dep: Dict, ctx: "ResolutionContext") -> str:
+_MISSING_PROBE = object()
+
+
+def _audit_deadline_skip_error(
+    dep: Dict,
+    ctx: "ResolutionContext",
+    state: Any = _MISSING_PROBE,
+) -> str:
     """Deadline placeholder that names the repository still being contacted.
 
     A bare "exceeded the deadline" hides which host the worker was on (#41).
     "later repositories were not queried" is added only when a declared
     repository after the in-flight one was not contacted. Two repositories
     in scope is not enough: the worker may already be blocked on the last
-    one, whose GET has been accepted.
+    one, whose GET has been accepted. ``state is None`` means the worker
+    never published a probe. It does not mean the label was popped after a
+    finished GET: that label is passed in by the collector.
     """
     message = f"skipped: exceeded the {TOOL_DEADLINE}s tool deadline"
     try:
         repos = _repos_for(dep["groupId"], dep["artifactId"], ctx)
     except Exception:
         repos = []
-    state = _repo_probe_state(id(dep))
+    if state is _MISSING_PROBE:
+        state = _repo_probe_state(id(dep))
     if state is None:
         # The worker never published a probe, so it did not reach a later host.
         label = ""
@@ -13625,6 +13723,7 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
     # first-writer-wins), never a corrupted or inconsistent cache entry.
     metadata_cache: Dict[str, Any] = {}
     metadata_cache_lock = threading.Lock()
+    probe_board = _AuditProbeBoard()
 
     def _fetch_one_audit_dep(dep: Dict) -> Dict[str, Any]:
         # Only ever called on deps_with_version (line ~9691, already filtered to a
@@ -13639,6 +13738,7 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         # handle_compare_dependency_versions.
         resolved_from = None
         _audit_probe.dep_id = id(dep)
+        _audit_probe.board = probe_board
         try:
             with metadata_cache_lock:
                 metadata = metadata_cache.get(ga_key)
@@ -13676,11 +13776,12 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             # never embed a repo URL.
             return _audit_error_entry(dep, current_version, str(e), resolved_from)
         finally:
-            # Pop only after the result is about to be published. A slot _map_parallel
-            # leaves as None is still inside this function, so the label is readable.
-            with _repo_probe_lock:
-                _repo_probe_labels.pop(id(dep), None)
+            # Do not pop an untaken label. _map_parallel may discard this
+            # return value, and the collector still needs the repository the
+            # worker was blocked on. release() drops the label only after take().
+            probe_board.release(id(dep))
             _audit_probe.dep_id = None
+            _audit_probe.board = None
 
     # #400/#402: bounded parallel fan-out, order preserved, bounded by the
     # shared tool-wide deadline. A dep left unprocessed when the deadline
@@ -13696,8 +13797,10 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         if entry is None:
             entry = _audit_error_entry(
                 dep, _effective_version(dep),
-                _audit_deadline_skip_error(dep, ctx),
+                _audit_deadline_skip_error(dep, ctx, probe_board.take(id(dep))),
             )
+        else:
+            probe_board.discard(id(dep))
         audit_deps.append(entry)
 
     for dep in deps_without_version:
