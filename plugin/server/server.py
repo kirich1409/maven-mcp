@@ -18,6 +18,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -621,6 +623,18 @@ def http_post_bytes(
     return _request_with_retry(req, timeout=timeout)
 
 
+def _maven_mcp_cache_root() -> str:
+    """``${XDG_CACHE_HOME:-~/.cache}/maven-central-mcp``, read per call.
+
+    Shared by the response cache and the Gradle daemon registry. The registry
+    must not consult ``MAVEN_MCP_CACHE_DISABLE`` — that flag skips cache reads,
+    not this directory.
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "maven-central-mcp")
+
+
 # ---------------------------------------------------------------------------
 # Persistent file cache
 # ---------------------------------------------------------------------------
@@ -653,9 +667,7 @@ class FileCache:
         dir and correctly handles the pre-existing loose-perm case (makedirs'
         mode= is umask-masked and a no-op when the dir pre-exists).
         """
-        xdg = os.environ.get("XDG_CACHE_HOME")
-        base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".cache")
-        d = os.path.join(base, "maven-central-mcp")
+        d = _maven_mcp_cache_root()
         try:
             os.makedirs(d, mode=0o700, exist_ok=True)
             # Explicit chmod on the LEAF dir only: makedirs' mode= is
@@ -12420,28 +12432,318 @@ def _gradle_cli_prefix_args() -> List[str]:
     return []
 
 
+# Constant bytes: the pid path is -Dmaven.mcp.daemon.pidfile, not text in this
+# script, so the closure before/after calls stay byte-identical. Top-level
+# init-script code runs in the daemon JVM before project configuration.
+# ProcessHandle is reflected so a JVM without that class still compiles the
+# script and falls back to the MXBean name; a direct reference would fail the
+# compile and the fallback would never run. Do not print the pid.
+_GRADLE_DAEMON_PID_INIT_SCRIPT = """\
+def pid = null
+try {
+    def handle = Class.forName("java.lang.ProcessHandle")
+    def current = handle.getMethod("current").invoke(null)
+    pid = String.valueOf(handle.getMethod("pid").invoke(current))
+} catch (Throwable ignored) {
+    def name = java.lang.management.ManagementFactory.getRuntimeMXBean().getName()
+    def at = name.indexOf("@")
+    pid = at >= 0 ? name.substring(0, at) : name
+}
+def path = System.getProperty("maven.mcp.daemon.pidfile")
+if (path != null && pid != null) {
+    new File(path).setText(pid, "UTF-8")
+}
+"""
+
+
+def _gradle_daemon_registry_dir() -> Optional[str]:
+    """Owner-only registry for the daemon this server starts.
+
+    ``-Dorg.gradle.daemon.registry.base`` relocates ``registry.bin`` and
+    ``daemon-<pid>.out.log`` only. Caches stay in ``GRADLE_USER_HOME``. Not
+    tied to ``MAVEN_MCP_CACHE_DISABLE``. None when the directory cannot be
+    created: the wrapper then runs as before, and nothing is killed.
+    """
+    path = os.path.join(_maven_mcp_cache_root(), "gradle-daemon-registry")
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return os.path.abspath(path)
+
+
+def _gradle_daemon_log_paths(registry_dir: str) -> Set[str]:
+    """Absolute ``daemon-*.out.log`` paths under the registry, including version dirs."""
+    found: Set[str] = set()
+    try:
+        for dirpath, _dirnames, filenames in os.walk(registry_dir):
+            for name in filenames:
+                if name.startswith("daemon-") and name.endswith(".out.log"):
+                    found.add(os.path.join(dirpath, name))
+    except OSError:
+        return set()
+    return found
+
+
+def _discard_dir(path: Optional[str]) -> None:
+    if not path:
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _read_daemon_pid_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except OSError:
+        return None
+    if not text.isdigit():
+        return None
+    return text
+
+
+def _pid_from_single_new_daemon_log(registry_dir: str, before: Set[str]) -> Optional[str]:
+    """Pid from the one new daemon log since ``before``. Zero or several: do not guess."""
+    new = _gradle_daemon_log_paths(registry_dir) - before
+    if len(new) != 1:
+        return None
+    name = os.path.basename(next(iter(new)))
+    prefix = "daemon-"
+    suffix = ".out.log"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    pid = name[len(prefix):-len(suffix)]
+    if not pid.isdigit():
+        return None
+    return pid
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _process_command_line(pid: int) -> str:
+    proc_cmd = "/proc/%s/cmdline" % pid
+    try:
+        with open(proc_cmd, "rb") as handle:
+            raw = handle.read()
+        if raw:
+            return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-ww", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout or ""
+
+
+def _contains_terminated_field(text: str, key: str, value: str) -> bool:
+    """True when ``key=value`` occurs and the next character is not more of the value."""
+    marker = key + "=" + value
+    start = 0
+    while True:
+        idx = text.find(marker, start)
+        if idx < 0:
+            return False
+        after = idx + len(marker)
+        if after >= len(text) or text[after] in ",]} \n\r\t":
+            return True
+        start = idx + 1
+
+
+def _registry_log_matches(registry_dir: str, pid: str) -> bool:
+    """``daemon-<pid>.out.log`` under our registry names this directory and this pid."""
+    name = "daemon-" + pid + ".out.log"
+    try:
+        for dirpath, _dirnames, filenames in os.walk(registry_dir):
+            if name not in filenames:
+                continue
+            path = os.path.join(dirpath, name)
+            with open(path, "rb") as handle:
+                text = handle.read(1024 * 1024).decode("utf-8", "replace")
+            if (
+                _contains_terminated_field(text, "daemonRegistryDir", registry_dir)
+                and _contains_terminated_field(text, "pid", pid)
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _ppid_map() -> Dict[int, int]:
+    try:
+        result = subprocess.run(
+            ["ps", "-ax", "-o", "pid=", "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    mapping: Dict[int, int] = {}
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        mapping[int(parts[0])] = int(parts[1])
+    return mapping
+
+
+def _descendant_pids(root: int) -> List[int]:
+    """Live descendants of ``root``, deepest first. Does not include ``root``."""
+    mapping = _ppid_map()
+    children: Dict[int, List[int]] = {}
+    for pid, ppid in mapping.items():
+        children.setdefault(ppid, []).append(pid)
+    depths: Dict[int, int] = {}
+    stack = [(child, 1) for child in children.get(root, [])]
+    seen = {root}
+    while stack:
+        pid, depth = stack.pop()
+        if pid in seen or pid <= 1:
+            continue
+        seen.add(pid)
+        depths[pid] = depth
+        for child in children.get(pid, []):
+            stack.append((child, depth + 1))
+    return sorted(depths, key=lambda pid: depths[pid], reverse=True)
+
+
+def _sigkill(pid: int) -> None:
+    if pid <= 1 or pid == os.getpid():
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+
+
+def _kill_isolated_gradle_daemon(
+    registry_dir: str,
+    pid_path: str,
+    before_logs: Set[str],
+) -> None:
+    """SIGKILL the daemon this call used, and live children whose PPID walks to it.
+
+    POSIX only. The daemon is already reparented (PPID 1, its own session), so
+    a process-group kill of the client does not reach it, and session 0 is not
+    a target. ``gradlew --stop`` is not used. A pid is killed only when it is
+    alive, its command line contains ``GradleDaemon``, and ``daemon-<pid>.out.log``
+    under our registry contains both ``daemonRegistryDir=<registry>`` and
+    ``pid=<pid>``. Otherwise nothing is killed — that is what leaves an IDE
+    daemon alone if the pid file is wrong or the wrapper ignored the property.
+    """
+    if os.name == "nt":
+        return
+    pid_text = _read_daemon_pid_file(pid_path)
+    if pid_text is None:
+        pid_text = _pid_from_single_new_daemon_log(registry_dir, before_logs)
+    if pid_text is None or not pid_text.isdigit():
+        return
+    pid = int(pid_text)
+    if pid <= 1 or not _pid_alive(pid):
+        return
+    if "GradleDaemon" not in _process_command_line(pid):
+        return
+    if not _registry_log_matches(registry_dir, pid_text):
+        return
+    children = _descendant_pids(pid)
+    fresh = _ppid_map()
+    allowed = set(children)
+    allowed.add(pid)
+    for child in children:
+        parent = fresh.get(child)
+        if parent in allowed:
+            _sigkill(child)
+    _sigkill(pid)
+
+
 def _run_gradle_command(
     project_root: str,
     gradlew: str,
     args: List[str],
     timeout: int = GRADLE_RESOLVE_TIMEOUT,
 ) -> Tuple[int, str, str]:
+    """Run the wrapper. Isolate this server's daemon; on timeout, kill only that JVM.
+
+    Isolation is one argv element, ``-Dorg.gradle.daemon.registry.base=<dir>``,
+    plus a constant ``--init-script`` whose pid path is
+    ``-Dmaven.mcp.daemon.pidfile``. Does not set ``GRADLE_USER_HOME``, rewrite
+    ``org.gradle.jvmargs``, pass ``--no-daemon``, or run ``gradlew --stop``.
+    A timeout still returns 124, empty stdout, and the existing timeout text.
+    Success, ``OSError``, and any non-timeout exit leave the daemon running.
+    """
+    registry = _gradle_daemon_registry_dir()
+    tmp: Optional[str] = None
+    pid_path: Optional[str] = None
+    before_logs: Set[str] = set()
+    cmd_args = list(args)
+    if registry is not None:
+        try:
+            tmp = tempfile.mkdtemp(prefix="maven-mcp-gradle-daemon-")
+            script_path = os.path.join(tmp, "maven-mcp-daemon-pid.init.gradle")
+            pid_path = os.path.join(tmp, "daemon.pid")
+            with open(script_path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(_GRADLE_DAEMON_PID_INIT_SCRIPT)
+            before_logs = _gradle_daemon_log_paths(registry)
+            cmd_args = [
+                "--init-script",
+                script_path,
+                "-Dorg.gradle.daemon.registry.base=" + registry,
+                "-Dmaven.mcp.daemon.pidfile=" + os.path.abspath(pid_path),
+            ] + list(args)
+        except OSError:
+            _discard_dir(tmp)
+            tmp = None
+            pid_path = None
+            registry = None
+            cmd_args = list(args)
     try:
-        result = _gradle_run(
-            [gradlew] + _gradle_cli_prefix_args() + args,
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_scrubbed_subprocess_env(),
-        )
-    except subprocess.TimeoutExpired:
-        return 124, "", f"Gradle command timed out after {timeout}s"
-    except OSError as e:
-        # WinError 193 and other launch failures name the wrapper that was
-        # executed. A bare OSError message does not, so the path is added here.
-        return 1, "", f"Failed to launch Gradle wrapper {gradlew}: {e}"
-    return result.returncode, result.stdout or "", result.stderr or ""
+        try:
+            result = _gradle_run(
+                [gradlew] + _gradle_cli_prefix_args() + cmd_args,
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=_scrubbed_subprocess_env(),
+            )
+        except subprocess.TimeoutExpired:
+            if registry is not None and pid_path is not None:
+                try:
+                    _kill_isolated_gradle_daemon(registry, pid_path, before_logs)
+                except Exception:
+                    _logger.warning(
+                        "gradle daemon kill after timeout failed", exc_info=True,
+                    )
+            return 124, "", f"Gradle command timed out after {timeout}s"
+        except OSError as e:
+            # WinError 193 and other launch failures name the wrapper that was
+            # executed. A bare OSError message does not, so the path is added here.
+            return 1, "", f"Failed to launch Gradle wrapper {gradlew}: {e}"
+        return result.returncode, result.stdout or "", result.stderr or ""
+    finally:
+        _discard_dir(tmp)
 
 
 def _is_production_runtime_configuration(config: str) -> bool:
