@@ -16,10 +16,12 @@ Two extra requirements live here:
 
 import datetime
 import json
+import os
 import threading
 import time
 import unittest
 import unittest.mock
+import urllib.error
 
 from _helpers import server, mock_urlopen, http_error, temp_project, write_fake_gradlew, mock_gradle_resolve
 
@@ -173,9 +175,11 @@ class TestCompareDependencyVersions(unittest.TestCase):
         # current itself is not published — nothing newer-or-equal qualifies
         # either (#312 correction). The `if not latest` guard (server.py :1299)
         # therefore raises "No matching version found". dep[1] resolves normally.
-        # Asserting the EXACT error string + upgradeAvailable/latestVersion makes
-        # this fail if the guard is removed: without it, get_upgrade_type(current,
-        # None) raises a TypeError whose message would replace the error text.
+        # Asserting the EXACT error string + latestVersion, and that upgradeType
+        # and upgradeAvailable are absent, makes this fail if the guard is
+        # removed: without it, get_upgrade_type(current, None) raises a
+        # TypeError whose message would replace the error text. A failed
+        # lookup is not upgradeType "none" / upgradeAvailable false.
         # #400: the per-dependency fan-out now runs on a ThreadPoolExecutor, so
         # urlopen calls are no longer guaranteed to happen in input order --
         # route by URL (which embeds the artifactId) instead of a
@@ -198,9 +202,11 @@ class TestCompareDependencyVersions(unittest.TestCase):
         by_artifact = {r["artifactId"]: r for r in out["results"]}
         no_match, sibling = by_artifact["nomatch"], by_artifact["sibling"]
 
-        # Exact observables of the guard:
+        # Exact observables of the guard. A failed lookup keeps the error and
+        # omits the comparison fields — upgradeAvailable false was the bug.
         self.assertEqual(no_match["error"], "No matching version found")
-        self.assertIs(no_match["upgradeAvailable"], False)
+        self.assertNotIn("upgradeType", no_match)
+        self.assertNotIn("upgradeAvailable", no_match)
         self.assertEqual(no_match["latestVersion"], "")
 
         # Sibling still resolves successfully alongside the failed one:
@@ -233,6 +239,263 @@ class TestCompareDependencyVersions(unittest.TestCase):
         self.assertIs(result["upgradeAvailable"], False)
         self.assertEqual(result["upgradeType"], "none")
         self.assertNotIn("error", result)
+
+
+def _request_url(req) -> str:
+    return req.full_url if hasattr(req, "full_url") else str(req)
+
+
+def _artifact_id_from_metadata_url(url: str) -> str:
+    marker = "/maven-metadata.xml"
+    if marker not in url:
+        return ""
+    return url.split(marker, 1)[0].rsplit("/", 1)[-1]
+
+
+def _issue36_metadata(req, *args, **kwargs):
+    """Thread-safe urlopen route. Failures repeat on every retry attempt."""
+    aid = _artifact_id_from_metadata_url(_request_url(req))
+    if aid == "fail-transport":
+        raise urllib.error.URLError("timed out")
+    if aid == "fail-auth":
+        raise http_error("https://repo1.maven.org/maven2", 401, "Unauthorized")
+    if aid == "fail-503":
+        raise http_error("https://repo1.maven.org/maven2", 503, "unavailable")
+    bodies = {
+        "snap-only": ["2.0.0-SNAPSHOT"],
+        "empty-list": [],
+        "equal-current": ["1.0.0"],
+        "minor-bump": ["1.0.0", "1.1.0"],
+    }
+    if aid not in bodies:
+        raise AssertionError("unexpected urlopen: " + _request_url(req))
+    return mock_urlopen((200, _meta(bodies[aid])))(req, *args, **kwargs)
+
+
+def _patched_lookup(side_effect):
+    return unittest.mock.patch("urllib.request.urlopen", side_effect=side_effect), \
+        unittest.mock.patch.object(server, "_sleep", lambda _delay: None)
+
+
+def _dep(artifact_id: str, version: str = "1.0.0") -> dict:
+    return {
+        "groupId": "com.example",
+        "artifactId": artifact_id,
+        "currentVersion": version,
+    }
+
+
+def _assert_compare_not_checked(test, row, error_part: str) -> None:
+    test.assertIn(error_part, row["error"])
+    test.assertNotIn("upgradeType", row)
+    test.assertNotIn("upgradeAvailable", row)
+    test.assertEqual(row["latestVersion"], "")
+    test.assertEqual(row["latestStability"], "")
+
+
+class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
+    """#36: a lookup that did not produce a version is not upgradeType none."""
+
+    def test_transport_auth_and_5xx_omit_upgrade_fields(self):
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with urlopen_patch, sleep_patch:
+            out = server.handle_compare_dependency_versions({
+                "dependencies": [
+                    _dep("fail-transport"),
+                    _dep("fail-auth"),
+                    _dep("fail-503"),
+                ],
+            })
+        by_artifact = {r["artifactId"]: r for r in out["results"]}
+        _assert_compare_not_checked(self, by_artifact["fail-transport"], "URLError")
+        _assert_compare_not_checked(self, by_artifact["fail-auth"], "auth required")
+        _assert_compare_not_checked(self, by_artifact["fail-503"], "HTTP 503")
+        self.assertEqual(out["summary"]["upgradeable"], 0)
+        self.assertNotIn("resolvedFrom", by_artifact["fail-transport"])
+
+    def test_no_acceptable_version_is_not_a_metadata_failure(self):
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with urlopen_patch, sleep_patch:
+            out = server.handle_compare_dependency_versions({
+                "dependencies": [
+                    _dep("snap-only"),
+                    _dep("empty-list"),
+                ],
+            })
+        for row in out["results"]:
+            self.assertEqual(row["error"], "No matching version found")
+            self.assertNotIn("Could not fetch metadata", row["error"])
+            self.assertNotIn("upgradeType", row)
+            self.assertNotIn("upgradeAvailable", row)
+            self.assertIn("resolvedFrom", row)
+            self.assertIn("url", row["resolvedFrom"])
+        self.assertEqual(out["summary"]["upgradeable"], 0)
+
+    def test_published_stable_equal_to_current_is_still_no_upgrade(self):
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with urlopen_patch, sleep_patch:
+            out = server.handle_compare_dependency_versions({
+                "dependencies": [_dep("equal-current")],
+            })
+        row = out["results"][0]
+        self.assertEqual(row["upgradeType"], "none")
+        self.assertIs(row["upgradeAvailable"], False)
+        self.assertNotIn("error", row)
+        self.assertEqual(row["latestVersion"], row["currentVersion"])
+
+    def test_sibling_upgrade_counted_error_rows_are_not(self):
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with urlopen_patch, sleep_patch:
+            out = server.handle_compare_dependency_versions({
+                "dependencies": [
+                    _dep("fail-transport"),
+                    _dep("minor-bump"),
+                    _dep("snap-only"),
+                ],
+            })
+        by_artifact = {r["artifactId"]: r for r in out["results"]}
+        self.assertEqual(by_artifact["minor-bump"]["upgradeType"], "minor")
+        self.assertIs(by_artifact["minor-bump"]["upgradeAvailable"], True)
+        self.assertNotIn("upgradeType", by_artifact["fail-transport"])
+        self.assertNotIn("upgradeType", by_artifact["snap-only"])
+        self.assertEqual(out["summary"]["upgradeable"], 1)
+        self.assertEqual(out["summary"]["minor"], 1)
+
+    def test_output_schema_does_not_require_upgrade_fields_on_failure(self):
+        tool = next(t for t in server.TOOLS if t["name"] == "compare_dependency_versions")
+        items = tool["outputSchema"]["properties"]["results"]["items"]
+        self.assertNotIn("upgradeType", items["required"])
+        self.assertNotIn("upgradeAvailable", items["required"])
+        self.assertEqual(
+            items["properties"]["upgradeType"]["enum"],
+            ["major", "minor", "patch", "none"],
+        )
+
+
+def _maven_pom(deps) -> str:
+    blocks = "".join(
+        "<dependency><groupId>%s</groupId><artifactId>%s</artifactId>"
+        "<version>%s</version></dependency>" % (group, artifact, version)
+        for group, artifact, version in deps
+    )
+    return "<project><dependencies>%s</dependencies></project>" % blocks
+
+
+class TestAuditFailedLookupIsNotCurrent(unittest.TestCase):
+    """#36: audit no-match is an error row, not upgradeType none."""
+
+    def test_transport_auth_and_5xx_omit_upgrade_type(self):
+        pom = _maven_pom([
+            ("com.example", "fail-transport", "1.0.0"),
+            ("com.example", "fail-auth", "1.0.0"),
+            ("com.example", "fail-503", "1.0.0"),
+            ("com.example", "minor-bump", "1.0.0"),
+        ])
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with temp_project({"pom.xml": pom}) as root:
+            with urlopen_patch, sleep_patch:
+                out = server.handle_audit_project_dependencies({
+                    "projectPath": root,
+                    "includeVulnerabilities": False,
+                })
+        by_artifact = {d["artifactId"]: d for d in out["dependencies"]}
+        for aid, part in (
+            ("fail-transport", "URLError"),
+            ("fail-auth", "auth required"),
+            ("fail-503", "HTTP 503"),
+        ):
+            row = by_artifact[aid]
+            self.assertIn(part, row["error"])
+            self.assertNotIn("upgradeType", row)
+        self.assertEqual(by_artifact["minor-bump"]["upgradeType"], "minor")
+        self.assertEqual(out["summary"]["upgradeable"], 1)
+
+    def test_no_acceptable_version_is_error_without_latest(self):
+        for artifact in ("snap-only", "empty-list"):
+            pom = _maven_pom([("com.example", artifact, "1.0.0")])
+            urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+            with temp_project({"pom.xml": pom}) as root:
+                with urlopen_patch, sleep_patch:
+                    out = server.handle_audit_project_dependencies({
+                        "projectPath": root,
+                        "includeVulnerabilities": False,
+                    })
+            self.assertEqual(len(out["dependencies"]), 1)
+            row = out["dependencies"][0]
+            self.assertEqual(row["error"], "No matching version found")
+            self.assertNotIn("Could not fetch metadata", row["error"])
+            self.assertNotIn("upgradeType", row)
+            self.assertNotIn("latestVersion", row)
+            self.assertIn("resolvedFrom", row)
+            self.assertIn("url", row["resolvedFrom"])
+            self.assertEqual(out["summary"]["upgradeable"], 0)
+
+    def test_latest_equal_to_current_is_still_no_upgrade(self):
+        pom = _maven_pom([("com.example", "equal-current", "1.0.0")])
+        urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
+        with temp_project({"pom.xml": pom}) as root:
+            with urlopen_patch, sleep_patch:
+                out = server.handle_audit_project_dependencies({
+                    "projectPath": root,
+                    "includeVulnerabilities": False,
+                })
+        row = out["dependencies"][0]
+        self.assertEqual(row["upgradeType"], "none")
+        self.assertNotIn("error", row)
+        self.assertEqual(row["latestVersion"], row["currentVersion"])
+        self.assertEqual(out["summary"]["upgradeable"], 0)
+
+
+def _skill_text(name: str) -> str:
+    path = os.path.normpath(os.path.join(
+        os.path.dirname(server.__file__), "..", "skills", name, "SKILL.md",
+    ))
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+class TestCheckDepsDoesNotCallFailedLookupCurrent(unittest.TestCase):
+    """#36 skill contract. String checks, not an agent run."""
+
+    def test_check_deps_step2_lists_failed_lookups_as_not_checked(self):
+        text = _skill_text("check-deps")
+        step2 = text.split("## Step 2", 1)[1].split("## Step 3", 1)[0]
+        not_equal = "\u2260"
+        old_rule = (
+            "(`upgradeType` %s `none`, or `latestVersion` %s `currentVersion`)"
+            % (not_equal, not_equal)
+        )
+        self.assertNotIn(old_rule, text)
+        self.assertIn(
+            '(`latestVersion` missing, null, or `""` and `upgradeType` absent)',
+            step2,
+        )
+        self.assertIn("not checked", step2)
+        self.assertIn("and the error", step2)
+        self.assertIn(
+            'print "All dependencies up to date." only when the not-checked set is empty',
+            step2,
+        )
+        self.assertIn("no vulnerabilities", step2)
+        self.assertIn("still up to date", step2)
+        self.assertIn("no `error`", step2)
+
+    def test_compare_skill_does_not_call_a_failed_lookup_no_upgrade(self):
+        text = _skill_text("compare-dependency-versions")
+        self.assertNotIn(
+            "**No upgrade available for any entry:** say so plainly; do not propose edits.",
+            text,
+        )
+        self.assertIn("without `upgradeType`", text)
+        self.assertIn('Do not call it "no upgrade"', text)
+        self.assertIn("Show the coordinate and the error", text)
+        self.assertIn("`summary.upgradeable` 0 is not enough", text)
+        self.assertIn(
+            "Say no upgrade only when every row has `upgradeType` `none`",
+            text,
+        )
+        self.assertIn("`latestVersion` equal to `currentVersion`", text)
+        self.assertIn("no `error`", text)
 
 
 # --- handle_get_dependency_changes ------------------------------------------

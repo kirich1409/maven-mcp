@@ -37,14 +37,19 @@ Do **not** hand-parse `maven-metadata.xml` or POST to OSV yourself while MCP too
 
 ## Step 2 — Build the report
 
-From the audit / compare results, only include entries where an upgrade is available
-(`upgradeType` ≠ `none`, or `latestVersion` ≠ `currentVersion`). Group by `source.kind`:
+Partition audit and compare rows before the upgrade table. Partition `error` first, so a row that has both `error` and `upgradeType` `none` is not checked, not current.
+
+**Not checked:** any row with `error`, or a versioned row whose lookup produced no version (`latestVersion` missing, null, or `""` and `upgradeType` absent). List `groupId:artifactId`, `currentVersion` when present, and the error. Do not call these current. Do not put them in the upgrade table. Do not propose an edit for them.
+
+**Upgrades:** no `error`, and `upgradeType` is `major`, `minor`, or `patch`, or a non-empty `latestVersion` that differs from `currentVersion`. Only these rows go in the upgrade table. A blank `latestVersion` must not satisfy "differs from `currentVersion`". Group upgrade rows that have `source` by `source.kind`:
 
 - **catalog-library** / **catalog-plugin** — alias, current → latest, upgrade type, catalog file, usages
 - **module-direct** — module, file, artifact, current → latest, configuration; flag catalog drift
 - **plugins-dsl** — split settings `pluginManagement` vs root/module `plugins {}`
 - **buildscript-classpath** — artifact, current → latest, file; note legacy style
 - **gradle-resolved** — Gradle-resolved direct dependency with no matching build-file provenance
+
+**Current:** no `error`, `upgradeType` `none`, and `latestVersion` equal to `currentVersion`. A latest-equals-current row with no `error` is still up to date.
 
 When `resolvedBy: "gradle"` is present on the scan/audit result, versions are Gradle-resolved
 (effective versions from BOM/platform/constraints), not regex-guessed from build files.
@@ -63,11 +68,9 @@ The deadline note `Stopped early after exceeding the {TOOL_DEADLINE}s tool deadl
 is not that diagnostic. If both a resolution failure and the tool deadline are present,
 report both. Do not replace one with the other.
 
-**Terminal branch — nothing outdated and no vulnerabilities:**
+A versionless row (no `currentVersion`, no lookup) is neither not-checked nor an upgrade. Do not invent an error for it.
 
-> All dependencies up to date.
-
-Stop — do not continue to edit steps.
+**Terminal branch:** print "All dependencies up to date." only when the not-checked set is empty, the upgrade list is empty, and there are no vulnerabilities. Then stop — do not continue to edit steps. Do not print that sentence while any not-checked row exists, even if `summary.upgradeable` is 0.
 
 **Vulnerabilities:** after upgrade tables, add a **Vulnerabilities** section for every entry
 with non-empty `vulnerabilities`. Use server fields (`id`, `severity`, `summary`,
