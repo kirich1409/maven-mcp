@@ -27,10 +27,11 @@ dependency ethos for a check this narrow in scope.
 
 import base64
 import json
+import os
 import unittest
 import unittest.mock
 
-from _helpers import server, mock_urlopen, temp_project
+from _helpers import server, mock_urlopen, http_error, temp_project
 
 # Empty: every tool declares an outputSchema. The accounted-for test still
 # fails if a new tool is added without one (or with one that the set misses).
@@ -626,14 +627,27 @@ class RealHandlerOutputSchemaTest(unittest.TestCase):
             '<?xml version="1.0"?><project><scm>'
             "<url>https://github.com/ktorio/ktor</url></scm></project>"
         )
+        nexus = "https://nexus.example.com/m2"
+        # Declared 401 then Central 200, so the real return carries both
+        # repositoryErrors and warnings. 401 is not retried.
         responses = [
+            http_error(nexus, 401, "Unauthorized"),
             (200, _metadata_xml(["1.0.0", "2.0.0"])),
+            http_error(nexus, 401, "Unauthorized"),
             (200, pom.encode()),
             (200, b"[]"),
             (200, json.dumps({"default_branch": "main"}).encode()),
             (200, json.dumps(payload).encode()),
         ]
-        with temp_project({}) as root, unittest.mock.patch(
+        files = {
+            "settings.gradle.kts": (
+                "dependencyResolutionManagement { repositories { "
+                'maven { url = uri("%s") } } }' % nexus
+            ),
+        }
+        with temp_project(files) as root, unittest.mock.patch.dict(
+            os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}
+        ), unittest.mock.patch(
             "urllib.request.urlopen", side_effect=mock_urlopen(responses)
         ):
             out = self._dispatch("get_dependency_changes", {
@@ -683,11 +697,22 @@ class RealHandlerOutputSchemaTest(unittest.TestCase):
         metadata = {
             "versions": ["4.12.0"],
             "lastUpdated": "20240101",
-            "resolvedFrom": {
-                "url": "https://repo1.maven.org/maven2/",
-                "scope": "dependency",
-                "viaPublicFallback": True,
+            "_versionSources": {
+                "4.12.0": {
+                    "resolvedFrom": {
+                        "url": "https://repo1.maven.org/maven2/",
+                        "scope": "dependency",
+                        "viaPublicFallback": True,
+                    },
+                    "name": "Maven Central",
+                },
             },
+            "_repositoryErrors": [{
+                "url": "https://nexus.example.com/m2",
+                "message": "auth required for https://nexus.example.com/m2 (HTTP 401)",
+                "status": 401,
+                "is_public_fallback": False,
+            }],
         }
         repo = {
             "stargazers_count": 10,
@@ -728,7 +753,10 @@ class RealHandlerOutputSchemaTest(unittest.TestCase):
 
     def test_audit_project_dependencies(self):
         pom = (
-            "<project><dependencies><dependency>"
+            "<project>"
+            "<repositories><repository><id>nexus</id>"
+            "<url>https://nexus.example.com/m2</url></repository></repositories>"
+            "<dependencies><dependency>"
             "<groupId>com.example</groupId><artifactId>lib</artifactId>"
             "<version>1.2.3</version></dependency></dependencies></project>"
         )
@@ -740,9 +768,17 @@ class RealHandlerOutputSchemaTest(unittest.TestCase):
                 "malicious": False,
             }],
         }]
-        with temp_project({"pom.xml": pom}) as root, unittest.mock.patch(
+        # Declared 401 (not retried) plus a Central-only newer version, so the
+        # dependency item carries repositoryErrors, warnings, and resolvedFrom.
+        responses = [
+            http_error("https://nexus.example.com/m2", 401, "Unauthorized"),
+            (200, _metadata_xml(["1.2.3", "1.3.0"])),
+        ]
+        with temp_project({"pom.xml": pom}) as root, unittest.mock.patch.dict(
+            os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}
+        ), unittest.mock.patch(
             "urllib.request.urlopen",
-            side_effect=mock_urlopen([(200, _metadata_xml(["1.2.3", "1.3.0"]))]),
+            side_effect=mock_urlopen(responses),
         ), unittest.mock.patch.object(
             server, "resolve_plugin_marker_implementation", return_value=None
         ), unittest.mock.patch.object(

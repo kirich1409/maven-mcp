@@ -77,7 +77,7 @@ with non-empty `vulnerabilities`. Use server fields (`id`, `severity`, `summary`
 `fixedVersion`, `malicious`) — do not re-derive severity from a raw querybatch response.
 Sort CRITICAL → HIGH → MEDIUM → LOW → unknown. Omit the section when empty.
 
-Surface `resolvedFrom.viaPublicFallback` when true (coordinate missing from declared repos).
+Surface `warnings` when present (the selected version was found only on a public fallback, or a declared repo returned 401, 403, or 5xx). A declared repo may have answered with older versions. Also surface `resolvedFrom.viaPublicFallback` when true — that flag is per selected version, not "the coordinate is missing from every declared repo".
 Surface `deadRepositoryHints` from the scan/audit when present (e.g. `jcenter()`).
 
 ## Step 3 — Confirmation

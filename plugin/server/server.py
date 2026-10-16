@@ -2372,6 +2372,40 @@ def _untried_probe(exc: BaseException) -> bool:
         isinstance(exc, urllib.error.URLError)
         and "no response and no transport error" in str(exc)
     )
+def _version_source(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Already-redacted record of the first repo that lists a version string.
+
+    Not published. ``name`` is the warning label (the entry name, so Maven
+    Central stays "Maven Central"). Raw URLs are never stored.
+    """
+    label = entry.get("name") or entry.get("url") or "repository"
+    return {
+        "resolvedFrom": _to_resolved_from(entry),
+        "name": _strip_userinfo(label),
+    }
+
+
+def _repository_error(
+    entry: Dict[str, Any], status: Optional[int], message: str
+) -> Dict[str, Any]:
+    """One failed repo probe. ``is_public_fallback`` is internal — the published
+    shape is ``{url, message}`` plus ``status`` only when there is an HTTP status.
+    """
+    err: Dict[str, Any] = {
+        "url": _strip_userinfo(entry["url"]),
+        "message": message,
+        "is_public_fallback": bool(entry.get("is_public_fallback")),
+    }
+    if status is not None:
+        err["status"] = status
+    return err
+
+
+def _declared_repo_status_warns(status: Any) -> bool:
+    """401/403/5xx from a declared repo add the warning's status clause.
+    429, transport errors (no status), and 404 do not.
+    """
+    return status in (401, 403) or (isinstance(status, int) and 500 <= status < 600)
 
 def _metadata_probe_error(
     ctx: "ResolutionContext",
@@ -2417,7 +2451,14 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     empty repo list keeps the offline / content-filter messages. The single-repo
     result is identical to the legacy path (union/sort of one ascending set =
     itself). Intentionally diverges from the retired TS ``resolveAll``: no
-    proxy-dedup."""
+    proxy-dedup.
+
+    Provenance is per version, not per first HTTP 200. ``_versionSources`` maps
+    each version string to the first repo in ``_repos_for`` order that lists it
+    (exact string match). ``_repositoryErrors`` keeps failures a later success
+    used to drop. Neither key is a tool result — callers project them through
+    ``_attach_version_provenance``. A definitive 404 is absence, not an error.
+    """
     repos = _repos_for(group_id, artifact_id, ctx)
     merged_versions: List[str] = []
     last_updated: Optional[str] = None
@@ -2436,9 +2477,9 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     # A single clause stays byte-identical to the previous last_err overwrite.
     # Joined with "; " only when more than one repo was queried and none answered.
     miss_clauses: List[str] = []
-    # First repo (in _repos_for order: declared repos before any public-fallback
-    # append) that answers 200 — surfaced as resolvedFrom for #317 provenance.
-    resolved_from: Optional[Dict[str, Any]] = None
+    # Per-version first listing, in _repos_for order. Not the first HTTP 200.
+    version_sources: Dict[str, Dict[str, Any]] = {}
+    repository_errors: List[Dict[str, Any]] = []
     for index, entry in enumerate(repos):
         # entry["name"] can be the literal repo URL for maven("url")
         # declarations (name == url); redact before it reaches tool-facing text.
@@ -2497,6 +2538,7 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
                 # the exception type name plus the already-redacted repo name.
                 clause = f"{type(e).__name__} from {name}"
                 miss_clauses.append(clause)
+                repository_errors.append(_repository_error(entry, None, clause))
                 if (
                     tool_deadline is not None
                     and not _untried_probe(e)
@@ -2511,9 +2553,12 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             # version list — a 200 with empty <versions> still counts as a
             # reachable repo, matching the legacy first-hit contract.
             answered = True
-            if resolved_from is None:
-                resolved_from = _to_resolved_from(entry)
             parsed = _parse_metadata_xml(body.decode("utf-8", errors="replace"), group_id, artifact_id)
+            # An empty version list claims no later version.
+            source = _version_source(entry)
+            for version in parsed["versions"]:
+                if version not in version_sources:
+                    version_sources[version] = source
             merged_versions.extend(parsed["versions"])
             lu = parsed.get("lastUpdated")
             if lu and (last_updated is None or lu > last_updated):
@@ -2522,10 +2567,18 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             # Private/corporate repos reject unauthenticated (or wrong-cred)
             # probes with 401/403 — surface a clear "auth required" signal
             # rather than a bare HTTP code (#291). Never include secrets.
-            miss_clauses.append(_auth_required_message(entry, status))
+            clause = _auth_required_message(entry, status)
+            miss_clauses.append(clause)
+            repository_errors.append(_repository_error(entry, status, clause))
+        elif status == 404:
+            # Definitive absence. Same miss text as a generic HTTP status,
+            # but not a repositoryError — a later fallback answer must not
+            # report the 404 as a failed repo.
+            miss_clauses.append(f"HTTP {status} from {name}")
         else:
             clause = f"HTTP {status} from {name}"
             miss_clauses.append(clause)
+            repository_errors.append(_repository_error(entry, status, clause))
             # 429 stays uncached (rate-limit must re-hit). 5xx is remembered
             # in memory only — FileCache.set still refuses it. A cached 404
             # is a definitive absence, not a failure to remember.
@@ -2547,8 +2600,56 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
         "latest": find_latest_version(versions, "PREFER_STABLE"),
         "release": find_latest_version(versions, "STABLE_ONLY"),
         "lastUpdated": last_updated,
-        "resolvedFrom": resolved_from,
+        "_versionSources": version_sources,
+        "_repositoryErrors": repository_errors,
     }
+
+
+def _attach_version_provenance(
+    result: Dict[str, Any],
+    metadata: Dict[str, Any],
+    version: Optional[str],
+) -> None:
+    """Project tool-facing provenance for ``version`` onto ``result``.
+
+    The only writer of ``resolvedFrom``, ``repositoryErrors``, and ``warnings``
+    from metadata. Does not mutate ``metadata`` (audit workers share one cached
+    object). A version missing from ``_versionSources`` omits ``resolvedFrom``
+    and does not fall back to the first HTTP 200 or to a ``resolvedFrom`` key
+    a test double left on the metadata dict. Empty ``warnings`` and
+    ``repositoryErrors`` are omitted.
+    """
+    sources = metadata.get("_versionSources") or {}
+    source = sources.get(version) if isinstance(version, str) else None
+    resolved = source.get("resolvedFrom") if source else None
+    if resolved:
+        result["resolvedFrom"] = {
+            "url": resolved["url"],
+            "scope": resolved["scope"],
+            "viaPublicFallback": resolved["viaPublicFallback"],
+        }
+
+    errors = metadata.get("_repositoryErrors") or []
+    published: List[Dict[str, Any]] = []
+    clauses: List[str] = []
+    if source and resolved and resolved.get("viaPublicFallback"):
+        clauses.append(
+            f"{version} found only on {source['name']} (public fallback)"
+        )
+    for err in errors:
+        item: Dict[str, Any] = {"url": err["url"], "message": err["message"]}
+        if "status" in err:
+            item["status"] = err["status"]
+        published.append(item)
+        if (
+            not err.get("is_public_fallback")
+            and _declared_repo_status_warns(err.get("status"))
+        ):
+            clauses.append(f"declared repo {err['url']} returned {err['status']}")
+    if published:
+        result["repositoryErrors"] = published
+    if clauses:
+        result["warnings"] = ["; ".join(clauses)]
 
 
 class _VersionInRepos(NamedTuple):
@@ -9548,10 +9649,8 @@ def resolve_dependency_license(
     ``license.spdx_id``. Category/notes come from static tables only.
     """
     resolved_version = version
-    resolved_from = None
     try:
         metadata = fetch_metadata(group_id, artifact_id, ctx)
-        resolved_from = metadata.get("resolvedFrom")
         if not resolved_version:
             versions = metadata.get("versions") or []
             resolved_version = find_latest_version(versions, "PREFER_STABLE") or (
@@ -9562,8 +9661,7 @@ def resolve_dependency_license(
                     group_id, artifact_id, None, None, None, None, "unknown", None,
                     error="No version found",
                 )
-                if resolved_from is not None:
-                    result["resolvedFrom"] = resolved_from
+                _attach_version_provenance(result, metadata, None)
                 return result
     except Exception as e:
         return _license_result(
@@ -9625,8 +9723,7 @@ def resolve_dependency_license(
     result = _license_result(
         group_id, artifact_id, resolved_version, spdx_id, name, url, category, source,
     )
-    if resolved_from is not None:
-        result["resolvedFrom"] = resolved_from
+    _attach_version_provenance(result, metadata, resolved_version)
     return result
 
 
@@ -10802,7 +10899,9 @@ def _get_dependency_changes_impl(group_id: str, artifact_id: str, from_version: 
         metadata = fetch_metadata(group_id, artifact_id, ctx)
     except Exception as e:
         return {**base, "error": str(e)}
-    base["resolvedFrom"] = metadata.get("resolvedFrom")
+    # toVersion, including no-versions-in-range and repositoryNotFound after a
+    # successful fetch. An unlisted toVersion omits resolvedFrom.
+    _attach_version_provenance(base, metadata, to_version)
 
     versions_in_range = _filter_version_range(metadata["versions"], from_version, to_version)
     if not versions_in_range:
@@ -15790,8 +15889,8 @@ def handle_get_latest_version(args: Dict) -> Any:
         "latestVersion": selected,
         "stability": classify_version(selected),
         "allVersionsCount": len(metadata["versions"]),
-        "resolvedFrom": metadata.get("resolvedFrom"),
     }
+    _attach_version_provenance(result, metadata, selected)
     # #284: the latest version of a relocated artifact is typically the
     # relocation stub itself (Maven relocation POMs stop receiving further
     # releases past that point), so this is the natural place to surface it.
@@ -15854,23 +15953,25 @@ def handle_check_multiple_dependencies(args: Dict) -> Any:
     ctx = build_resolution_context(args)
 
     def _check_one(dep: Dict) -> Dict[str, Any]:
-        # resolved_from is captured as soon as fetch_metadata succeeds, so a
-        # downstream "no version found" still carries provenance (#317 finding 1:
-        # a repo did answer, so resolvedFrom is known even on a not-found result).
-        resolved_from = None
+        # Provenance is the repo that lists the selected version, not the first
+        # HTTP 200. "No version found" omits resolvedFrom; a 401/403/5xx on a
+        # declared repo still attaches repositoryErrors and a warning.
+        metadata = None
+        selected = None
         try:
             metadata = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
-            resolved_from = metadata.get("resolvedFrom")
             latest = find_latest_version(metadata["versions"], "PREFER_STABLE")
             if not latest:
                 raise ValueError("No version found")
-            return {
+            selected = latest
+            entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "latestVersion": latest,
                 "stability": classify_version(latest),
-                "resolvedFrom": resolved_from,
             }
+            _attach_version_provenance(entry, metadata, latest)
+            return entry
         except Exception as e:
             error_entry = {
                 "groupId": dep["groupId"],
@@ -15879,8 +15980,8 @@ def handle_check_multiple_dependencies(args: Dict) -> Any:
                 "stability": "",
                 "error": str(e),
             }
-            if resolved_from is not None:
-                error_entry["resolvedFrom"] = resolved_from
+            if metadata is not None:
+                _attach_version_provenance(error_entry, metadata, selected)
             return error_entry
 
     # #400: bounded parallel fan-out. _map_parallel is index-mapped, so
@@ -15896,18 +15997,19 @@ def handle_compare_dependency_versions(args: Dict) -> Any:
     ctx = build_resolution_context(args)
 
     def _compare_one(dep: Dict) -> Dict[str, Any]:
-        # resolved_from is captured as soon as fetch_metadata succeeds, so a
-        # downstream "no matching version" still carries provenance (#317 finding 1:
-        # a repo did answer, so resolvedFrom is known even on a not-found result).
-        resolved_from = None
+        # Provenance is the repo that lists latestVersion (the compared
+        # version), not currentVersion and not the first HTTP 200. "No matching
+        # version found" omits resolvedFrom; declared 401/403/5xx still warn.
+        metadata = None
+        selected = None
         try:
             metadata = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
-            resolved_from = metadata.get("resolvedFrom")
             latest = find_latest_version_for_current(metadata["versions"], dep["currentVersion"])
             if not latest:
                 raise ValueError("No matching version found")
+            selected = latest
             upgrade_type = get_upgrade_type(dep["currentVersion"], latest)
-            return {
+            entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "currentVersion": dep["currentVersion"],
@@ -15915,8 +16017,9 @@ def handle_compare_dependency_versions(args: Dict) -> Any:
                 "latestStability": classify_version(latest),
                 "upgradeType": upgrade_type,
                 "upgradeAvailable": upgrade_type != "none",
-                "resolvedFrom": resolved_from,
             }
+            _attach_version_provenance(entry, metadata, latest)
+            return entry
         except Exception as e:
             # A lookup that did not produce a version is not "no upgrade".
             # Omit upgradeType/upgradeAvailable; keep error as str(e) so
@@ -15929,8 +16032,8 @@ def handle_compare_dependency_versions(args: Dict) -> Any:
                 "latestStability": "",
                 "error": str(e),
             }
-            if resolved_from is not None:
-                error_entry["resolvedFrom"] = resolved_from
+            if metadata is not None:
+                _attach_version_provenance(error_entry, metadata, selected)
             return error_entry
 
     # #400: bounded parallel fan-out, order preserved (see
@@ -16103,7 +16206,6 @@ def handle_get_dependency_health(args: Dict) -> Any:
         except Exception as e:
             result["healthError"] = str(e)
             return result
-        result["resolvedFrom"] = metadata.get("resolvedFrom")
 
         versions = metadata["versions"]
         result["versionCount"] = len(versions)
@@ -16113,6 +16215,9 @@ def handle_get_dependency_health(args: Dict) -> Any:
         result["stability"] = classify_version(latest_version) if latest_version else None
 
         target_version = requested_version or latest_version
+        # Requested version, else latest. A requested version absent from the
+        # map omits resolvedFrom rather than borrowing latest's repo.
+        _attach_version_provenance(result, metadata, target_version)
         if not find_latest_version(versions, "STABLE_ONLY"):
             result["signals"].append("no stable release")
 
@@ -16581,11 +16686,11 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         # caller's guarantee.
         current_version = _effective_version(dep) or ""
         ga_key = f"{dep['groupId']}:{dep['artifactId']}"
-        # resolved_from is captured as soon as fetch_metadata succeeds, so an
-        # unexpected downstream failure still carries provenance — mirrors the
-        # #317 finding 1 fix applied to handle_check_multiple_dependencies /
-        # handle_compare_dependency_versions.
-        resolved_from = None
+        # Provenance is the repo that lists latestVersion. A downstream
+        # exception after that version was selected still gets that version's
+        # resolvedFrom. Do not fall back to the first HTTP 200.
+        metadata = None
+        selected = None
         _audit_probe.dep_id = id(dep)
         _audit_probe.board = probe_board
         try:
@@ -16595,15 +16700,17 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
                 fetched = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
                 with metadata_cache_lock:
                     metadata = metadata_cache.setdefault(ga_key, fetched)
-            resolved_from = metadata.get("resolvedFrom")
             latest = find_latest_version_for_current(metadata["versions"], current_version)
             # Metadata answered but nothing acceptable is at least as new as
             # current. Same error-entry shape as a fetch failure — not a
             # success row with upgradeType "none" and latestVersion null.
             if not latest:
-                return _audit_error_entry(
-                    dep, current_version, "No matching version found", resolved_from,
+                error_entry = _audit_error_entry(
+                    dep, current_version, "No matching version found",
                 )
+                _attach_version_provenance(error_entry, metadata, None)
+                return error_entry
+            selected = latest
             upgrade_type = get_upgrade_type(current_version, latest)
             entry = {
                 "groupId": dep["groupId"],
@@ -16615,8 +16722,8 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
                 "usages": dep.get("usages", []),
                 "module": (dep.get("usages") or [{}])[0].get("module"),
                 "configuration": (dep.get("usages") or [{}])[0].get("configuration"),
-                "resolvedFrom": resolved_from,
             }
+            _attach_version_provenance(entry, metadata, latest)
             if dep.get("effectiveVersion") is not None:
                 entry["effectiveVersion"] = dep["effectiveVersion"]
             if dep.get("managedBy") is not None:
@@ -16630,7 +16737,10 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             # at the source (see fetch_metadata), and find_latest_version_for_
             # current/get_upgrade_type are pure version-string functions that
             # never embed a repo URL.
-            return _audit_error_entry(dep, current_version, str(e), resolved_from)
+            error_entry = _audit_error_entry(dep, current_version, str(e))
+            if metadata is not None:
+                _attach_version_provenance(error_entry, metadata, selected)
+            return error_entry
         finally:
             # Do not pop an untaken label. _map_parallel may discard this
             # return value, and the collector still needs the repository the
@@ -17348,6 +17458,16 @@ _RESOLVED_FROM_SCHEMA: Dict[str, Any] = {
         "viaPublicFallback": {"type": "boolean"},
     },
 }
+_REPOSITORY_ERROR_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string"},
+        "message": {"type": "string"},
+        "status": {"type": "integer"},
+    },
+    "required": ["url", "message"],
+}
+_WARNINGS_SCHEMA: Dict[str, Any] = {"type": "array", "items": {"type": "string"}}
 # Per-vulnerability shape built by `_vuln_info_from_osv` — shared by
 # get_dependency_vulnerabilities and get_vulnerability_paths.
 _VULN_ITEM_SCHEMA: Dict[str, Any] = {
@@ -17378,6 +17498,9 @@ _LICENSE_RESULT_SCHEMA: Dict[str, Any] = {
         "notes": {"type": "string"},
         "source": {"type": ["string", "null"]},
         "error": {"type": "string"},
+        "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+        "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+        "warnings": _WARNINGS_SCHEMA,
     },
     "required": ["groupId", "artifactId", "category", "notes"],
 }
@@ -17411,6 +17534,8 @@ TOOLS = [
                 "stability": {"type": "string"},
                 "allVersionsCount": {"type": "integer"},
                 "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                "warnings": _WARNINGS_SCHEMA,
                 "relocatedTo": _GAV_SCHEMA,
             },
             "required": ["groupId", "artifactId", "latestVersion", "stability", "allVersionsCount"],
@@ -17486,6 +17611,8 @@ TOOLS = [
                             "latestVersion": {"type": "string"},
                             "stability": {"type": "string"},
                             "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                            "warnings": _WARNINGS_SCHEMA,
                             "error": {"type": "string"},
                         },
                         "required": ["groupId", "artifactId", "latestVersion", "stability"],
@@ -17537,6 +17664,8 @@ TOOLS = [
                             "upgradeType": {"type": "string", "enum": ["major", "minor", "patch", "none"]},
                             "upgradeAvailable": {"type": "boolean"},
                             "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                            "warnings": _WARNINGS_SCHEMA,
                             "error": {"type": "string"},
                         },
                         "required": [
@@ -17597,6 +17726,8 @@ TOOLS = [
                 },
                 "repositoryUrl": {"type": "string"},
                 "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                "warnings": _WARNINGS_SCHEMA,
                 "changelogUrl": {"type": "string"},
             },
             "required": ["groupId", "artifactId", "fromVersion", "toVersion", "changes"],
@@ -17994,6 +18125,8 @@ TOOLS = [
                             "stability": {"type": ["string", "null"]},
                             "lastPublishedToMaven": {"type": ["string", "null"]},
                             "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                            "warnings": _WARNINGS_SCHEMA,
                             "scorecard": {
                                 "type": "object",
                                 "properties": {
@@ -18203,6 +18336,8 @@ TOOLS = [
                             "module": {"type": ["string", "null"]},
                             "configuration": {"type": ["string", "null"]},
                             "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
+                            "warnings": _WARNINGS_SCHEMA,
                             "vulnerabilities": {"type": "array", "items": {"type": "object"}},
                         },
                         "required": [

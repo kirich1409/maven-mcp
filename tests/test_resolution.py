@@ -554,6 +554,11 @@ class TestProvenanceReporting(unittest.TestCase):
                 })
         self.assertEqual(out["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
         self.assertIs(out["resolvedFrom"]["viaPublicFallback"], True)
+        # 404 is absence, not a repositoryError. The selected version still
+        # came only from the public fallback, so the result warns.
+        self.assertNotIn("repositoryErrors", out)
+        self.assertTrue(any("public fallback" in w for w in out["warnings"]))
+        self.assertTrue(any("2.0.0" in w for w in out["warnings"]))
 
     def test_declared_repo_answers_reports_no_public_fallback(self):
         # Normal case: the project's own declared repo answers directly, no
@@ -612,7 +617,7 @@ class TestProvenanceReporting(unittest.TestCase):
         self._assert_declared(out["results"][0]["resolvedFrom"])
 
     def test_get_dependency_health_includes_resolved_from(self):
-        # resolvedFrom is set right after the metadata fetch, before the POM
+        # resolvedFrom is attached for the evaluated version before the POM
         # probe; com.acme is not GitHub-guessable so the chain stops after
         # metadata + POM-404 with no further network.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
@@ -657,8 +662,9 @@ class TestProvenanceReporting(unittest.TestCase):
         self._assert_declared(out["dependencies"][0]["resolvedFrom"])
 
     def test_get_dependency_changes_impl_includes_resolved_from(self):
-        # Downstream no-versions-in-range still carries resolvedFrom: the repo
-        # answered, so provenance is known even though the result is an error.
+        # Unlisted toVersion omits resolvedFrom. A 200 with no failures also
+        # omits warnings and repositoryErrors. This used to pin first-answerer
+        # provenance even though no repo listed 3.0.0.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
         with temp_project(files) as root:
             ctx = server.build_resolution_context({"projectPath": root})
@@ -670,7 +676,9 @@ class TestProvenanceReporting(unittest.TestCase):
                     "com.acme", "lib", "2.0.0", "3.0.0", ctx,
                 )
         self.assertIn("error", out)  # no versions in (2.0.0, 3.0.0]
-        self._assert_declared(out["resolvedFrom"])
+        self.assertNotIn("resolvedFrom", out)
+        self.assertNotIn("warnings", out)
+        self.assertNotIn("repositoryErrors", out)
 
     # --- finding #1 (code-reviewer, /finalize Phase A): the two handlers below
     # used to build their error entry from a single try/except wrapping BOTH
@@ -681,7 +689,9 @@ class TestProvenanceReporting(unittest.TestCase):
     def test_check_multiple_dependencies_downstream_error_includes_resolved_from(self):
         # The repo answers 200 but with an empty version list, so
         # find_latest_version returns None and the handler raises "No version
-        # found" downstream of a successful fetch_metadata.
+        # found". That result describes no selected version, so resolvedFrom is
+        # omitted — not copied from the first HTTP 200. No failures, so
+        # warnings and repositoryErrors are omitted too.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
         with temp_project(files) as root:
             with unittest.mock.patch(
@@ -694,12 +704,14 @@ class TestProvenanceReporting(unittest.TestCase):
                 })
         entry = out["results"][0]
         self.assertIn("error", entry)
-        self._assert_declared(entry["resolvedFrom"])
+        self.assertNotIn("resolvedFrom", entry)
+        self.assertNotIn("warnings", entry)
+        self.assertNotIn("repositoryErrors", entry)
 
     def test_compare_dependency_versions_downstream_error_includes_resolved_from(self):
         # Same shape as above: empty version list -> find_latest_version_for_current
-        # returns None -> "No matching version found", downstream of a
-        # successful fetch_metadata.
+        # returns None -> "No matching version found". The missing version
+        # omits resolvedFrom.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
         with temp_project(files) as root:
             with unittest.mock.patch(
@@ -715,7 +727,9 @@ class TestProvenanceReporting(unittest.TestCase):
                 })
         entry = out["results"][0]
         self.assertIn("error", entry)
-        self._assert_declared(entry["resolvedFrom"])
+        self.assertNotIn("resolvedFrom", entry)
+        self.assertNotIn("warnings", entry)
+        self.assertNotIn("repositoryErrors", entry)
 
     def test_check_multiple_dependencies_fetch_failure_omits_resolved_from(self):
         # Mirror image of the downstream-error test above: when fetch_metadata
@@ -1034,6 +1048,191 @@ class TestAuditDownstreamErrorResolvedFrom(unittest.TestCase):
         # carry no "error" key at all (bare `except Exception:`), unlike its
         # sibling handlers — fixed alongside the resolvedFrom threading above.
         self.assertEqual(entry.get("error"), "boom")
+
+
+_PRIVATE_VERSIONS = ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+_CENTRAL_NEWER = [*_PRIVATE_VERSIONS, "1.5.0"]
+
+
+class TestPerVersionFallbackProvenance(unittest.TestCase):
+    """MAVEN_MCP_PUBLIC_FALLBACK on must not attribute a Central-only version
+    to the first declared HTTP 200, and must not drop a declared 401."""
+
+    def _latest(self, root, responses):
+        with unittest.mock.patch.dict(
+            os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}
+        ), unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ) as opened:
+            out = server.handle_get_latest_version({
+                "groupId": "com.acme", "artifactId": "lib", "projectPath": root,
+            })
+        return out, opened
+
+    def test_split_versions_attribute_latest_to_central(self):
+        files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        responses = [
+            (200, _meta(_PRIVATE_VERSIONS)),
+            (200, _meta(_CENTRAL_NEWER)),
+        ]
+        with temp_project(files) as root:
+            out, _opened = self._latest(root, responses)
+        self.assertEqual(out["latestVersion"], "1.5.0")
+        self.assertEqual(out["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertIs(out["resolvedFrom"]["viaPublicFallback"], True)
+        warning = out["warnings"][0]
+        self.assertIn("1.5", warning)
+        self.assertIn("public fallback", warning)
+        self.assertNotIn(CUSTOM_URL, warning)
+        self.assertNotIn(CUSTOM_URL, out["resolvedFrom"]["url"])
+        self.assertNotIn("_versionSources", json.dumps(out))
+
+    def test_compare_attributes_latest_not_current_to_central(self):
+        files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        responses = [
+            (200, _meta(_PRIVATE_VERSIONS)),
+            (200, _meta(_CENTRAL_NEWER)),
+        ]
+        with temp_project(files) as root:
+            with unittest.mock.patch.dict(
+                os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}
+            ), unittest.mock.patch(
+                "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+            ):
+                out = server.handle_compare_dependency_versions({
+                    "dependencies": [{
+                        "groupId": "com.acme", "artifactId": "lib",
+                        "currentVersion": "1.4.0",
+                    }],
+                    "projectPath": root,
+                })
+        item = out["results"][0]
+        self.assertEqual(item["latestVersion"], "1.5.0")
+        self.assertEqual(item["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertIs(item["resolvedFrom"]["viaPublicFallback"], True)
+        self.assertIn("public fallback", item["warnings"][0])
+        self.assertNotIn("warnings", out)
+        self.assertNotIn(CUSTOM_URL, item["warnings"][0])
+
+    def test_audit_attributes_gradle_upgrade_to_central(self):
+        files = {
+            "settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL),
+            "build.gradle.kts": 'dependencies { implementation("com.acme:lib:1.4.0") }',
+        }
+        responses = [
+            (200, _meta(_PRIVATE_VERSIONS)),
+            (200, _meta(_CENTRAL_NEWER)),
+        ]
+        resolved = [{
+            "groupId": "com.acme",
+            "artifactId": "lib",
+            "version": "1.4.0",
+            "resolvedBy": "gradle",
+            "usages": [{"module": None, "configuration": "releaseRuntimeClasspath"}],
+        }]
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with mock_gradle_resolve(resolved), unittest.mock.patch.dict(
+                os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}
+            ), unittest.mock.patch(
+                "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+            ):
+                out = server.handle_audit_project_dependencies({
+                    "projectPath": root, "includeVulnerabilities": False,
+                })
+        dep = out["dependencies"][0]
+        self.assertEqual(dep["latestVersion"], "1.5.0")
+        self.assertEqual(dep["upgradeType"], "minor")
+        self.assertEqual(dep["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertIs(dep["resolvedFrom"]["viaPublicFallback"], True)
+        self.assertIn("public fallback", dep["warnings"][0])
+        self.assertNotIn(CUSTOM_URL, dep["warnings"][0])
+        self.assertNotIn("warnings", out)
+
+    def test_declared_401_is_kept_and_redacted_when_central_answers(self):
+        files = {
+            "settings.gradle.kts": _settings(
+                'maven { url = uri("%s") }' % CREDENTIALED_URL
+            )
+        }
+        responses = [
+            http_error(CREDENTIALED_URL, 401, "Unauthorized"),
+            (200, _meta(["1.5.0"])),
+        ]
+        with temp_project(files) as root:
+            out, _opened = self._latest(root, responses)
+        blob = json.dumps(out)
+        self.assertNotIn("repopass", blob)
+        self.assertNotIn("_versionSources", blob)
+        err = out["repositoryErrors"][0]
+        self.assertEqual(err["status"], 401)
+        self.assertIn("***@", err["url"])
+        self.assertEqual(set(err), {"url", "status", "message"})
+        warning = out["warnings"][0]
+        self.assertEqual(
+            warning,
+            "1.5.0 found only on Maven Central (public fallback); "
+            "declared repo https://***@nexus.example.com/m2 returned 401",
+        )
+        self.assertEqual(out["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertIs(out["resolvedFrom"]["viaPublicFallback"], True)
+        self.assertEqual(out["latestVersion"], "1.5.0")
+
+    def test_fallback_off_does_not_query_central_or_warn(self):
+        files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        with temp_project(files) as root:
+            with unittest.mock.patch.dict(
+                os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": ""}, clear=False
+            ), unittest.mock.patch(
+                "urllib.request.urlopen",
+                side_effect=mock_urlopen([(200, _meta(["1.4.0"]))]),
+            ) as opened:
+                out = server.handle_get_latest_version({
+                    "groupId": "com.acme", "artifactId": "lib", "projectPath": root,
+                })
+        self.assertEqual(out["latestVersion"], "1.4.0")
+        self.assertEqual(out["resolvedFrom"]["url"], CUSTOM_URL)
+        self.assertIs(out["resolvedFrom"]["viaPublicFallback"], False)
+        urls = [c.args[0].full_url for c in opened.call_args_list]
+        self.assertFalse(any(u.startswith(server.MAVEN_CENTRAL_URL) for u in urls))
+        self.assertNotIn("warnings", out)
+        self.assertNotIn("repositoryErrors", out)
+
+    def test_shared_version_stays_on_the_declared_repo(self):
+        files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        shared = ["1.0.0", "1.5.0"]
+        responses = [(200, _meta(shared)), (200, _meta(shared))]
+        with temp_project(files) as root:
+            out, _opened = self._latest(root, responses)
+        self.assertEqual(out["latestVersion"], "1.5.0")
+        self.assertEqual(out["resolvedFrom"]["url"], CUSTOM_URL)
+        self.assertIs(out["resolvedFrom"]["viaPublicFallback"], False)
+        self.assertNotIn("warnings", out)
+
+    def test_empty_declared_200_does_not_claim_later_central_version(self):
+        files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        responses = [(200, _meta([])), (200, _meta(["1.5.0"]))]
+        with temp_project(files) as root:
+            out, _opened = self._latest(root, responses)
+        self.assertEqual(out["latestVersion"], "1.5.0")
+        self.assertEqual(out["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertIs(out["resolvedFrom"]["viaPublicFallback"], True)
+        self.assertNotIn("repositoryErrors", out)
+        self.assertIn("public fallback", out["warnings"][0])
+
+    def test_configuration_docs_describe_per_version_provenance(self):
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "docs", "configuration.md"
+        )
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("per-version", text)
+        self.assertIn("repositoryErrors", text)
+        self.assertIn("warnings", text)
+        self.assertNotIn(
+            "`resolvedFrom.viaPublicFallback` is true when only a public fallback answered",
+            text,
+        )
 
 
 if __name__ == "__main__":
