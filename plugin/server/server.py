@@ -5313,6 +5313,7 @@ def get_vulnerability_paths(
         vulns = vulns_by_key.get(key)
         if not vulns:
             continue
+        vulns = _without_line_match(vulns)
         gav = key_to_gav[key]
         best_path: Optional[List[int]] = None
         for idx in key_to_indices[key]:
@@ -5930,7 +5931,15 @@ def _upgrade_vuln_item(
     if isinstance(fixed, str) and fixed.strip():
         item["fixedVersion"] = fixed
         if relation in ("introduced", "remaining", "target") and selected_version:
-            item["clearedBySelection"] = compare_versions(selected_version, fixed) >= 0
+            # _lineMatch is internal and is not copied onto the public item.
+            # A selected version still inside a stored interval, or listed in
+            # that entry's versions, is not cleared — even when it sorts above
+            # a fix from another line. No range data keeps the numeric compare
+            # so synthetic closure records stay valid.
+            if _line_match_still_affected(raw.get("_lineMatch"), selected_version):
+                item["clearedBySelection"] = False
+            else:
+                item["clearedBySelection"] = compare_versions(selected_version, fixed) >= 0
     if relation == "uncompared":
         item["reason"] = "before-version not queried"
     if relation != "target" and path_fields:
@@ -10476,15 +10485,250 @@ def _extract_severity(vuln: Dict) -> Optional[str]:
     return None
 
 
-def _extract_fixed_version(vuln: Dict) -> Optional[str]:
-    for affected in (vuln.get("affected") or []):
-        for rng in (affected.get("ranges") or []):
-            if rng.get("type") != "ECOSYSTEM":
-                continue
-            for event in (rng.get("events") or []):
-                if "fixed" in event:
-                    return event["fixed"]
+def _entry_has_package(entry: Dict) -> bool:
+    """True when ``affected[].package`` is a dict that names an ecosystem or package."""
+    package = entry.get("package")
+    return isinstance(package, dict) and ("ecosystem" in package or "name" in package)
+
+
+def _considered_osv_entries(
+    vuln: Dict, group_id: str, artifact_id: str,
+) -> Optional[List[Dict]]:
+    """Affected entries to walk for this coordinate, or None if none were considered.
+
+    If any entry has a package, only ``ecosystem == Maven`` and
+    ``name == groupId:artifactId`` match. Package-less entries and every other
+    package are ignored — there is no first-fixed fallback. If the document has
+    no package objects at all, every dict entry is walked so the existing
+    package-less fixtures still resolve by containment.
+    """
+    raw = vuln.get("affected") if isinstance(vuln, dict) else None
+    if not isinstance(raw, list):
+        return None
+    entries = [entry for entry in raw if isinstance(entry, dict)]
+    if not entries:
+        return None
+    if any(_entry_has_package(entry) for entry in entries):
+        name = f"{group_id}:{artifact_id}"
+        matched = [
+            entry for entry in entries
+            if isinstance(entry.get("package"), dict)
+            and entry["package"].get("ecosystem") == "Maven"
+            and entry["package"].get("name") == name
+        ]
+        return matched or None
+    return entries
+
+
+def _usable_bound(value: Any) -> Optional[str]:
+    """Non-empty string bound. Non-strings and blank strings are skipped."""
+    if isinstance(value, str) and value.strip():
+        return value
     return None
+
+
+def _ecosystem_intervals(events: Any) -> List[Dict[str, Optional[str]]]:
+    """Opened ECOSYSTEM intervals, in event order.
+
+    ``introduced`` opens inclusive. A second ``introduced`` while one is open
+    closes the previous interval with no fix, then opens the new one. ``fixed``
+    closes exclusive and is the fix. ``last_affected`` closes inclusive and is
+    not a fix. ``limit`` closes exclusive and is not a fix. A closer with no
+    open ``introduced`` does not contain the version — there is no implicit
+    ``introduced: 0``. An ``introduced`` still open at the end of the events
+    array contains ``version >= introduced`` and has no fix.
+    """
+    if not isinstance(events, list):
+        return []
+    intervals: List[Dict[str, Optional[str]]] = []
+    opened: Optional[str] = None
+
+    def close_open(
+        kind: Optional[str], bound: Optional[str], fixed: Optional[str],
+    ) -> None:
+        nonlocal opened
+        if opened is None:
+            return
+        intervals.append({
+            "introduced": opened,
+            "kind": kind,
+            "bound": bound,
+            "fixed": fixed,
+        })
+        opened = None
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if "introduced" in event:
+            if opened is not None:
+                close_open(None, None, None)
+            opened = _usable_bound(event.get("introduced"))
+            continue
+        closer: Optional[str] = None
+        for key in ("fixed", "last_affected", "limit"):
+            if key in event:
+                closer = key
+                break
+        if closer is None:
+            continue
+        bound = _usable_bound(event.get(closer))
+        if bound is None or opened is None:
+            # Non-string bound, or a closer with nothing open. Neither invents
+            # an introduced:0 interval, and neither counts as a fix.
+            continue
+        close_open(closer, bound, bound if closer == "fixed" else None)
+    if opened is not None:
+        close_open(None, None, None)
+    return intervals
+
+
+def _version_in_interval(version: str, interval: Dict[str, Optional[str]]) -> bool:
+    """Shared containment predicate for extraction and clearedBySelection."""
+    introduced = interval.get("introduced")
+    if not isinstance(introduced, str) or not introduced.strip():
+        return False
+    if compare_versions(version, introduced) < 0:
+        return False
+    kind = interval.get("kind")
+    bound = interval.get("bound")
+    if kind == "last_affected" and isinstance(bound, str) and bound.strip():
+        return compare_versions(version, bound) <= 0
+    if kind in ("fixed", "limit") and isinstance(bound, str) and bound.strip():
+        return compare_versions(version, bound) < 0
+    return True
+
+
+def _fixed_from_entries(entries: List[Dict], version: str) -> Optional[str]:
+    """Highest ``fixed`` of intervals that contain ``version``, or None.
+
+    If any containing interval has no ``fixed``, omit the fix entirely — do
+    not borrow one from another line. ``versions`` list membership is not a
+    fix and does not suppress a containing ``fixed``.
+    """
+    if not isinstance(version, str) or not version.strip():
+        return None
+    fixes: List[str] = []
+    unfixed = False
+    containing = False
+    for entry in entries:
+        ranges = entry.get("ranges")
+        if not isinstance(ranges, list):
+            continue
+        for rng in ranges:
+            if not isinstance(rng, dict) or rng.get("type") != "ECOSYSTEM":
+                continue
+            for interval in _ecosystem_intervals(rng.get("events")):
+                if not _version_in_interval(version, interval):
+                    continue
+                containing = True
+                fix = interval.get("fixed")
+                if isinstance(fix, str) and fix.strip():
+                    fixes.append(fix)
+                else:
+                    unfixed = True
+    if not containing or unfixed or not fixes:
+        return None
+    return max(fixes, key=functools.cmp_to_key(compare_versions))
+
+
+def _line_match_payload(entries: List[Dict]) -> Dict[str, Any]:
+    """ECOSYSTEM events and version strings from the considered entries only."""
+    ranges_out: List[Dict[str, Any]] = []
+    versions: List[str] = []
+    seen: Set[str] = set()
+    for entry in entries:
+        ranges = entry.get("ranges")
+        if isinstance(ranges, list):
+            for rng in ranges:
+                if not isinstance(rng, dict) or rng.get("type") != "ECOSYSTEM":
+                    continue
+                events = rng.get("events")
+                stored = (
+                    [dict(event) for event in events if isinstance(event, dict)]
+                    if isinstance(events, list) else []
+                )
+                ranges_out.append({"events": stored})
+        raw_versions = entry.get("versions")
+        if not isinstance(raw_versions, list):
+            continue
+        for item in raw_versions:
+            if isinstance(item, str) and item not in seen:
+                seen.add(item)
+                versions.append(item)
+    return {"ranges": ranges_out, "versions": versions}
+
+
+def _extract_fixed_version(
+    vuln: Dict, group_id: str, artifact_id: str, version: str,
+) -> Optional[str]:
+    """Line-matched ``fixed`` for the queried Maven coordinate, or None.
+
+    The coordinate is the one ``query_osv_batch`` sends. A fix that belongs
+    to a different package, or to an interval that does not contain
+    ``version``, is never used. Omit the key when there is no fix — do not
+    store null.
+    """
+    entries = _considered_osv_entries(vuln, group_id, artifact_id)
+    if entries is None:
+        return None
+    return _fixed_from_entries(entries, version)
+
+
+def _osv_line_match(
+    vuln: Dict, group_id: str, artifact_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Internal range payload for the considered entries, or None.
+
+    Attached even when ``fixedVersion`` is omitted, so a ``last_affected``
+    line is still visible to ``clearedBySelection``. Omitted when nothing
+    was considered (no affected entries, a hydration stub, or packages
+    present but none match). Another package's events are not included.
+    """
+    entries = _considered_osv_entries(vuln, group_id, artifact_id)
+    if entries is None:
+        return None
+    return _line_match_payload(entries)
+
+
+def _line_match_still_affected(line_match: Any, version: str) -> bool:
+    """True when ``version`` is inside a stored interval or listed in ``versions``.
+
+    Exact string membership, not a version compare. Interval containment
+    reuses ``_version_in_interval``.
+    """
+    if not isinstance(line_match, dict) or not isinstance(version, str) or not version:
+        return False
+    listed = line_match.get("versions")
+    if isinstance(listed, list) and version in listed:
+        return True
+    ranges = line_match.get("ranges")
+    if not isinstance(ranges, list):
+        return False
+    for rng in ranges:
+        if not isinstance(rng, dict):
+            continue
+        for interval in _ecosystem_intervals(rng.get("events")):
+            if _version_in_interval(version, interval):
+                return True
+    return False
+
+
+def _without_line_match(vulns: List[Dict]) -> List[Dict]:
+    """Public copy of vulnerability dicts with the internal ``_lineMatch`` key removed.
+
+    Does not mutate the dicts ``query_osv_batch`` returned — the closure
+    classifier still needs the key on that result.
+    """
+    public: List[Dict] = []
+    for vuln in vulns:
+        if isinstance(vuln, dict) and "_lineMatch" in vuln:
+            cleaned = dict(vuln)
+            cleaned.pop("_lineMatch", None)
+            public.append(cleaned)
+        else:
+            public.append(vuln)
+    return public
 
 
 def _extract_url(vuln: Dict) -> str:
@@ -10549,8 +10793,17 @@ def _hydrate_osv_vulns(
     return out
 
 
-def _vuln_info_from_osv(v: Dict) -> Dict:
-    """Build the public per-vuln dict from a (possibly hydrated) OSV record."""
+def _vuln_info_from_osv(
+    v: Dict, group_id: str, artifact_id: str, version: str,
+) -> Dict:
+    """Build the per-vuln dict from a (possibly hydrated) OSV record.
+
+    ``fixedVersion`` is the line-matched fix on the coordinate
+    ``query_osv_batch`` sent, not the first ECOSYSTEM ``fixed``.
+    ``_lineMatch`` is internal range data for ``clearedBySelection`` and is
+    stripped before a public tool returns the dict. A hydration stub has no
+    ``affected`` ranges, so both fields stay omitted.
+    """
     vuln_id = v.get("id", "")
     vuln_info: Dict = {
         "id": vuln_id,
@@ -10561,9 +10814,12 @@ def _vuln_info_from_osv(v: Dict) -> Dict:
     sev = _extract_severity(v)
     if sev:
         vuln_info["severity"] = sev
-    fixed = _extract_fixed_version(v)
+    fixed = _extract_fixed_version(v, group_id, artifact_id, version)
     if fixed:
         vuln_info["fixedVersion"] = fixed
+    line_match = _osv_line_match(v, group_id, artifact_id)
+    if line_match is not None:
+        vuln_info["_lineMatch"] = line_match
     return vuln_info
 
 
@@ -10572,11 +10828,15 @@ def _compute_safe_upgrade(vulnerabilities: List[Dict]) -> Optional[Dict[str, Any
 
     ADVISORY ONLY — a candidate to verify, never a guaranteed-safe pin: fixed
     versions are self-reported by upstream OSV advisories and can be wrong,
-    stale, or simply unknown for a given CVE. Reuses each vuln's already-
-    hydrated ``fixedVersion`` (query_osv_batch / _extract_fixed_version) — no
-    new network call. The minimum version clearing every known vulnerability is
-    the HIGHEST individual fixedVersion across them (a version must be >= every
-    CVE's own fix boundary to clear all of them at once).
+    stale, or simply unknown for a given CVE. Each ``fixedVersion`` is the
+    line-matched fix on the queried package — the ``fixed`` event of the
+    ECOSYSTEM interval that contains the queried version — not the first
+    ECOSYSTEM ``fixed`` in the document. Reuses those already-extracted strings
+    (query_osv_batch / _extract_fixed_version) and does not scan the raw
+    advisory for a higher first-range fix. The minimum version clearing every
+    known vulnerability on that package and line is the HIGHEST individual
+    fixedVersion across them (a version must be >= every CVE's own fix boundary
+    to clear all of them at once).
 
     Returns ``None`` when there is nothing to synthesize (no vulnerabilities —
     the dependency is already clear of every KNOWN CVE, so there is nothing to
@@ -10681,7 +10941,9 @@ def query_osv_batch(deps: List[Dict], deadline: Optional[float] = None) -> List[
             # Prefer hydrated id when present; bare querybatch always has id.
             if not full.get("id") and vid:
                 full = {**full, "id": vid}
-            vulns.append(_vuln_info_from_osv(full))
+            vulns.append(_vuln_info_from_osv(
+                full, dep["groupId"], dep["artifactId"], dep["version"],
+            ))
         entry = {**dep, "vulnerabilities": vulns}
         if unreachable and not vulns:
             entry["capabilityUnavailable"] = "unreachable"
@@ -15309,6 +15571,7 @@ def handle_get_dependency_vulnerabilities(args: Dict) -> Any:
             entry["artifactId"] = original_deps[i]["artifactId"]
             entry["version"] = original_deps[i]["version"]
             entry["resolvedImplementation"] = resolutions[i]
+        entry["vulnerabilities"] = _without_line_match(entry.get("vulnerabilities") or [])
         entry["vulnerabilityCount"] = len(entry["vulnerabilities"])
         safe_upgrade = _compute_safe_upgrade(entry["vulnerabilities"])
         if safe_upgrade is not None:

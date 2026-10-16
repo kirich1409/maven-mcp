@@ -206,6 +206,8 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
      `landed`, `rewroteVersionless`, `capabilityUnavailable`. When
      `compare_versions(safeUpgrade.version, toVersion) > 0`, say the confirmed
      direct version does not clear every known CVE and name that candidate. That
+     compare is against the line-matched `safeUpgrade.version` for the queried
+     package and the line, not clearance by a cross-line numeric win. That
      compare is `compare_versions`: numeric segments, then stability class, qualifier
      presence, prerelease ordinals, then a lexical tie-break. Not text order (`1.10`
      is above `1.9`). An RC and a final release that share a numeric core are not equal. Ask
@@ -230,8 +232,12 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
      result. Do not say safe.
 
    `targets[].safeUpgrade` is one extra line on the direct coordinate, labeled
-   advisory: `fixesAllKnown` and `version`, or `fixesAllKnown: false` plus
-   `reason`. It is not a row per CVE. Do not present it as the version to write.
+   advisory. It is not a row per CVE. `safeUpgrade.version` is advisory, is not
+   the version to write, and is only the fix on the queried package and the line
+   that contains the installed version. Name `safeUpgrade.version` only when
+   `fixesAllKnown` is `true`. When `fixesAllKnown` is false, a version that
+   fixes every known issue on that package and line is not known; surface
+   `reason` and do not name a version.
 
    If `landed` is false, you may offer one retry of that coordinate with
    `substitution: "module"`. The server does not launch that second pair. Do not
@@ -263,8 +269,8 @@ One CVE, in this order. Same row as `/upgrade-closure`. Do not paraphrase `summa
 3. `id`, linked with `url`. When `url` is empty, use `https://osv.dev/vulnerability/{id}`.
 4. `severity`, or `severity unknown` when hydration left it off.
 5. `summary`, or the id alone when `summary` is empty.
-6. `fixedVersion`, or `fix unknown` when it was omitted.
-7. `clearedBySelection`: `selected version is at or above the fix`, `selected version is still below the fix`, or omit this clause when there is no `fixedVersion`. For `relation: fixed`, say the bump no longer selects the vulnerable version.
+6. `fixedVersion`, the fix on the queried package and the line that contains the vulnerable node's version, or `fix unknown` when omitted, including when the containing range has no `fixed`. That string is the `fixed` event of the ECOSYSTEM interval that contains the queried version on the affected entry whose `package.ecosystem` is `Maven` and whose `package.name` is `groupId:artifactId`. Do not take the first ECOSYSTEM `fixed`. `fixed` is exclusive. `last_affected` is inclusive and is not a fix. `limit` is not a fix. Do not borrow a fix from another line of the same package or from a different package.
+7. `clearedBySelection`: false means the selected version is still inside an affected range of that package or is listed in that entry's `versions`, even if it sorts above `fixedVersion`. True means the selected version is at or above the fix for the queried package and the line that contains it, and is not still inside an affected range or listed in its versions. A numeric win over `fixedVersion` is not clearance when that string is not the line that contains the selected version. Omit this clause when there is no `fixedVersion`. For `relation: fixed`, say the bump no longer selects the vulnerable version.
 8. `path` as an arrow chain (`g:a:v → g:a:v`) when present. When `pathOmitted` is present, say the middle was shortened and the leaf is the vulnerable node.
 9. When the node is not the target and `clearedBySelection` is false: this coordinate is not the line being edited; clearing it needs a constraint or a higher root, and this preview does not propose that pin.
 
