@@ -986,7 +986,7 @@ class LicenseAndSelectionTest(unittest.TestCase):
 
     def test_tool_registry_includes_compare_upgrade_closure(self):
         names = [tool["name"] for tool in server.TOOLS]
-        self.assertEqual(len(names), 21)
+        self.assertEqual(len(names), 22)
         self.assertIn("compare_upgrade_closure", names)
 
 

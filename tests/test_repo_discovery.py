@@ -737,6 +737,123 @@ class TestExclusiveContentShorthand(unittest.TestCase):
         self.assertEqual(len(entries), 2)
 
 
+class TestShorthandRepoBlocks(unittest.TestCase):
+    """``google { }`` / ``mavenCentral { }`` / ``gradlePluginPortal { }`` are
+    repositories, including a nested ``content { }`` filter. A missed block is
+    not public fallback and is not a second unfiltered shorthand."""
+
+    def test_now_in_android_settings_shape(self):
+        settings = (
+            "pluginManagement {\n"
+            "  repositories {\n"
+            "    google {\n"
+            "      content {\n"
+            '        includeGroupByRegex("com\\\\.android.*")\n'
+            '        includeGroupByRegex("com\\\\.google.*")\n'
+            '        includeGroupByRegex("androidx.*")\n'
+            "      }\n"
+            "    }\n"
+            "    mavenCentral()\n"
+            "    gradlePluginPortal()\n"
+            "  }\n"
+            "}\n"
+            "dependencyResolutionManagement {\n"
+            "  repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n"
+            "  repositories {\n"
+            "    google {\n"
+            "      content {\n"
+            '        includeGroupByRegex("com\\\\.android.*")\n'
+            '        includeGroupByRegex("com\\\\.google.*")\n'
+            '        includeGroupByRegex("androidx.*")\n'
+            "      }\n"
+            "    }\n"
+            "    mavenCentral()\n"
+            "  }\n"
+            "}\n"
+        )
+        expected = [
+            {"type": "regex", "value": r"com\.android.*"},
+            {"type": "regex", "value": r"com\.google.*"},
+            {"type": "regex", "value": "androidx.*"},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "settings.gradle.kts"), "w", encoding="utf-8") as fh:
+                fh.write(settings)
+            discovered = server.discover_repositories(root)
+        for scope in ("dependency", "plugin"):
+            google = next(
+                e for e in discovered[scope] if e["url"] == server.GOOGLE_MAVEN_URL
+            )
+            self.assertEqual(google["group_filters"], expected)
+            self.assertTrue(server._repo_matches_group(google, "androidx.navigation3"))
+            self.assertFalse(server._repo_matches_group(google, "org.jetbrains.kotlin"))
+        self.assertIn(server.MAVEN_CENTRAL_URL, _urls(discovered["dependency"]))
+        self.assertIn(server.GRADLE_PLUGIN_PORTAL_URL, _urls(discovered["plugin"]))
+
+    def test_three_shorthand_blocks_keep_content_filters(self):
+        body = (
+            "google { }\n"
+            'mavenCentral { content { includeGroup("org.example") } }\n'
+            'gradlePluginPortal { content { includeGroupByRegex("com\\\\.example\\\\..*") } }\n'
+        )
+        entries = server._parse_gradle_repos(body)
+        self.assertEqual(
+            [e["url"] for e in entries],
+            [
+                server.GOOGLE_MAVEN_URL,
+                server.MAVEN_CENTRAL_URL,
+                server.GRADLE_PLUGIN_PORTAL_URL,
+            ],
+        )
+        self.assertNotIn("group_filters", entries[0])
+        self.assertEqual(
+            entries[1]["group_filters"],
+            [{"type": "exact", "value": "org.example"}],
+        )
+        self.assertEqual(
+            entries[2]["group_filters"],
+            [{"type": "regex", "value": r"com\.example\..*"}],
+        )
+        self.assertTrue(server._repo_matches_group(entries[2], "com.example.foo"))
+
+    def test_call_form_is_one_entry_and_block_is_not_a_second_shorthand(self):
+        call = server._parse_gradle_repos("google()")
+        self.assertEqual(len(call), 1)
+        self.assertEqual(call[0]["url"], server.GOOGLE_MAVEN_URL)
+        self.assertNotIn("group_filters", call[0])
+
+        block = server._parse_gradle_repos(
+            'google { content { includeGroup("androidx.core") } }'
+        )
+        self.assertEqual(len(block), 1)
+        self.assertEqual(block[0]["group_filters"], [{"type": "exact", "value": "androidx.core"}])
+
+        both = server._parse_gradle_repos(
+            'google()\ngoogle { content { includeGroup("androidx.core") } }'
+        )
+        self.assertEqual(len(both), 1)
+        self.assertEqual(both[0]["group_filters"], [{"type": "exact", "value": "androidx.core"}])
+
+    def test_exclusive_content_google_block_is_not_recorded_twice(self):
+        body = (
+            "exclusiveContent {\n"
+            "  forRepository {\n"
+            "    google {\n"
+            '      content { includeGroupByRegex("androidx.*") }\n'
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        entries = server._parse_gradle_repos(body)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["url"], server.GOOGLE_MAVEN_URL)
+        self.assertEqual(
+            entries[0]["group_filters"],
+            [{"type": "regex", "value": "androidx.*"}],
+        )
+        self.assertTrue(server._repo_matches_group(entries[0], "androidx.core"))
+
+
 class TestSubmoduleRepositories(unittest.TestCase):
     def test_prefer_project_includes_submodule_repos(self):
         with tempfile.TemporaryDirectory() as root:

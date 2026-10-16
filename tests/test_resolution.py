@@ -413,6 +413,77 @@ class TestMetadataMerge(unittest.TestCase):
                 server.fetch_metadata("com.acme", "lib", ctx)
         self.assertTrue(str(cm.exception).startswith("Could not fetch metadata for com.acme:lib"))
 
+    def test_all_repos_404_names_every_queried_repo(self):
+        # A multi-repo miss must name every queried repo, not only the last
+        # last_err. A single queried repo stays byte-identical (covered by
+        # the prefix assertion above and the one-repo auth tests).
+        ctx = self._two_repo_ctx()
+        responses = [http_error(REPO_A, 404, "x"), http_error(REPO_B, 404, "x")]
+        with unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ):
+            with self.assertRaises(ValueError) as cm:
+                server.fetch_metadata("com.acme", "lib", ctx)
+        msg = str(cm.exception)
+        self.assertTrue(msg.startswith("Could not fetch metadata for com.acme:lib:"))
+        self.assertIn(REPO_A, msg)
+        self.assertIn(REPO_B, msg)
+        self.assertIn("; ", msg)
+        self.assertNotEqual(
+            msg,
+            f"Could not fetch metadata for com.acme:lib: HTTP 404 from {REPO_B}",
+        )
+
+
+class TestMetadataMissNamesQueriedRepos(unittest.TestCase):
+    def test_compare_names_google_block_and_maven_central(self):
+        # Now in Android settings shape: google { content { } } plus
+        # mavenCentral(). A mocked multi-404 must name both, not only Central.
+        settings = (
+            "dependencyResolutionManagement {\n"
+            "  repositories {\n"
+            "    google {\n"
+            "      content {\n"
+            '        includeGroupByRegex("com\\\\.android.*")\n'
+            '        includeGroupByRegex("com\\\\.google.*")\n'
+            '        includeGroupByRegex("androidx.*")\n'
+            "      }\n"
+            "    }\n"
+            "    mavenCentral()\n"
+            "  }\n"
+            "}\n"
+        )
+        files = {"settings.gradle.kts": settings}
+        responses = [
+            http_error(server.GOOGLE_MAVEN_URL, 404, "Not Found"),
+            http_error(server.MAVEN_CENTRAL_URL, 404, "Not Found"),
+        ]
+        with temp_project(files) as root:
+            with unittest.mock.patch(
+                "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+            ):
+                out = server.handle_compare_dependency_versions({
+                    "projectPath": root,
+                    "dependencies": [{
+                        "groupId": "androidx.navigation3",
+                        "artifactId": "navigation3-ui",
+                        "currentVersion": "1.0.0",
+                    }],
+                })
+        error = out["results"][0]["error"]
+        self.assertTrue(
+            error.startswith(
+                "Could not fetch metadata for androidx.navigation3:navigation3-ui:"
+            )
+        )
+        self.assertIn("Google Maven", error)
+        self.assertIn("Maven Central", error)
+        self.assertNotEqual(
+            error,
+            "Could not fetch metadata for androidx.navigation3:navigation3-ui: "
+            "HTTP 404 from Maven Central",
+        )
+
 
 # ---------------------------------------------------------------------------
 # T-6 — handlers build ctx from projectPath and thread it down

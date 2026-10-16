@@ -285,8 +285,9 @@ def mock_gradle_resolve(
         deps = list(dependencies if dependencies is not None else [])
         err = list(errors or [])
         if not deps and not err:
-            # scan_project rejects an empty Gradle resolve; tests that only
-            # exercise provenance/dead-repo hints need a placeholder GAV.
+            # Provenance-only tests need a production row so scan_project reports
+            # resolvedBy gradle. A failed resolve (errors set, no deps) must stay
+            # empty so the caller can assert the no-production path.
             deps = [{
                 "groupId": "com.example",
                 "artifactId": "fixture",

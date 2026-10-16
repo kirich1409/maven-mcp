@@ -48,6 +48,20 @@ From the audit / compare results, only include entries where an upgrade is avail
 
 When `resolvedBy: "gradle"` is present on the scan/audit result, versions are Gradle-resolved
 (effective versions from BOM/platform/constraints), not regex-guessed from build files.
+Absence of `resolvedBy` is not proof that Gradle resolution failed. A successful
+`audit_project_dependencies` result does not set `resolvedBy`.
+
+Catalog fallback is keyed off `gradleErrors` and the resolution-failure notes copied
+only when Gradle resolution produced no production runtime rows. Those notes are
+`All Gradle dependency tasks failed.` and `No production configurations resolved; project may lack applicable variants.`
+Launch and exit failures stay on `gradleErrors` (`Gradle init-script invocation exited with code N: ...`,
+`Failed to launch Gradle wrapper ...`). When either is present, quote that diagnostic and
+say the versions came from the catalog because Gradle resolution failed. Do not describe
+that result as a Gradle-resolved scan.
+
+The deadline note `Stopped early after exceeding the {TOOL_DEADLINE}s tool deadline...`
+is not that diagnostic. If both a resolution failure and the tool deadline are present,
+report both. Do not replace one with the other.
 
 **Terminal branch — nothing outdated and no vulnerabilities:**
 
@@ -64,6 +78,36 @@ Surface `resolvedFrom.viaPublicFallback` when true (coordinate missing from decl
 Surface `deadRepositoryHints` from the scan/audit when present (e.g. `jcenter()`).
 
 ## Step 3 — Confirmation
+
+Before the stable non-major library batch, split toolchain pins out. Identify them by
+coordinate, not catalog alias. They get their own confirm even when `upgradeType` is
+`minor` or `patch`. Do not put them in the library batch. A green
+`compileDemoDebugKotlin` does not make one of these a library patch.
+
+- AGP: plugin ids `com.android.application`, `com.android.library`, `com.android.test`,
+  `com.android.dynamic-feature`, the marker `{id}:{id}.gradle.plugin`, and
+  `com.android.tools.build:gradle`.
+- KGP: `org.jetbrains.kotlin.android`, `org.jetbrains.kotlin.jvm`,
+  `org.jetbrains.kotlin.multiplatform`, the marker form, and
+  `org.jetbrains.kotlin:kotlin-gradle-plugin`.
+- KSP: `com.google.devtools.ksp` and its marker.
+- Compose compiler: `org.jetbrains.kotlin.plugin.compose` and
+  `androidx.compose.compiler:compiler`.
+
+For that confirm, call `check_version_compatibility`. Pass the proposed AGP as
+`android.agp` and the proposed Kotlin as `android.kotlin`, plus the project's Gradle
+and JDK only when the project actually states them. Do not invent a JDK. KSP and the
+Compose compiler still get the confirm and still get the call with the project's known
+AGP / Kotlin / Gradle. Do not invent a KSP or Compose row the tool does not have.
+
+If a conflict kind is `agp_unknown` or `kotlin_unknown`, say the shipped matrix does not cover that version. Do not say the combination is known-good or known-bad. Other
+kinds, including `kotlin_gradle` and `kotlin_agp`, are reported as the tool's conflicts.
+Do not rewrite them into unknown.
+
+Paired-version note on that confirm: name catalog entries that share the same
+`version.ref` (a catalog comment that AGP and Android tools move together is the
+example, not a hardcoded alias). Name matrix partners: Gradle and JDK for AGP, AGP
+and Gradle for KGP. Do not bump the paired pin in that confirm.
 
 Present the full report and **ask before making any edits**. Default proposal: update
 catalog entries first. Ask separately for non-catalog groups. Flag every MAJOR upgrade
@@ -198,6 +242,18 @@ all-identity `none`, and `unknown` do not mean safe; they also do not by themsel
 cancel a set the user already confirmed. Step 5 stays a build check. This preview
 is not a build.
 
+### SDK floor — after confirm, before the edit
+
+Not during the audit, and not for every audit row. For a confirmed pin that is not a
+toolchain coordinate and whose `groupId` starts with `androidx.`, `com.google.android.`,
+or `com.google.firebase.`, call `get_aar_sdk_requirements` once with the candidate
+version and `projectPath`.
+
+If `requiresCompileSdk` or `requiresMinSdk` is set, refuse the bump. Name the project
+value and the required value. Either field blocks until the user explicitly accepts
+the SDK change in a separate confirm. Do not apply the pin while either field is set. Do not apply the SDK edit in the same step as the pin. Do not edit `compileSdk` or `minSdk` to make the bump pass. If the tool returns neither field, do not block,
+including when a note says the SDK was unparsed or the artifact was not an AAR.
+
 ### Decision row
 
 One CVE, in this order. Same row as `/upgrade-closure`. Do not paraphrase `summary`.
@@ -250,8 +306,24 @@ After every edit pass:
 - **Gradle:** `./gradlew build` (or a faster resolve check when a full build is slow)
 - **Maven:** `mvn dependency:tree`
 
-Surface failures immediately. Attempt trivial fixes; otherwise revert that entry and note
-"manual upgrade required". **Never report "versions updated" without a passing build.**
+Still revert a pin that did not stay. **Never report "versions updated" without a passing build.**
+
+### Not updated
+
+Every confirmed pin that did not stay gets a **Not updated** row: coordinate, from → to,
+the failed command, and the diagnostic. Diagnostics to name: unresolved symbol,
+spotless violation, `requiresCompileSdk`, `requiresMinSdk`.
+
+- API rename: show the replacement patch. Do not apply it unasked, and do not apply it
+  and then revert it together with the pin.
+- Spotless: show the rule and the `spotlessApply` diff. Do not format the repo unasked.
+  Do not run `spotlessApply` unless the user accepts that separately.
+- A later `CheckAarMetadata` failure is parsed from that task's output into the same
+  `requiresCompileSdk` / `requiresMinSdk` fields: the project's current value and the
+  value the AAR requires. That is a refusal, not a follow-up edit. Do not edit
+  `compileSdk` or `minSdk` while chasing a green build, and do not edit `compileSdk`
+  or `minSdk` to make the bump pass.
+- "manual upgrade required" is not a substitute for the diagnostic and is not the outcome.
 
 ## Constraints and non-goals
 

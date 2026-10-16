@@ -270,11 +270,13 @@ class TestRunGradleCommand(unittest.TestCase):
                     fh.write(name + "\n")
             with unittest.mock.patch.object(server.os, "name", "nt"):
                 with unittest.mock.patch.object(server, "_gradle_run", side_effect=_raise):
-                    with self.assertRaises(ValueError) as raised:
-                        server.scan_project(root)
-        message = str(raised.exception)
-        self.assertIn(os.path.join(root, "gradlew.bat"), message)
-        self.assertNotIn("not a valid Win32 application", message.split("Failed to launch", 1)[0])
+                    result = server.scan_project(root)
+        text = "; ".join(result.get("gradleErrors") or [])
+        self.assertIn(os.path.join(root, "gradlew.bat"), text)
+        self.assertNotIn(
+            "not a valid Win32 application", text.split("Failed to launch", 1)[0]
+        )
+        self.assertNotEqual(result.get("resolvedBy"), "gradle")
 
     def test_timeout_expired_returns_124(self):
         def _raise_timeout(*_args, **_kwargs):
@@ -548,34 +550,151 @@ class TestGradleResolveIntegration(unittest.TestCase):
                 server.scan_project(root)
         self.assertIn("Gradle wrapper", str(ctx.exception))
 
-    def test_resolution_errors_raise_when_no_dependencies(self):
+    def test_resolution_errors_surface_without_raising(self):
         files = {"build.gradle.kts": 'plugins { id("java") }'}
         with temp_project(files) as root:
             write_fake_gradlew(root)
             with mock_gradle_resolve(errors=["Gradle daemon unavailable"], dependencies=[]):
-                with self.assertRaises(ValueError) as ctx:
-                    server.scan_project(root)
-        self.assertIn("Gradle dependency resolution failed", str(ctx.exception))
+                result = server.scan_project(root)
+        self.assertNotEqual(result.get("resolvedBy"), "gradle")
+        self.assertIn("Gradle daemon unavailable", result.get("gradleErrors") or [])
 
-    def test_only_classpath_deps_raises(self):
+    def test_only_classpath_deps_keeps_provenance(self):
         files = {"build.gradle.kts": 'plugins { id("java") }'}
         with temp_project(files) as root:
             write_fake_gradlew(root)
             with self._mock_run(ONLY_BUILDENV_FIXTURE):
-                with self.assertRaises(ValueError) as ctx:
-                    server.scan_project(root)
-        self.assertIn("No production runtime dependencies resolved", str(ctx.exception))
+                result = server.scan_project(root)
+        self.assertNotEqual(result.get("resolvedBy"), "gradle")
+        text = " ".join(result.get("gradleErrors") or [])
+        self.assertIn("No production runtime dependencies resolved", text)
+        self.assertTrue(any(
+            d["groupId"] == "com.android.tools.build" for d in result["dependencies"]
+        ))
 
-    def test_all_silent_task_failures_raise(self):
+    def test_all_silent_task_failures_return_scan(self):
         files = {"build.gradle.kts": 'plugins { id("java") }'}
         with temp_project(files) as root:
             write_fake_gradlew(root)
             with unittest.mock.patch.object(
                 server, "_run_gradle_command", return_value=(1, "", "")
             ):
-                with self.assertRaises(ValueError) as ctx:
-                    server.scan_project(root)
-        self.assertIn("Gradle dependency resolution failed", str(ctx.exception))
+                result = server.scan_project(root)
+        self.assertNotEqual(result.get("resolvedBy"), "gradle")
+        text = " ".join(result.get("gradleErrors") or []) + " " + " ".join(result.get("notes") or [])
+        self.assertIn("All Gradle dependency tasks failed.", text)
+
+    def test_failed_resolve_audit_looks_up_catalog_rows(self):
+        files = {
+            "settings.gradle.kts": 'rootProject.name = "app"\n',
+            "gradle/libs.versions.toml": (
+                "[versions]\n"
+                'coreKtx = "1.16.0"\n'
+                'agp = "9.3.2"\n'
+                "\n"
+                "[libraries]\n"
+                'androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }\n'
+                "\n"
+                "[plugins]\n"
+                'android-application = { id = "com.android.application", version.ref = "agp" }\n'
+            ),
+        }
+        with temp_project(files) as root:
+            path = os.path.join(root, "gradlew")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(path, 0o700)
+
+            def _raise_metadata(group_id, artifact_id, _ctx):
+                raise ValueError(
+                    f"Could not fetch metadata for {group_id}:{artifact_id}: HTTP 404"
+                )
+
+            with unittest.mock.patch.object(
+                server, "fetch_metadata", side_effect=_raise_metadata
+            ) as fetch:
+                with unittest.mock.patch.object(server, "apply_bom_managed_versions") as bom:
+                    result = server.handle_audit_project_dependencies({
+                        "projectPath": root,
+                        "includeVulnerabilities": False,
+                    })
+        self.assertFalse(bom.called)
+        self.assertGreaterEqual(fetch.call_count, 2)
+        coords = {
+            (d["groupId"], d["artifactId"]) for d in result["dependencies"]
+        }
+        self.assertIn(("androidx.core", "core-ktx"), coords)
+        self.assertIn(
+            ("com.android.application", "com.android.application.gradle.plugin"),
+            coords,
+        )
+        for dep in result["dependencies"]:
+            if dep.get("currentVersion"):
+                self.assertTrue(
+                    dep["error"].startswith("Could not fetch metadata for"),
+                    dep,
+                )
+        self.assertTrue(result.get("gradleErrors"))
+        notes = " ".join(result.get("notes") or [])
+        self.assertIn("All Gradle dependency tasks failed.", notes)
+
+    def test_failed_resolve_conflict_scan_does_not_fallback(self):
+        files = {"settings.gradle.kts": 'rootProject.name = "app"\n'}
+        with temp_project(files) as root:
+            path = os.path.join(root, "gradlew")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(path, 0o700)
+            with unittest.mock.patch.object(server, "apply_bom_managed_versions") as bom:
+                with unittest.mock.patch.object(
+                    server, "fetch_depsdev_dependencies"
+                ) as depsdev:
+                    with unittest.mock.patch.object(
+                        server, "resolve_pom_graph"
+                    ) as pom_graph:
+                        result = server.detect_dependency_conflicts(root)
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["graphsFetched"], 0)
+        self.assertFalse(bom.called)
+        self.assertFalse(depsdev.called)
+        self.assertFalse(pom_graph.called)
+        text = " ".join(result.get("errors") or []) + " " + " ".join(result.get("notes") or [])
+        self.assertTrue(
+            "exited with code 1" in text or "All Gradle dependency tasks failed." in text
+        )
+
+    def test_failed_resolve_keeps_deadline_note_with_resolution_notes(self):
+        files = {
+            "settings.gradle.kts": 'rootProject.name = "app"\n',
+            "gradle/libs.versions.toml": (
+                "[libraries]\n"
+                'core = { module = "androidx.core:core-ktx", version = "1.16.0" }\n'
+                'nav = { module = "androidx.navigation3:navigation3-ui", version = "1.0.0" }\n'
+            ),
+        }
+        seen = {"n": 0}
+
+        def _now():
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return 0.0
+            return float(server.TOOL_DEADLINE) + 1.0
+
+        with temp_project(files) as root:
+            path = os.path.join(root, "gradlew")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(path, 0o700)
+            with unittest.mock.patch.object(server, "_now", side_effect=_now):
+                result = server.handle_audit_project_dependencies({
+                    "projectPath": root,
+                    "includeVulnerabilities": False,
+                })
+        self.assertTrue(result.get("partial"))
+        notes = result.get("notes") or []
+        self.assertIn("All Gradle dependency tasks failed.", notes)
+        self.assertTrue(any(note.startswith("Stopped early after exceeding the ") for note in notes))
+        self.assertTrue(result.get("gradleErrors"))
 
     def test_partial_failure_surfaces_gradle_errors(self):
         # Per-module, per-configuration failure isolation (#401): one
