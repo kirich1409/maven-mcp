@@ -278,7 +278,7 @@ source:
 numeric: major | minor | patch | same
 stability: promoted | same | regressed
 notesStatus: missing | inconclusive | classified
-upgradeEffect: bump | source-adaptation | migration   # required when notesStatus is classified; omitted otherwise
+upgradeEffect: source-adaptation | migration   # required when notesStatus is classified; omitted otherwise
 changelogNotes: [string]
 ```
 
