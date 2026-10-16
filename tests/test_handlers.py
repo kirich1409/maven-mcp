@@ -111,6 +111,8 @@ class TestCheckVersionExists(unittest.TestCase):
             })
         self.assertTrue(out["exists"])
         self.assertEqual(out["repository"], "Maven Central")
+        self.assertNotIn("existenceStatus", out)
+        self.assertNotIn("error", out)
 
     def test_version_absent(self):
         with _patch_urlopen([(200, _meta(["1.0.0", "1.1.0"]))]):
@@ -119,6 +121,219 @@ class TestCheckVersionExists(unittest.TestCase):
             })
         self.assertFalse(out["exists"])
         self.assertNotIn("repository", out)
+        self.assertNotIn("existenceStatus", out)
+        self.assertNotIn("error", out)
+
+
+def _dispatch_check_version(arguments):
+    return server._dispatch_message({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "check_version_exists", "arguments": arguments},
+    })
+
+
+def _assert_unknown(test, response, *error_parts):
+    """A failed lookup is a successful unknown result, not exists false and not isError."""
+    test.assertNotIn("error", response)
+    result = response["result"]
+    test.assertNotIn("isError", result)
+    payload = result["structuredContent"]
+    test.assertEqual(json.loads(result["content"][0]["text"]), payload)
+    test.assertEqual(payload["existenceStatus"], "unknown")
+    test.assertNotIn("exists", payload)
+    test.assertNotIn("repository", payload)
+    test.assertNotIn("resolvedFrom", payload)
+    for part in error_parts:
+        test.assertIn(part, payload["error"])
+    return payload
+
+
+def _assert_definitive(test, response, exists):
+    test.assertNotIn("error", response)
+    result = response["result"]
+    test.assertNotIn("isError", result)
+    payload = result["structuredContent"]
+    test.assertIs(payload["exists"], exists)
+    test.assertNotIn("existenceStatus", payload)
+    test.assertNotIn("error", payload)
+    return payload
+
+
+class TestCheckVersionExistsUnverifiable(unittest.TestCase):
+    """tools/call so isError is observable. Fails on the exists-false collapse."""
+
+    def _args(self, root, group_id="com.example", artifact_id="lib", version="1.2.3"):
+        return {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "version": version,
+            "projectPath": root,
+        }
+
+    def test_http_500_is_unknown(self):
+        errs = [http_error("u", 500, "boom") for _ in range(server.HTTP_MAX_ATTEMPTS)]
+        with temp_project({}) as root, \
+                unittest.mock.patch("urllib.request.urlopen", side_effect=mock_urlopen(errs)) as opened, \
+                unittest.mock.patch.object(server, "_sleep"):
+            response = _dispatch_check_version(self._args(root))
+        self.assertEqual(opened.call_count, server.HTTP_MAX_ATTEMPTS)
+        _assert_unknown(self, response, "HTTP 500", "Maven Central")
+
+    def test_http_401_and_403_are_unknown(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                with temp_project({}) as root, unittest.mock.patch(
+                    "urllib.request.urlopen",
+                    side_effect=mock_urlopen([http_error("u", status, "no")]),
+                ) as opened:
+                    response = _dispatch_check_version(self._args(root))
+                self.assertEqual(opened.call_count, 1)
+                _assert_unknown(self, response, "auth required", f"HTTP {status}")
+
+    def test_urlerror_is_unknown_and_drops_exception_text(self):
+        token = "password-fragment-must-not-appear"
+        errs = [urllib.error.URLError(token) for _ in range(server.HTTP_MAX_ATTEMPTS)]
+        with temp_project({}) as root, \
+                unittest.mock.patch("urllib.request.urlopen", side_effect=mock_urlopen(errs)) as opened, \
+                unittest.mock.patch.object(server, "_sleep"):
+            response = _dispatch_check_version(self._args(root))
+        self.assertEqual(opened.call_count, server.HTTP_MAX_ATTEMPTS)
+        payload = _assert_unknown(self, response, "URLError", "Maven Central")
+        self.assertNotIn(token, payload["error"])
+
+    def test_offline_empty_repo_list_is_unknown_without_urlopen(self):
+        with temp_project({}) as root:
+            env = {
+                "MAVEN_MCP_OFFLINE": "1",
+                "MAVEN_MCP_SETTINGS": os.path.join(root, "missing-settings.xml"),
+            }
+            with unittest.mock.patch.dict(os.environ, env, clear=False), \
+                    unittest.mock.patch.object(server, "_load_gradle_init_mirrors", return_value=[]), \
+                    unittest.mock.patch("urllib.request.urlopen") as opened:
+                os.environ.pop("MAVEN_MCP_REPOSITORY_BASE", None)
+                response = _dispatch_check_version(self._args(root))
+        opened.assert_not_called()
+        _assert_unknown(self, response, "no queryable repositories")
+
+    def test_content_filter_empty_list_is_unknown_without_urlopen(self):
+        files = {
+            "settings.gradle.kts": (
+                "dependencyResolutionManagement { repositories { "
+                'maven { url = uri("https://jitpack.io"); '
+                'content { includeGroup("com.github.foo") } } '
+                "} }"
+            ),
+        }
+        with temp_project(files) as root, unittest.mock.patch("urllib.request.urlopen") as opened:
+            response = _dispatch_check_version(self._args(root, group_id="com.google.guava", artifact_id="guava"))
+        opened.assert_not_called()
+        _assert_unknown(self, response, "content/group filtering")
+
+    def test_omitting_200_does_not_hide_sibling_401(self):
+        # androidx.core: Google Maven, then Maven Central.
+        responses = [
+            http_error(server.GOOGLE_MAVEN_URL, 401, "no"),
+            (200, _meta(["1.0.0"])),
+        ]
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ) as opened:
+            response = _dispatch_check_version(self._args(root, group_id="androidx.core", artifact_id="core-ktx"))
+        self.assertEqual(opened.call_count, 2)
+        _assert_unknown(self, response, "auth required", "HTTP 401", "Google Maven")
+
+    def test_404_does_not_overwrite_auth_required_error(self):
+        responses = [
+            http_error(server.GOOGLE_MAVEN_URL, 401, "no"),
+            http_error(server.MAVEN_CENTRAL_URL, 404, "missing"),
+        ]
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ):
+            response = _dispatch_check_version(self._args(root, group_id="androidx.core", artifact_id="core-ktx"))
+        payload = _assert_unknown(self, response, "auth required")
+        self.assertNotIn("HTTP 404", payload["error"])
+
+    def test_listing_200_stays_exists_true(self):
+        responses = [(200, _meta(["1.2.3"])), http_error("u", 404, "no pom")]
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ):
+            response = _dispatch_check_version(self._args(root))
+        payload = _assert_definitive(self, response, True)
+        self.assertEqual(payload["repository"], "Maven Central")
+
+    def test_sole_omitting_200_stays_exists_false(self):
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen",
+            side_effect=mock_urlopen([(200, _meta(["1.0.0"]))]),
+        ) as opened:
+            response = _dispatch_check_version(self._args(root))
+        self.assertEqual(opened.call_count, 1)
+        _assert_definitive(self, response, False)
+
+    def test_every_repo_404_stays_exists_false(self):
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen",
+            side_effect=mock_urlopen([http_error("u", 404, "missing")]),
+        ) as opened:
+            response = _dispatch_check_version(self._args(root))
+        self.assertEqual(opened.call_count, 1)
+        _assert_definitive(self, response, False)
+
+    def test_unverifiable_then_listing_200_stays_exists_true(self):
+        # 401 is not retried. 500 is, so queue HTTP_MAX_ATTEMPTS failures first.
+        cases = (
+            ("401", [http_error("u", 401, "no"), (200, _meta(["1.2.3"]))]),
+            ("500", [http_error("u", 500, "boom") for _ in range(server.HTTP_MAX_ATTEMPTS)] + [(200, _meta(["1.2.3"]))]),
+        )
+        pom_misses = [http_error("u", 404, "no pom"), http_error("u", 404, "no pom")]
+        for label, metadata in cases:
+            with self.subTest(label=label), temp_project({}) as root, \
+                    unittest.mock.patch(
+                        "urllib.request.urlopen",
+                        side_effect=mock_urlopen(metadata + pom_misses),
+                    ), \
+                    unittest.mock.patch.object(server, "_sleep"):
+                response = _dispatch_check_version(
+                    self._args(root, group_id="androidx.core", artifact_id="core-ktx")
+                )
+            payload = _assert_definitive(self, response, True)
+            self.assertEqual(payload["repository"], "Maven Central")
+
+    def test_google_omit_then_central_hit_reports_central(self):
+        responses = [
+            (200, _meta(["1.0.0"])),
+            (200, _meta(["1.0.0", "1.2.3"])),
+            http_error("u", 404, "no pom"),
+            http_error("u", 404, "no pom"),
+        ]
+        with temp_project({}) as root, unittest.mock.patch(
+            "urllib.request.urlopen", side_effect=mock_urlopen(responses)
+        ):
+            response = _dispatch_check_version(
+                self._args(root, group_id="androidx.core", artifact_id="core-ktx")
+            )
+        payload = _assert_definitive(self, response, True)
+        self.assertEqual(payload["repository"], "Maven Central")
+        self.assertIn("repo1.maven.org", payload["resolvedFrom"]["url"])
+
+
+class TestCheckVersionExistsSkill(unittest.TestCase):
+    def test_skill_distinguishes_miss_from_check_did_not_run(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "plugin", "skills", "check-version-exists", "SKILL.md",
+        )
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("unknown means the check did not run", text)
+        self.assertIn("existenceStatus", text)
+        self.assertIn("means the version was not in the metadata", text)
+        self.assertIn("exists: false", text)
+        self.assertIn("Do not say the version was not found", text)
 
 
 # --- handle_check_multiple_dependencies -------------------------------------

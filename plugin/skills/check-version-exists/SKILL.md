@@ -28,14 +28,19 @@ resolvable repository.
    - `exists: true` — show `stability` and `repository` (which repo answered), and
      `relocatedTo` when present (the artifact was relocated via a Maven
      `<distributionManagement>` POM — tell the user the new coordinates).
-   - `exists: false` — tell the user the version was not found in any resolvable
-     repository. Do not guess a reason; offer `/latest-version` to check what *is*
-     available, or `/search-artifacts` if the artifact name itself may be wrong.
+   - `exists: false` means the version was not in the metadata. Do not guess a
+     cause. Offer `/latest-version` to check what *is* available, or
+     `/search-artifacts` if the artifact name itself may be wrong. Keep those
+     offers on this branch only.
+   - `existenceStatus` unknown means the check did not run (`exists` is omitted).
+     Report the `error` field. Do not say the version was not found, and do not
+     offer another tool as if this check had found it missing.
 
 ## Error handling
 
-Tool error / not found → report as-is, do not invent a version or existence status from
-memory.
+A tools/call `isError` is a tool failure and is reported as-is. Do not invent a
+version or existence status from memory. `existenceStatus` unknown is a successful
+result, not that failure, and not "not found".
 
 ## Constraints and non-goals
 
@@ -46,5 +51,6 @@ memory.
 ## Fallback (MCP unavailable only)
 
 Fetch `maven-metadata.xml` from public repos (Maven Central → Google Maven → Gradle Plugin
-Portal) and check whether `version` is present in the `<versions>` list. Note that this
-skips project-declared private repos and relocation detection.
+Portal) and check whether `version` is present in the `<versions>` list. A failed
+metadata fetch means the check did not run, not that the version was not found.
+Note that this skips project-declared private repos and relocation detection.

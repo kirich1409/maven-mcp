@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.error
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2373,6 +2373,39 @@ def _untried_probe(exc: BaseException) -> bool:
         and "no response and no transport error" in str(exc)
     )
 
+def _metadata_probe_error(
+    ctx: "ResolutionContext",
+    entry: Optional[Dict[str, Any]] = None,
+    status: Optional[int] = None,
+    exc: Optional[BaseException] = None,
+) -> str:
+    """Secret-free last_err shared by ``fetch_metadata`` and ``check_version_in_repos``.
+
+    ``entry is None`` is the zero-repository case. Offline with no mirror and no
+    ``MAVEN_MCP_REPOSITORY_BASE`` is a different sentence from content/group
+    filtering, because those two empty lists are not the same failure. Otherwise
+    ``exc`` wins over ``status``. Never interpolates ``str(exc)``: a userinfo URL
+    makes ``urlopen`` raise ``http.client.InvalidURL`` (not ``URLError``) whose
+    message embeds the password, and ``_strip_userinfo`` cannot redact a fragment
+    that is not itself a URL.
+    """
+    if entry is None:
+        if ctx.offline and not ctx.repository_base and not ctx.mirrors:
+            return (
+                "no queryable repositories (offline/closed mode with no mirror "
+                "or MAVEN_MCP_REPOSITORY_BASE)"
+            )
+        return (
+            "no repository in scope (declared repo(s) excluded by "
+            "content/group filtering)"
+        )
+    if exc is not None:
+        return f"{type(exc).__name__} from {_strip_userinfo(entry['name'])}"
+    if status in (401, 403):
+        return _auth_required_message(entry, status)
+    assert status is not None
+    return f"HTTP {status} from {_strip_userinfo(entry['name'])}"
+
 
 def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") -> Dict[str, Any]:
     """Query every repo in ``ctx`` and MERGE results across those answering 200:
@@ -2393,18 +2426,10 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     # explicit reason instead of leaving this None (which would surface as the
     # confusing "...: None"). Two causes since #320/#294: content/group filtering
     # excluded every declared repo, or offline/closed mode dropped all public
-    # hosts with no mirror / REPOSITORY_BASE replacement.
+    # hosts with no mirror / REPOSITORY_BASE replacement. Wording is shared with
+    # check_version_in_repos via _metadata_probe_error so the two cannot drift.
     if not repos:
-        if ctx.offline and not ctx.repository_base and not ctx.mirrors:
-            last_err = (
-                "no queryable repositories (offline/closed mode with no mirror "
-                "or MAVEN_MCP_REPOSITORY_BASE)"
-            )
-        else:
-            last_err = (
-                "no repository in scope (declared repo(s) excluded by "
-                "content/group filtering)"
-            )
+        last_err = _metadata_probe_error(ctx)
     else:
         last_err = None
     # One clause per queried repo that did not answer 200, in _repos_for order.
@@ -2526,9 +2551,38 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     }
 
 
-def check_version_in_repos(group_id: str, artifact_id: str, version: str, ctx: "ResolutionContext") -> Optional[Dict[str, Any]]:
-    """Returns the matching repo entry (name/url/scope/is_public_fallback) if version exists, else None."""
+class _VersionInRepos(NamedTuple):
+    """Internal outcome of ``check_version_in_repos``. Not a tools/call payload.
+
+    Hit: ``entry`` is the repo that listed the version, ``error`` is None.
+    Definitive miss: both None. Unknown: ``entry`` is None and ``error`` is the
+    secret-free last_err text. A miss and an unknown are not the same None.
+    """
+
+    entry: Optional[Dict[str, Any]]
+    error: Optional[str]
+
+
+def check_version_in_repos(
+    group_id: str, artifact_id: str, version: str, ctx: "ResolutionContext"
+) -> _VersionInRepos:
+    """Probe metadata for ``version`` without collapsing a failed lookup into a miss.
+
+    Hit short-circuits and discards any earlier unverifiable error: any HTTP 200
+    whose metadata lists ``version`` wins, even if a sibling probe failed. A
+    definitive miss is every probe being HTTP 404 or an HTTP 200 that omits the
+    version. Anything else — 401/403, 429, 5xx, any other non-200 non-404, a
+    transport exception, or zero repositories — is unknown and carries
+    ``_metadata_probe_error`` text. An omitting 200 and a 404 do not overwrite
+    that error. A later listing 200 still wins, so an unverifiable probe does
+    not stop the walk. Does not raise, and does not fetch a POM.
+    """
     repos = _repos_for(group_id, artifact_id, ctx)
+    if not repos:
+        return _VersionInRepos(None, _metadata_probe_error(ctx))
+    # Last unverifiable probe in _repos_for order, matching fetch_metadata's
+    # overwrite. Left unset when every probe so far is a definitive negative.
+    last_err: Optional[str] = None
     for entry in repos:
         url = _metadata_url(entry["url"], group_id, artifact_id)
         try:
@@ -2537,10 +2591,19 @@ def check_version_in_repos(group_id: str, artifact_id: str, version: str, ctx: "
                 xml = body.decode("utf-8", errors="replace")
                 versions = re.findall(r"<version>([^<]+)</version>", xml)
                 if version in versions:
-                    return entry
-        except Exception:
-            continue
-    return None
+                    return _VersionInRepos(entry, None)
+                # Omitting 200 is a definitive negative. Do not stop: a later
+                # repo may list the version. Do not clear last_err: a sibling
+                # 401 is not "missing" just because this metadata omitted it.
+                continue
+            if status == 404:
+                continue
+            last_err = _metadata_probe_error(ctx, entry, status)
+        except Exception as e:
+            last_err = _metadata_probe_error(ctx, entry, exc=e)
+    if last_err is not None:
+        return _VersionInRepos(None, last_err)
+    return _VersionInRepos(None, None)
 
 
 def fetch_pom(
@@ -15341,11 +15404,20 @@ def handle_get_latest_version(args: Dict) -> Any:
 
 
 def handle_check_version_exists(args: Dict) -> Any:
+    """Successful tri-state. Never raises, so a degraded lookup is not isError.
+
+    exists true only when some probed metadata lists the version. exists false
+    only when every probe was a definitive miss. Otherwise omit exists and
+    return existenceStatus unknown plus the secret-free error. Relocation and
+    resolvedFrom stay on the hit path — a miss or an unknown did not identify
+    a repository that served the version.
+    """
     group_id = args["groupId"]
     artifact_id = args["artifactId"]
     version = args["version"]
     ctx = build_resolution_context(args)
-    entry = check_version_in_repos(group_id, artifact_id, version, ctx)
+    probed = check_version_in_repos(group_id, artifact_id, version, ctx)
+    entry = probed.entry
     if entry:
         result = {
             "groupId": group_id,
@@ -15364,6 +15436,14 @@ def handle_check_version_exists(args: Dict) -> Any:
         if relocated_to:
             result["relocatedTo"] = relocated_to
         return result
+    if probed.error is not None:
+        return {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+            "version": version,
+            "existenceStatus": "unknown",
+            "error": probed.error,
+        }
     return {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -16937,7 +17017,7 @@ TOOLS = [
     },
     {
         "name": "check_version_exists",
-        "description": "Check if a specific version of a Maven artifact exists in any repository resolved for the project: declared repositories first, then the public Maven Central / Google Maven / Gradle Plugin Portal fallback when the project declares none (see projectPath).",
+        "description": "Check if a specific version of a Maven artifact exists in any repository resolved for the project: declared repositories first, then the public Maven Central / Google Maven / Gradle Plugin Portal fallback when the project declares none (see projectPath). An unverifiable lookup omits exists and returns existenceStatus unknown plus error; exists false means every probed repository was a definitive miss.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -16956,12 +17036,14 @@ TOOLS = [
                 "artifactId": {"type": "string"},
                 "version": {"type": "string"},
                 "exists": {"type": "boolean"},
+                "existenceStatus": {"type": "string", "enum": ["unknown"]},
+                "error": {"type": "string"},
                 "stability": {"type": "string"},
                 "repository": {"type": "string"},
                 "resolvedFrom": _RESOLVED_FROM_SCHEMA,
                 "relocatedTo": _GAV_SCHEMA,
             },
-            "required": ["groupId", "artifactId", "version", "exists"],
+            "required": ["groupId", "artifactId", "version"],
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
