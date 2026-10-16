@@ -6,12 +6,14 @@ No external dependencies; Python 3.9+ standard library only.
 
 import base64
 import concurrent.futures
+import ctypes
 import datetime
 import email.utils
 import functools
 import hashlib
 import http.client
 import http.server
+import io
 import ipaddress
 import json
 import logging
@@ -10924,12 +10926,414 @@ def _gradle_cli_prefix_args() -> List[str]:
     return []
 
 
+def _gradle_windows_job() -> bool:
+    """True when a timeout must stop the wrapper and the JVM it started.
+
+    ``sys.platform``, not ``os.name``. Tests patch ``os.name`` to ``"nt"`` so
+    ``_find_gradle_wrapper`` selects ``gradlew.bat`` on POSIX; those calls must
+    still go through ``_gradle_run``.
+    """
+    return sys.platform == "win32"
+
+
+def _load_kernel32() -> Any:
+    """kernel32 for the Windows job path. Tests replace this.
+
+    Loaded only from that path (``ctypes.WinDLL`` is Windows-only) so importing
+    this module on POSIX stays side-effect-free. ``use_last_error`` keeps a
+    failed ``CreateProcessW`` code available via ``ctypes.get_last_error``.
+    """
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+# Windows job path (#35). CPython's subprocess.run timeout kills only the
+# direct child, then reads the pipes with no remaining timeout. gradlew.bat's
+# direct child is cmd.exe; the Gradle JVM is a grandchild that inherited those
+# pipes, so the read never returns. The wrapper is created suspended, assigned
+# to a new anonymous job, and only then resumed, so the JVM it starts is in
+# the job before it runs. A post-spawn assign can miss that JVM. The job is
+# terminated only when the wait expires — JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+# is never set, so closing the handle after a successful run does not kill a
+# daemon this call started. POSIX keeps subprocess.run; the daemon lock after
+# a POSIX 124 is a separate issue.
+_CREATE_SUSPENDED = 0x00000004
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_CREATE_NO_WINDOW = 0x08000000
+_STARTF_USESHOWWINDOW = 0x00000001
+_STARTF_USESTDHANDLES = 0x00000100
+_SW_HIDE = 0
+_HANDLE_FLAG_INHERIT = 0x00000001
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+_INFINITE = 0xFFFFFFFF
+_ERROR_BAD_EXE_FORMAT = 193
+_STD_INPUT_HANDLE = 0xFFFFFFF6  # DWORD(-10)
+# Independent of the Gradle timeout and of the grandchild's lifetime.
+_GRADLE_TIMEOUT_DRAIN_SECONDS = 3
+
+
+class _StartupInfoW(ctypes.Structure):
+    """Windows x64/x86 STARTUPINFOW. Field types are sized explicitly so a
+    HANDLE is pointer-sized on the platform this bug is about (a 32-bit
+    restype would truncate a 64-bit handle and leave the hang in place)."""
+
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", ctypes.c_uint32),
+        ("dwY", ctypes.c_uint32),
+        ("dwXSize", ctypes.c_uint32),
+        ("dwYSize", ctypes.c_uint32),
+        ("dwXCountChars", ctypes.c_uint32),
+        ("dwYCountChars", ctypes.c_uint32),
+        ("dwFillAttribute", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32),
+        ("wShowWindow", ctypes.c_uint16),
+        ("cbReserved2", ctypes.c_uint16),
+        ("lpReserved2", ctypes.c_void_p),
+        ("hStdInput", ctypes.c_void_p),
+        ("hStdOutput", ctypes.c_void_p),
+        ("hStdError", ctypes.c_void_p),
+    ]
+
+
+class _ProcessInformation(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", ctypes.c_void_p),
+        ("hThread", ctypes.c_void_p),
+        ("dwProcessId", ctypes.c_uint32),
+        ("dwThreadId", ctypes.c_uint32),
+    ]
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int32),
+    ]
+
+
+def _configure_kernel32(kernel32: Any) -> None:
+    """Pin HANDLE restype/argtypes to pointer width before any call."""
+    void = ctypes.c_void_p
+    dword = ctypes.c_uint32
+    bool_ = ctypes.c_int
+    wchar = ctypes.c_wchar_p
+    kernel32.CreateJobObjectW.restype = void
+    kernel32.CreateJobObjectW.argtypes = [void, wchar]
+    kernel32.CreatePipe.restype = bool_
+    kernel32.CreatePipe.argtypes = [
+        ctypes.POINTER(void),
+        ctypes.POINTER(void),
+        ctypes.POINTER(_SecurityAttributes),
+        dword,
+    ]
+    kernel32.SetHandleInformation.restype = bool_
+    kernel32.SetHandleInformation.argtypes = [void, dword, dword]
+    kernel32.GetStdHandle.restype = void
+    kernel32.GetStdHandle.argtypes = [dword]
+    kernel32.CreateProcessW.restype = bool_
+    kernel32.CreateProcessW.argtypes = [
+        wchar, wchar, void, void, bool_, dword, wchar, wchar,
+        ctypes.POINTER(_StartupInfoW), ctypes.POINTER(_ProcessInformation),
+    ]
+    kernel32.AssignProcessToJobObject.restype = bool_
+    kernel32.AssignProcessToJobObject.argtypes = [void, void]
+    kernel32.ResumeThread.restype = dword
+    kernel32.ResumeThread.argtypes = [void]
+    kernel32.WaitForSingleObject.restype = dword
+    kernel32.WaitForSingleObject.argtypes = [void, dword]
+    kernel32.TerminateJobObject.restype = bool_
+    kernel32.TerminateJobObject.argtypes = [void, dword]
+    kernel32.TerminateProcess.restype = bool_
+    kernel32.TerminateProcess.argtypes = [void, dword]
+    kernel32.GetExitCodeProcess.restype = bool_
+    kernel32.GetExitCodeProcess.argtypes = [void, ctypes.POINTER(dword)]
+    kernel32.ReadFile.restype = bool_
+    kernel32.ReadFile.argtypes = [
+        void, ctypes.POINTER(ctypes.c_char), dword, ctypes.POINTER(dword), void,
+    ]
+    kernel32.PeekNamedPipe.restype = bool_
+    kernel32.PeekNamedPipe.argtypes = [
+        void, ctypes.POINTER(ctypes.c_char), dword,
+        ctypes.POINTER(dword), ctypes.POINTER(dword), ctypes.POINTER(dword),
+    ]
+    kernel32.CloseHandle.restype = bool_
+    kernel32.CloseHandle.argtypes = [void]
+
+
+def _kernel32_last_error(kernel32: Any) -> int:
+    """Win32 code from the call just made.
+
+    A real ``WinDLL(..., use_last_error=True)`` stores it on
+    ``ctypes.get_last_error``, which does not exist outside Windows. A test
+    stand-in records the same code on ``last_error``.
+    """
+    getter = getattr(ctypes, "get_last_error", None)
+    if getter is not None:
+        code = int(getter())
+        if code:
+            return code
+    return int(getattr(kernel32, "last_error", 0) or 0)
+
+
+def _windows_oserror(code: int) -> OSError:
+    factory = getattr(ctypes, "WinError", None)
+    if factory is not None and code:
+        err = factory(code)
+        if isinstance(err, OSError):
+            return err
+    if code:
+        return OSError(f"[WinError {code}]")
+    return OSError("Windows API call failed")
+
+
+def _gradle_launch_failure(gradlew: str, exc: BaseException) -> Tuple[int, str, str]:
+    return 1, "", f"Failed to launch Gradle wrapper {gradlew}: {exc}"
+
+
+def _gradle_wait_ms(timeout: int) -> int:
+    """Milliseconds for ``WaitForSingleObject``. Never ``INFINITE``.
+
+    A DWORD wraps modulo 2**32. ``0xFFFFFFFF`` is wait-forever, so a huge
+    ``MAVEN_MCP_GRADLE_TIMEOUT`` must not be passed through and must not be
+    truncated into that value.
+    """
+    if timeout <= 0:
+        return 0
+    ms = timeout * 1000
+    if ms >= _INFINITE:
+        return _INFINITE - 1
+    return int(ms)
+
+
+def _gradle_subprocess_text_encoding() -> str:
+    """Encoding ``subprocess.run(..., text=True)`` uses on this interpreter."""
+    text_encoding = getattr(subprocess, "_text_encoding", None)
+    if text_encoding is not None:
+        return text_encoding()
+    import locale
+    return locale.getpreferredencoding(False)
+
+
+def _decode_gradle_output(data: bytes) -> str:
+    if not data:
+        return ""
+    # newline=None is TextIOWrapper's default: universal newlines, same as
+    # subprocess text mode.
+    with io.TextIOWrapper(io.BytesIO(data), encoding=_gradle_subprocess_text_encoding()) as wrapper:
+        return wrapper.read()
+
+
+def _windows_env_block(env: Dict[str, str]) -> Any:
+    """Unicode environment block (``CREATE_UNICODE_ENVIRONMENT``).
+
+    Sorted the way CreateProcess expects. The buffer is writable and lives as
+    long as the caller holds the return value.
+    """
+    parts = [f"{key}={value}" for key, value in sorted(env.items(), key=lambda kv: kv[0].upper())]
+    return ctypes.create_unicode_buffer("\0".join(parts) + "\0\0")
+
+
+def _gradle_comspec() -> str:
+    return os.environ.get("COMSPEC") or "cmd.exe"
+
+
+def _create_pipe(kernel32: Any, inheritable: Any) -> Tuple[int, int]:
+    read = ctypes.c_void_p()
+    write = ctypes.c_void_p()
+    ok = kernel32.CreatePipe(
+        ctypes.byref(read), ctypes.byref(write), ctypes.byref(inheritable), 0,
+    )
+    if not ok or not read.value or not write.value:
+        raise _windows_oserror(_kernel32_last_error(kernel32))
+    return int(read.value), int(write.value)
+
+
+def _drain_pipe(kernel32: Any, handle: int) -> bytes:
+    """Blocking read until EOF. Success path only — same shape as
+    ``communicate()`` after the client has already exited. A daemon that
+    inherited the pipe can still block here; that is not the timeout hang.
+    """
+    chunks: List[bytes] = []
+    while True:
+        buf = ctypes.create_string_buffer(65536)
+        nread = ctypes.c_uint32()
+        ok = kernel32.ReadFile(handle, buf, len(buf), ctypes.byref(nread), None)
+        if not ok or not nread.value:
+            break
+        chunks.append(buf.raw[:int(nread.value)])
+    return b"".join(chunks)
+
+
+def _drain_pipe_bounded(kernel32: Any, handle: int, seconds: float) -> bytes:
+    """Read what is already buffered, then stop. Never a blocking read and
+    never ``INFINITE``. ``PeekNamedPipe`` fails with ``ERROR_BROKEN_PIPE``
+    once the job kill has closed the write ends.
+    """
+    deadline = time.monotonic() + seconds
+    chunks: List[bytes] = []
+    while True:
+        avail = ctypes.c_uint32()
+        ok = kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+        if not ok:
+            break
+        if avail.value:
+            buf = ctypes.create_string_buffer(min(int(avail.value), 65536))
+            nread = ctypes.c_uint32()
+            got = kernel32.ReadFile(handle, buf, len(buf), ctypes.byref(nread), None)
+            if not got or not nread.value:
+                break
+            chunks.append(buf.raw[:int(nread.value)])
+            continue
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return b"".join(chunks)
+
+
+def _create_suspended_gradle(
+    kernel32: Any,
+    gradlew: str,
+    argv: List[str],
+    project_root: str,
+    env_block: Any,
+    flags: int,
+    startup: Any,
+    process_info: Any,
+) -> None:
+    """Create the wrapper suspended. A ``.bat`` is not a Win32 image
+    (WinError 193); retry via ``%COMSPEC% /c`` and the same quoted argv,
+    still suspended. Failure raises. Never falls back to ``subprocess.run``.
+    """
+    quoted = subprocess.list2cmdline(argv)
+    command = ctypes.create_unicode_buffer(quoted)
+    ok = kernel32.CreateProcessW(
+        gradlew, command, None, None, 1, flags, env_block, project_root,
+        ctypes.byref(startup), ctypes.byref(process_info),
+    )
+    if ok:
+        return
+    err = _kernel32_last_error(kernel32)
+    if err != _ERROR_BAD_EXE_FORMAT:
+        raise _windows_oserror(err)
+    comspec = _gradle_comspec()
+    retry = subprocess.list2cmdline([comspec, "/c"]) + " " + quoted
+    retry_buf = ctypes.create_unicode_buffer(retry)
+    ok = kernel32.CreateProcessW(
+        comspec, retry_buf, None, None, 1, flags, env_block, project_root,
+        ctypes.byref(startup), ctypes.byref(process_info),
+    )
+    if not ok:
+        raise _windows_oserror(_kernel32_last_error(kernel32))
+
+
+def _run_gradle_command_windows(
+    project_root: str,
+    gradlew: str,
+    args: List[str],
+    timeout: int,
+) -> Tuple[int, str, str]:
+    kernel32 = _load_kernel32()
+    _configure_kernel32(kernel32)
+    opened: List[int] = []
+
+    def close_one(handle: int) -> None:
+        try:
+            opened.remove(handle)
+        except ValueError:
+            return
+        kernel32.CloseHandle(handle)
+
+    def close_all() -> None:
+        while opened:
+            kernel32.CloseHandle(opened.pop())
+
+    try:
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise _windows_oserror(_kernel32_last_error(kernel32))
+        opened.append(int(job))
+
+        security = _SecurityAttributes()
+        security.nLength = ctypes.sizeof(security)
+        security.bInheritHandle = 1
+        stdout_r, stdout_w = _create_pipe(kernel32, security)
+        stderr_r, stderr_w = _create_pipe(kernel32, security)
+        opened.extend((stdout_r, stdout_w, stderr_r, stderr_w))
+        # Inherit only the write ends. stdin is the process standard handle,
+        # not a pipe — same as subprocess.run without stdin=.
+        kernel32.SetHandleInformation(stdout_r, _HANDLE_FLAG_INHERIT, 0)
+        kernel32.SetHandleInformation(stderr_r, _HANDLE_FLAG_INHERIT, 0)
+
+        startup = _StartupInfoW()
+        startup.cb = ctypes.sizeof(startup)
+        startup.dwFlags = _STARTF_USESTDHANDLES | _STARTF_USESHOWWINDOW
+        startup.wShowWindow = _SW_HIDE
+        startup.hStdInput = kernel32.GetStdHandle(_STD_INPUT_HANDLE)
+        startup.hStdOutput = stdout_w
+        startup.hStdError = stderr_w
+
+        flags = _CREATE_SUSPENDED | _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW
+        env_block = _windows_env_block(_scrubbed_subprocess_env())
+        process_info = _ProcessInformation()
+        argv = [gradlew] + _gradle_cli_prefix_args() + args
+        _create_suspended_gradle(
+            kernel32, gradlew, argv, project_root, env_block, flags,
+            startup, process_info,
+        )
+        process = int(process_info.hProcess)
+        thread = int(process_info.hThread)
+        opened.extend((process, thread))
+        # The suspended process already holds its inherited copies.
+        close_one(stdout_w)
+        close_one(stderr_w)
+
+        if not kernel32.AssignProcessToJobObject(job, process):
+            # Still suspended: no JVM yet. Do not resume, do not fall back.
+            kernel32.TerminateProcess(process, 1)
+            raise _windows_oserror(_kernel32_last_error(kernel32))
+        if kernel32.ResumeThread(thread) == _INFINITE:
+            kernel32.TerminateProcess(process, 1)
+            raise _windows_oserror(_kernel32_last_error(kernel32))
+        close_one(thread)
+
+        waited = kernel32.WaitForSingleObject(process, _gradle_wait_ms(timeout))
+        if waited == _WAIT_TIMEOUT:
+            kernel32.TerminateJobObject(job, 1)
+            # Discard. The bytes are not the timeout error, and the read must
+            # not wait out the grandchild.
+            _drain_pipe_bounded(kernel32, stdout_r, _GRADLE_TIMEOUT_DRAIN_SECONDS)
+            _drain_pipe_bounded(kernel32, stderr_r, _GRADLE_TIMEOUT_DRAIN_SECONDS)
+            return 124, "", f"Gradle command timed out after {timeout}s"
+        if waited != _WAIT_OBJECT_0:
+            # Wait failed after resume, so a JVM may already be in the job.
+            kernel32.TerminateJobObject(job, 1)
+            raise OSError(f"WaitForSingleObject failed ({waited})")
+
+        code = ctypes.c_uint32()
+        if not kernel32.GetExitCodeProcess(process, ctypes.byref(code)):
+            raise _windows_oserror(_kernel32_last_error(kernel32))
+        stdout = _decode_gradle_output(_drain_pipe(kernel32, stdout_r))
+        stderr = _decode_gradle_output(_drain_pipe(kernel32, stderr_r))
+        return int(code.value), stdout or "", stderr or ""
+    except OSError as exc:
+        return _gradle_launch_failure(gradlew, exc)
+    finally:
+        close_all()
+
+
 def _run_gradle_command(
     project_root: str,
     gradlew: str,
     args: List[str],
     timeout: int = GRADLE_RESOLVE_TIMEOUT,
 ) -> Tuple[int, str, str]:
+    if _gradle_windows_job():
+        return _run_gradle_command_windows(project_root, gradlew, args, timeout)
     try:
         result = _gradle_run(
             [gradlew] + _gradle_cli_prefix_args() + args,

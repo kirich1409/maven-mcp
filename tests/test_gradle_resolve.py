@@ -11,8 +11,11 @@ generator, the single-invocation output parser, and the end-to-end
 
 import os
 import subprocess
+import sys
+import threading
 import unittest
 import unittest.mock
+from contextlib import ExitStack
 
 from _helpers import (
     mock_gradle_resolve,
@@ -225,6 +228,513 @@ class TestFindGradleWrapper(unittest.TestCase):
             self.assertEqual(os.path.basename(chosen), "gradlew")
 
 
+# Grandchild lifetime. Longer than the join deadline below, so a read that
+# waits for this process cannot pass as "returned within a few seconds".
+_GRANDCHILD_HOLD_SECONDS = 30
+_WINDOWS_JOB_JOIN_SECONDS = 8
+_CREATE_SUSPENDED = 0x00000004
+
+
+class _KernelCall:
+    """Callable with the restype/argtypes attributes ``WinDLL`` functions have."""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _JobModel:
+    def __init__(self):
+        self.members = []
+        self.closed = False
+
+
+class _PipeModel:
+    def __init__(self):
+        self.parent_write_open = True
+        self.held_by_child = False
+        self.dups = []
+
+    def writer_open(self):
+        return self.parent_write_open or self.held_by_child or bool(self.dups)
+
+
+class _HandleRec:
+    def __init__(self, kind, fd=None, pipe=None):
+        self.kind = kind
+        self.fd = fd
+        self.pipe = pipe
+        self.closed = False
+        self.inheritable = True
+
+
+class _ProcModel:
+    def __init__(self):
+        self.job = None
+        self.resumed = False
+        self.started_outside = False
+        self.in_job_before_resume = False
+        self.stdout_dup = None
+        self.stderr_dup = None
+        self.stdout_pipe = None
+        self.stderr_pipe = None
+        self.direct = None
+        self.grandchild = None
+        self.exited = False
+        self.exit_code = None
+        self.exit_event = threading.Event()
+
+
+class WindowsGradleJobStandIn:
+    """kernel32 stand-in for the grandchild-holds-the-pipe hang.
+
+    ``TerminateJobObject`` kills the grandchild only when the wrapper was
+    assigned to the job before ``ResumeThread``. ``TerminateProcess`` kills
+    only the direct child and leaves the grandchild's pipe ends open.
+    ``bad_gradle_run`` is the current Windows ``subprocess.run`` cleanup:
+    kill the direct child, then read with no timeout.
+    """
+
+    def __init__(self, quick_exit=None, fail_bat=False):
+        self.quick_exit = quick_exit
+        self.fail_bat = fail_bat
+        self.last_error = 0
+        self.grandchild = None
+        self.direct = None
+        self.env = None
+        self.command_lines = []
+        self.application_names = []
+        self.creation_flags = []
+        self.wait_ms = None
+        self.terminate_job_called = False
+        self.kill_on_job_close = False
+        self.assigned_before_resume = False
+        self.direct_only_killed = False
+        self.job_killed_grandchild = False
+        self.unbounded_after_direct_kill = False
+        self.gradle_run_called = False
+        self.child_holds_stdout = False
+        self.child_holds_stderr = False
+        self._next = 1
+        self._create_count = 0
+        self._fds = []
+        self._children = []
+        self.handles = {}
+        self.procs = {}
+        self.threads = {}
+        self.jobs = {}
+        for name in (
+            "CreateJobObjectW",
+            "CreatePipe",
+            "SetHandleInformation",
+            "GetStdHandle",
+            "CreateProcessW",
+            "AssignProcessToJobObject",
+            "ResumeThread",
+            "WaitForSingleObject",
+            "TerminateJobObject",
+            "TerminateProcess",
+            "GetExitCodeProcess",
+            "ReadFile",
+            "PeekNamedPipe",
+            "CloseHandle",
+            "SetInformationJobObject",
+        ):
+            setattr(self, name, _KernelCall(getattr(self, "_" + name)))
+
+    def _as_int(self, handle):
+        if handle is None:
+            return 0
+        value = getattr(handle, "value", handle)
+        if value is None:
+            return 0
+        return int(value)
+
+    def _alloc(self, kind, fd=None, pipe=None):
+        hid = self._next
+        self._next += 1
+        self.handles[hid] = _HandleRec(kind, fd=fd, pipe=pipe)
+        return hid
+
+    def _track_fd(self, fd):
+        self._fds.append(fd)
+        return fd
+
+    def _cmdline(self, buf):
+        if isinstance(buf, str):
+            return buf
+        return buf.value
+
+    def _parse_env(self, buf):
+        if buf is None:
+            return {}
+        if isinstance(buf, dict):
+            return dict(buf)
+        chars = [buf[i] for i in range(len(buf))]
+        env = {}
+        for part in "".join(chars).split("\0"):
+            if not part or "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            env[key] = value
+        return env
+
+    def _close_dup(self, proc, which):
+        dup = proc.stdout_dup if which == "stdout" else proc.stderr_dup
+        pipe = proc.stdout_pipe if which == "stdout" else proc.stderr_pipe
+        if dup is None:
+            return
+        try:
+            os.close(dup)
+        except OSError:
+            pass
+        if pipe is not None and dup in pipe.dups:
+            pipe.dups.remove(dup)
+        if which == "stdout":
+            proc.stdout_dup = None
+        else:
+            proc.stderr_dup = None
+
+    def _inherit_write(self, handle):
+        rec = self.handles.get(self._as_int(handle))
+        if rec is None or rec.fd is None or rec.pipe is None or rec.kind != "write":
+            return None, None
+        if not rec.inheritable:
+            return None, None
+        dup = self._track_fd(os.dup(rec.fd))
+        rec.pipe.dups.append(dup)
+        return rec.pipe, dup
+
+    def _spawn_sleeper(self, stdout, stderr):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(%d)" % _GRANDCHILD_HOLD_SECONDS],
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+        )
+        self._children.append(child)
+        return child
+
+    def _start(self, proc):
+        if self.quick_exit is not None:
+            out, err = self.quick_exit
+            if proc.stdout_dup is not None:
+                if out:
+                    os.write(proc.stdout_dup, out)
+                self._close_dup(proc, "stdout")
+            if proc.stderr_dup is not None:
+                if err:
+                    os.write(proc.stderr_dup, err)
+                self._close_dup(proc, "stderr")
+            proc.exit_code = 0
+            proc.exited = True
+            proc.exit_event.set()
+            return
+        grandchild = self._spawn_sleeper(
+            proc.stdout_dup if proc.stdout_dup is not None else subprocess.DEVNULL,
+            proc.stderr_dup if proc.stderr_dup is not None else subprocess.DEVNULL,
+        )
+        direct = self._spawn_sleeper(subprocess.DEVNULL, subprocess.DEVNULL)
+        proc.grandchild = grandchild
+        proc.direct = direct
+        self.grandchild = grandchild
+        self.direct = direct
+        if proc.stdout_pipe is not None and proc.stdout_dup is not None:
+            proc.stdout_pipe.held_by_child = True
+            self.child_holds_stdout = True
+        if proc.stderr_pipe is not None and proc.stderr_dup is not None:
+            proc.stderr_pipe.held_by_child = True
+            self.child_holds_stderr = True
+        # Our copies must not keep the write ends open after the grandchild
+        # has inherited them. TerminateProcess on the direct child does not
+        # close the grandchild's copies.
+        self._close_dup(proc, "stdout")
+        self._close_dup(proc, "stderr")
+
+    def _kill_tree(self, proc):
+        for child in (proc.direct, proc.grandchild):
+            if child is not None and child.poll() is None:
+                child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        if proc.stdout_pipe is not None:
+            proc.stdout_pipe.held_by_child = False
+        if proc.stderr_pipe is not None:
+            proc.stderr_pipe.held_by_child = False
+        self._close_dup(proc, "stdout")
+        self._close_dup(proc, "stderr")
+        proc.exited = True
+        proc.exit_code = 1
+        proc.exit_event.set()
+
+    def _grandchild_alive(self):
+        child = self.grandchild
+        return child is not None and child.poll() is None
+
+    def _note_unbounded(self):
+        if self.direct_only_killed and not self.job_killed_grandchild and self._grandchild_alive():
+            self.unbounded_after_direct_kill = True
+
+    def bad_gradle_run(self, args, cwd=None, capture_output=None, text=None, timeout=None, env=None, **_kwargs):
+        """Current Windows cleanup: kill only the direct child, then read until EOF."""
+        self.gradle_run_called = True
+        read_out, write_out = os.pipe()
+        read_err, write_err = os.pipe()
+        self._track_fd(read_out)
+        self._track_fd(write_out)
+        self._track_fd(read_err)
+        self._track_fd(write_err)
+        grandchild = self._spawn_sleeper(write_out, write_err)
+        direct = self._spawn_sleeper(subprocess.DEVNULL, subprocess.DEVNULL)
+        os.close(write_out)
+        os.close(write_err)
+        self.grandchild = grandchild
+        self.direct = direct
+        self.child_holds_stdout = True
+        self.child_holds_stderr = True
+        if direct.poll() is None:
+            direct.kill()
+            direct.wait(timeout=2)
+        self.direct_only_killed = True
+        self.unbounded_after_direct_kill = True
+        os.read(read_out, 1)
+        return subprocess.CompletedProcess(args, 124, "", "")
+
+    def stop(self):
+        for child in list(self._children):
+            if child.poll() is None:
+                child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        for proc in self.procs.values():
+            if proc.stdout_pipe is not None:
+                proc.stdout_pipe.held_by_child = False
+            if proc.stderr_pipe is not None:
+                proc.stderr_pipe.held_by_child = False
+
+    def close_fds(self):
+        for fd in list(self._fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+
+    def _CreateJobObjectW(self, _attrs, name):
+        if name not in (None, ""):
+            self.named_job = True
+        job = self._alloc("job")
+        self.jobs[job] = _JobModel()
+        return job
+
+    def _CreatePipe(self, h_read, h_write, _sa, _n_size):
+        read_fd, write_fd = os.pipe()
+        self._track_fd(read_fd)
+        self._track_fd(write_fd)
+        pipe = _PipeModel()
+        h_read._obj.value = self._alloc("read", fd=read_fd, pipe=pipe)
+        h_write._obj.value = self._alloc("write", fd=write_fd, pipe=pipe)
+        return 1
+
+    def _SetHandleInformation(self, handle, mask, flags):
+        rec = self.handles.get(self._as_int(handle))
+        if rec is not None and int(mask) & 1:
+            rec.inheritable = bool(int(flags) & 1)
+        return 1
+
+    def _GetStdHandle(self, _which):
+        return self._alloc("stdin")
+
+    def _CreateProcessW(self, app, cmdline, _pa, _ta, _inherit, flags, env, cwd, startup, process_info):
+        self._create_count += 1
+        self.application_names.append(app)
+        self.command_lines.append(self._cmdline(cmdline))
+        self.creation_flags.append(int(flags))
+        self.env = self._parse_env(env)
+        self.cwd = cwd
+        if self.fail_bat and self._create_count == 1:
+            self.last_error = 193
+            return 0
+        si = startup._obj
+        proc = _ProcModel()
+        suspended = bool(int(flags) & _CREATE_SUSPENDED)
+        proc.stdout_pipe, proc.stdout_dup = self._inherit_write(si.hStdOutput)
+        proc.stderr_pipe, proc.stderr_dup = self._inherit_write(si.hStdError)
+        process = self._alloc("process")
+        thread = self._alloc("thread")
+        self.procs[process] = proc
+        self.threads[thread] = proc
+        info = process_info._obj
+        info.hProcess = process
+        info.hThread = thread
+        info.dwProcessId = process
+        info.dwThreadId = thread
+        if not suspended:
+            # Primary thread already ran. A later assign cannot catch the JVM.
+            proc.started_outside = True
+            proc.resumed = True
+            self._start(proc)
+        return 1
+
+    def _AssignProcessToJobObject(self, job, process):
+        proc = self.procs.get(self._as_int(process))
+        job_rec = self.jobs.get(self._as_int(job))
+        if proc is None or job_rec is None:
+            self.last_error = 6
+            return 0
+        proc.job = job_rec
+        job_rec.members.append(proc)
+        return 1
+
+    def _ResumeThread(self, thread):
+        proc = self.threads.get(self._as_int(thread))
+        if proc is None:
+            self.last_error = 6
+            return 0xFFFFFFFF
+        if not proc.resumed:
+            proc.resumed = True
+            proc.in_job_before_resume = proc.job is not None and not proc.started_outside
+            if proc.in_job_before_resume:
+                self.assigned_before_resume = True
+            self._start(proc)
+        return 1
+
+    def _WaitForSingleObject(self, handle, ms):
+        self.wait_ms = int(ms)
+        proc = self.procs.get(self._as_int(handle))
+        if proc is None:
+            self.last_error = 6
+            return 0xFFFFFFFF
+        if proc.exited:
+            return 0
+        if int(ms) == 0xFFFFFFFF or int(ms) > 0xFFFFFFFE:
+            self._note_unbounded()
+            proc.exit_event.wait(_GRANDCHILD_HOLD_SECONDS)
+            return 0 if proc.exited else 0x102
+        if ms:
+            proc.exit_event.wait(int(ms) / 1000.0)
+        return 0 if proc.exited else 0x102
+
+    def _TerminateJobObject(self, job, _code):
+        self.terminate_job_called = True
+        job_rec = self.jobs.get(self._as_int(job))
+        if job_rec is None:
+            self.last_error = 6
+            return 0
+        for proc in list(job_rec.members):
+            if not proc.in_job_before_resume:
+                continue
+            self._kill_tree(proc)
+            self.job_killed_grandchild = True
+        return 1
+
+    def _TerminateProcess(self, process, code):
+        proc = self.procs.get(self._as_int(process))
+        if proc is None:
+            self.last_error = 6
+            return 0
+        self.direct_only_killed = True
+        if proc.direct is not None and proc.direct.poll() is None:
+            proc.direct.kill()
+            try:
+                proc.direct.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        if not proc.resumed:
+            self._close_dup(proc, "stdout")
+            self._close_dup(proc, "stderr")
+        proc.exited = True
+        proc.exit_code = int(code)
+        proc.exit_event.set()
+        return 1
+
+    def _GetExitCodeProcess(self, process, code_ptr):
+        proc = self.procs.get(self._as_int(process))
+        if proc is None:
+            self.last_error = 6
+            return 0
+        code_ptr._obj.value = 259 if not proc.exited else int(proc.exit_code or 0)
+        return 1
+
+    def _ReadFile(self, handle, buf, size, nread, _overlapped):
+        rec = self.handles.get(self._as_int(handle))
+        if rec is None or rec.fd is None:
+            self.last_error = 6
+            return 0
+        self._note_unbounded()
+        try:
+            data = os.read(rec.fd, int(size) or 1)
+        except OSError:
+            data = b""
+        if data and buf is not None:
+            buf[:len(data)] = data
+        if nread is not None:
+            nread._obj.value = len(data)
+        return 1
+
+    def _PeekNamedPipe(self, handle, _buf, _size, _nread, avail, _left):
+        rec = self.handles.get(self._as_int(handle))
+        if rec is None or rec.pipe is None:
+            self.last_error = 6
+            return 0
+        if not rec.pipe.writer_open():
+            self.last_error = 109
+            return 0
+        if avail is not None:
+            avail._obj.value = 0
+        return 1
+
+    def _CloseHandle(self, handle):
+        key = self._as_int(handle)
+        if key in self.jobs:
+            self.jobs[key].closed = True
+            return 1
+        rec = self.handles.get(key)
+        if rec is None or rec.closed:
+            return 0
+        rec.closed = True
+        if rec.kind == "write" and rec.pipe is not None:
+            rec.pipe.parent_write_open = False
+        if rec.fd is not None:
+            try:
+                os.close(rec.fd)
+            except OSError:
+                pass
+            rec.fd = None
+        return 1
+
+    def _SetInformationJobObject(self, _job, _info_class, info, _length):
+        flags = getattr(info, "LimitFlags", None)
+        if flags is None and hasattr(info, "_obj"):
+            flags = getattr(info._obj, "LimitFlags", None)
+        if flags is not None and int(flags) & 0x2000:
+            self.kill_on_job_close = True
+        return 1
+
+
+def _windows_job_context(standin):
+    stack = ExitStack()
+    stack.enter_context(unittest.mock.patch.object(
+        server, "_gradle_windows_job", return_value=True,
+    ))
+    stack.enter_context(unittest.mock.patch.object(
+        server, "_load_kernel32", return_value=standin,
+    ))
+    stack.enter_context(unittest.mock.patch.object(
+        server, "_gradle_run", side_effect=standin.bad_gradle_run,
+    ))
+    return stack
+
+
 class TestRunGradleCommand(unittest.TestCase):
     def test_oserror_names_wrapper_and_is_not_success(self):
         def _raise(*_args, **_kwargs):
@@ -390,6 +900,128 @@ class TestRunGradleCommand(unittest.TestCase):
         self.assertNotIn("supersecret", stdout)
         self.assertNotIn("ghsecret", stdout)
         self.assertIn("TOKEN=[][]", stdout)
+
+    def test_windows_timeout_stops_jvm_holding_pipes(self):
+        # Models the Windows hang: the JVM is a grandchild that holds both
+        # pipe write ends for 30s unless the job it was assigned to before
+        # ResumeThread is terminated. _gradle_run is armed as the current
+        # cleanup (kill only the direct child, then read with no timeout).
+        # A skipUnless(win32) test would pass on the buggy tree; CI is Ubuntu.
+        standin = WindowsGradleJobStandIn(fail_bat=True)
+        box = {}
+
+        def _call():
+            try:
+                box["result"] = server._run_gradle_command(
+                    "C:\\proj",
+                    os.path.join("C:\\proj", "gradlew.bat"),
+                    ["--init-script", "x"],
+                    timeout=1,
+                )
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=_call, daemon=True)
+        try:
+            with _windows_job_context(standin):
+                thread.start()
+                thread.join(_WINDOWS_JOB_JOIN_SECONDS)
+                self.assertFalse(
+                    thread.is_alive(),
+                    "call did not return within 8s while the grandchild held the pipes",
+                )
+                if "error" in box:
+                    raise box["error"]
+                self.assertEqual(
+                    box["result"],
+                    (124, "", "Gradle command timed out after 1s"),
+                )
+                self.assertIsNotNone(standin.grandchild)
+                self.assertIsNotNone(standin.grandchild.poll())
+                self.assertFalse(standin.unbounded_after_direct_kill)
+                self.assertFalse(standin.gradle_run_called)
+                self.assertTrue(standin.assigned_before_resume)
+                self.assertTrue(standin.terminate_job_called)
+                self.assertFalse(standin.kill_on_job_close)
+                self.assertTrue(standin.child_holds_stdout)
+                self.assertTrue(standin.child_holds_stderr)
+                self.assertGreaterEqual(len(standin.command_lines), 2)
+                self.assertIn("/c", standin.command_lines[-1])
+                self.assertIn("gradlew.bat", standin.command_lines[-1])
+        finally:
+            standin.stop()
+            if thread.ident is not None:
+                thread.join(2)
+            standin.close_fds()
+
+    def test_windows_job_success_does_not_kill_on_close(self):
+        standin = WindowsGradleJobStandIn(quick_exit=(b"ok\n", b""))
+        box = {}
+
+        def _call():
+            try:
+                box["result"] = server._run_gradle_command(
+                    "/proj", "gradlew.bat", ["--version"], timeout=30,
+                )
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=_call, daemon=True)
+        try:
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"JAVA_HOME": "/usr/lib/jvm/test", "GITHUB_TOKEN": "ghsecret"},
+                clear=False,
+            ):
+                with _windows_job_context(standin):
+                    thread.start()
+                    thread.join(_WINDOWS_JOB_JOIN_SECONDS)
+                    self.assertFalse(thread.is_alive(), "success path did not return")
+                    if "error" in box:
+                        raise box["error"]
+                    self.assertEqual(box["result"], (0, "ok\n", ""))
+                    self.assertFalse(standin.terminate_job_called)
+                    self.assertFalse(standin.kill_on_job_close)
+                    self.assertFalse(standin.gradle_run_called)
+                    self.assertEqual(standin.env.get("JAVA_HOME"), "/usr/lib/jvm/test")
+                    self.assertNotIn("GITHUB_TOKEN", standin.env)
+                    self.assertIn("--version", standin.command_lines[-1])
+                    self.assertIn("gradlew.bat", standin.command_lines[-1])
+        finally:
+            standin.stop()
+            if thread.ident is not None:
+                thread.join(2)
+            standin.close_fds()
+
+    def test_windows_wait_does_not_pass_infinite(self):
+        standin = WindowsGradleJobStandIn(quick_exit=(b"ok\n", b""))
+        box = {}
+
+        def _call():
+            try:
+                box["result"] = server._run_gradle_command(
+                    "/proj", "gradlew.bat", ["--version"], timeout=10 ** 7,
+                )
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=_call, daemon=True)
+        try:
+            with _windows_job_context(standin):
+                thread.start()
+                thread.join(_WINDOWS_JOB_JOIN_SECONDS)
+                self.assertFalse(thread.is_alive(), "huge timeout was treated as infinite")
+                if "error" in box:
+                    raise box["error"]
+                self.assertEqual(box["result"][0], 0)
+                self.assertNotEqual(standin.wait_ms, 0xFFFFFFFF)
+                self.assertLess(standin.wait_ms, 0xFFFFFFFF)
+                self.assertEqual(standin.wait_ms, 0xFFFFFFFE)
+        finally:
+            standin.stop()
+            if thread.ident is not None:
+                thread.join(2)
+            standin.close_fds()
 
 
 class TestMergeGradleWithProvenance(unittest.TestCase):
