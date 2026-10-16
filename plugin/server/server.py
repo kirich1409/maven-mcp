@@ -3047,7 +3047,7 @@ def _read_aar_members(
     if cd_size == 0:
         return {_AAR_METADATA_NAME: None, _AAR_MANIFEST_NAME: None}
     cd_rel = cd_offset - start
-    if 0 <= cd_rel and cd_rel + cd_size <= len(body):
+    if cd_rel >= 0 and cd_rel + cd_size <= len(body):
         cd = body[cd_rel:cd_rel + cd_size]
     else:
         cd_bytes = _read_absolute_range(entry, url, cd_offset, cd_size)
