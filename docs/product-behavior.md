@@ -93,14 +93,15 @@ Lines:
 - A platform qualifier such as `-jre` or `-android` is its own line.
 - A datestamp version, such as `20030203.000550`, is not an advised candidate when a normal release exists. It remains available under `published`.
 - Stability classes, from least to most stable, are `snapshot`, `alpha`, `beta`, `milestone`, `rc`, `stable`.
-- Any other qualifier is its own line. `-jre` and `-android` are different lines. `-jre8` and `-jre11` are different lines too.
+- Prerelease qualifiers (`snapshot`, `alpha`, `beta`, `milestone`, `rc`), with or without a number such as `alpha05`, do not form their own line. They belong to the release line of their numeric core, so `1.5.0-alpha05`, `1.5.0-rc01` and `1.5.0` are all on the same line. Different numeric cores, such as `1.5.0-alpha05` and `1.6.0-alpha01`, are different lines.
+- Any other unrecognised qualifier is its own line. `-jre` and `-android` are different lines. `-jre8` and `-jre11` are different lines too.
 
 When the current version is already on a line, that line is selected.
 
 - `version` is the newest version on that same line, under the order below.
 - The stable completion of the current minor wins over a prerelease of the next minor, as in choice 1. The next minor's prerelease stays a `next-minor-prerelease` sibling.
 - Versions on other lines are siblings. They do not replace `version`, and the agent does not ask.
-- When that line has no newer stable version and more than one newer prerelease, there is no `version` until the user chooses, as in choice 3. The choice is among prereleases of that line.
+- When that line has no newer stable version and more than one newer prerelease, there is no `version` until the user chooses, as in choice 3. The candidates are the newer prerelease on that line and the next minor's prerelease.
 
 ## Order
 
