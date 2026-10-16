@@ -15427,14 +15427,15 @@ def handle_compare_dependency_versions(args: Dict) -> Any:
                 "resolvedFrom": resolved_from,
             }
         except Exception as e:
+            # A lookup that did not produce a version is not "no upgrade".
+            # Omit upgradeType/upgradeAvailable; keep error as str(e) so
+            # "No matching version found" stays distinct from fetch failures.
             error_entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "currentVersion": dep.get("currentVersion", ""),
                 "latestVersion": "",
                 "latestStability": "",
-                "upgradeType": "none",
-                "upgradeAvailable": False,
                 "error": str(e),
             }
             if resolved_from is not None:
@@ -16105,7 +16106,14 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
                     metadata = metadata_cache.setdefault(ga_key, fetched)
             resolved_from = metadata.get("resolvedFrom")
             latest = find_latest_version_for_current(metadata["versions"], current_version)
-            upgrade_type = get_upgrade_type(current_version, latest) if latest else "none"
+            # Metadata answered but nothing acceptable is at least as new as
+            # current. Same error-entry shape as a fetch failure — not a
+            # success row with upgradeType "none" and latestVersion null.
+            if not latest:
+                return _audit_error_entry(
+                    dep, current_version, "No matching version found", resolved_from,
+                )
+            upgrade_type = get_upgrade_type(current_version, latest)
             entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
@@ -17036,7 +17044,7 @@ TOOLS = [
                         },
                         "required": [
                             "groupId", "artifactId", "currentVersion", "latestVersion",
-                            "latestStability", "upgradeType", "upgradeAvailable",
+                            "latestStability",
                         ],
                     },
                 },

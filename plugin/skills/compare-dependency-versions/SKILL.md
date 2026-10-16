@@ -26,7 +26,7 @@ classify the upgrade as `major` / `minor` / `patch` / `none`.
    `upgradeAvailable`. Use the `summary` block (`total`, `upgradeable`, `major`, `minor`,
    `patch`) for a one-line rollup when comparing more than a couple of dependencies.
 
-**No upgrade available for any entry:** say so plainly; do not propose edits.
+**A row with `error`, or without `upgradeType`, was not compared.** Show the coordinate and the error. Do not call it "no upgrade", even when `summary.upgradeable` is 0. `summary.upgradeable` 0 is not enough. Say no upgrade only when every row has `upgradeType` `none`, `latestVersion` equal to `currentVersion`, and no `error`. Do not propose edits in that case.
 
 ## Constraints and non-goals
 
