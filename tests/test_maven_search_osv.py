@@ -260,7 +260,7 @@ class TestFetchMetadata(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# check_version_in_repos (server.py:170)
+# check_version_in_repos
 # ---------------------------------------------------------------------------
 class TestCheckVersionInRepos(unittest.TestCase):
     def test_returns_repo_name_when_version_present(self):
@@ -269,15 +269,17 @@ class TestCheckVersionInRepos(unittest.TestCase):
             side_effect=mock_urlopen([(200, _metadata_xml(["1.0.0", "2.0.0"]))]),
         ):
             result = server.check_version_in_repos("io.ktor", "ktor-core", "2.0.0", empty_ctx())
-        self.assertEqual(result["name"], "Maven Central")
+        self.assertEqual(result.entry["name"], "Maven Central")
+        self.assertIsNone(result.error)
 
-    def test_returns_none_when_version_absent(self):
+    def test_omitting_200_is_definitive_miss(self):
         with unittest.mock.patch(
             "urllib.request.urlopen",
             side_effect=mock_urlopen([(200, _metadata_xml(["1.0.0"]))]),
         ):
             result = server.check_version_in_repos("io.ktor", "ktor-core", "9.9.9", empty_ctx())
-        self.assertIsNone(result)
+        self.assertIsNone(result.entry)
+        self.assertIsNone(result.error)
 
     def test_checks_google_then_central_when_only_central_has_version(self):
         # Unlike fetch_metadata, this iterates ALL repos until the version is
@@ -290,8 +292,58 @@ class TestCheckVersionInRepos(unittest.TestCase):
             "urllib.request.urlopen", side_effect=mock_urlopen(responses)
         ) as m:
             result = server.check_version_in_repos("androidx.core", "core-ktx", "2.0.0", empty_ctx())
-        self.assertEqual(result["name"], "Maven Central")
+        self.assertEqual(result.entry["name"], "Maven Central")
+        self.assertIsNone(result.error)
         self.assertEqual(m.call_count, 2)
+
+    def test_http_500_is_unknown_not_a_miss(self):
+        errs = [http_error("u", 500, "boom") for _ in range(server.HTTP_MAX_ATTEMPTS)]
+        with unittest.mock.patch.object(server, "_sleep"), \
+                unittest.mock.patch(
+                    "urllib.request.urlopen", side_effect=mock_urlopen(errs)
+                ) as m:
+            result = server.check_version_in_repos("io.ktor", "ktor-core", "2.0.0", empty_ctx())
+        self.assertEqual(m.call_count, server.HTTP_MAX_ATTEMPTS)
+        self.assertIsNone(result.entry)
+        self.assertIn("HTTP 500", result.error)
+        self.assertIn("Maven Central", result.error)
+
+    def test_http_401_is_unknown_not_a_miss(self):
+        with unittest.mock.patch(
+            "urllib.request.urlopen",
+            side_effect=mock_urlopen([http_error("u", 401, "no")]),
+        ) as m:
+            result = server.check_version_in_repos("io.ktor", "ktor-core", "2.0.0", empty_ctx())
+        self.assertEqual(m.call_count, 1)
+        self.assertIsNone(result.entry)
+        self.assertIn("auth required", result.error)
+        self.assertIn("HTTP 401", result.error)
+
+    def test_urlerror_is_unknown_and_drops_exception_text(self):
+        token = "password-fragment-must-not-appear"
+        errs = [urllib.error.URLError(token) for _ in range(server.HTTP_MAX_ATTEMPTS)]
+        with unittest.mock.patch.object(server, "_sleep"), \
+                unittest.mock.patch(
+                    "urllib.request.urlopen", side_effect=mock_urlopen(errs)
+                ):
+            result = server.check_version_in_repos("io.ktor", "ktor-core", "2.0.0", empty_ctx())
+        self.assertIsNone(result.entry)
+        self.assertIn("URLError", result.error)
+        self.assertIn("Maven Central", result.error)
+        self.assertNotIn(token, result.error)
+
+    def test_offline_empty_repos_is_unknown_without_urlopen(self):
+        ctx = server.ResolutionContext(
+            "/__no_project__",
+            {"dependency": [], "plugin": []},
+            False,
+            offline=True,
+        )
+        with unittest.mock.patch("urllib.request.urlopen") as m:
+            result = server.check_version_in_repos("io.ktor", "ktor-core", "2.0.0", ctx)
+        m.assert_not_called()
+        self.assertIsNone(result.entry)
+        self.assertIn("no queryable repositories", result.error)
 
 
 # ---------------------------------------------------------------------------

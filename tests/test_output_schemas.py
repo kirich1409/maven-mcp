@@ -556,12 +556,34 @@ class StructuredContentRoundTripTest(unittest.TestCase):
                 validate_against_schema(result["structuredContent"], tool["outputSchema"])
 
     def test_check_version_exists_false_branch_validates_too(self):
-        # The minimal "not found" shape (most fields simply absent, not null)
-        # must ALSO satisfy the schema -- required only lists the 4 fields
-        # that are unconditionally present on every branch.
+        # A definitive miss carries exists and omits existenceStatus/error.
+        # required is only the fields present on every branch, so this fixture
+        # is not forced to carry unknown.
         fixture = {"groupId": "com.example", "artifactId": "nope", "version": "9.9.9", "exists": False}
         tool = next(t for t in server.TOOLS if t["name"] == "check_version_exists")
-        validate_against_schema(fixture, tool["outputSchema"])
+        schema = tool["outputSchema"]
+        self.assertNotIn("exists", schema["required"])
+        self.assertNotIn("existenceStatus", schema["required"])
+        self.assertNotIn("error", schema["required"])
+        validate_against_schema(fixture, schema)
+
+    def test_check_version_exists_unknown_branch_validates_without_exists(self):
+        # Not run through _assert_schema_properties_subset: that helper demands
+        # every schema property on one object, and existenceStatus is only on
+        # the unknown branch.
+        fixture = {
+            "groupId": "com.example",
+            "artifactId": "lib",
+            "version": "1.2.3",
+            "existenceStatus": "unknown",
+            "error": "HTTP 500 from Maven Central",
+        }
+        tool = next(t for t in server.TOOLS if t["name"] == "check_version_exists")
+        schema = tool["outputSchema"]
+        self.assertEqual(schema["properties"]["existenceStatus"]["enum"], ["unknown"])
+        self.assertNotIn("additionalProperties", schema)
+        validate_against_schema(fixture, schema)
+        self.assertIn("existenceStatus unknown plus error", tool["description"])
 
 
 def _metadata_xml(versions):
