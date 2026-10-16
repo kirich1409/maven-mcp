@@ -144,6 +144,282 @@ class CatalogGenerateTest(unittest.TestCase):
         self.assertEqual(result["alias"], "ktor-client-core")
         self.assertEqual(result["entry"]["updateKind"], "inline_or_line_replace")
 
+    def _generate(self, catalog, kind, coordinate, version):
+        coord = dict(coordinate)
+        coord["version"] = version
+        return server.handle_catalog_entry({
+            "mode": "generate",
+            "kind": kind,
+            "catalogToml": catalog,
+            "coordinate": coord,
+        })
+
+    def _non_comment_declaration(self, snippet):
+        return "\n".join(
+            line for line in snippet.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    def _assert_literal_replace(
+        self,
+        catalog,
+        kind,
+        coordinate,
+        version,
+        section,
+        alias,
+        original,
+        declaration,
+        unchanged=None,
+    ):
+        result = self._generate(catalog, kind, coordinate, version)
+        expected = (
+            f"# Update version on existing [{section}] alias {alias!r}\n"
+            f"{declaration}\n"
+        )
+        self.assertEqual(result["suggestedDiff"].strip(), expected.strip())
+        self.assertEqual(result["suggestedDiff"], expected)
+        self.assertEqual(result["entry"]["updateKind"], "inline_or_line_replace")
+        self.assertIsNone(result["entry"]["versionRef"])
+        self.assertIsNone(result["entry"]["versionLine"])
+        self.assertEqual(result["entry"]["tomlLine"], declaration)
+        self.assertEqual(result["entry"]["tomlSnippet"], result["suggestedDiff"])
+        self.assertEqual(result["entry"]["version"], version)
+        self.assertNotIn("version.ref", result["suggestedDiff"])
+        non_comment = self._non_comment_declaration(result["suggestedDiff"])
+        self.assertEqual(non_comment, declaration)
+        self.assertIn(version, non_comment)
+        self.assertIn(original, catalog)
+        applied = catalog.replace(original, non_comment, 1)
+        if unchanged is not None:
+            self.assertIn(unchanged, applied)
+            self.assertNotIn(version, unchanged)
+        validated = server.handle_catalog_entry({
+            "mode": "validate",
+            "catalogToml": applied,
+        })
+        rules = [item["rule"] for item in validated["violations"]]
+        self.assertNotIn("undefined_version_ref", rules)
+        return applied
+
+    def test_generate_inline_or_shorthand_replaces_version_literal(self):
+        """An existing plain pin keeps its notation; only the version literal changes (#32)."""
+        library = {"groupId": "com.example", "artifactId": "some-lib"}
+        plugin = {
+            "groupId": "org.jetbrains.kotlin.android",
+            "artifactId": "org.jetbrains.kotlin.android.gradle.plugin",
+        }
+        inline = 'some-lib = { module = "com.example:some-lib", version = "1.0.0" }'
+        cases = (
+            {
+                "name": "library inline table",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": "[libraries]\n" + inline + "\n",
+                "original": inline,
+                "declaration": 'some-lib = { module = "com.example:some-lib", version = "1.2.3" }',
+            },
+            {
+                "name": "library shorthand",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": '[libraries]\nsome-lib = "com.example:some-lib:1.0.0"\n',
+                "original": 'some-lib = "com.example:some-lib:1.0.0"',
+                "declaration": 'some-lib = "com.example:some-lib:1.2.3"',
+            },
+            {
+                "name": "plugin inline table",
+                "kind": "plugin",
+                "coordinate": plugin,
+                "version": "2.0.0",
+                "catalog": (
+                    "[plugins]\n"
+                    'kotlin-android = { id = "org.jetbrains.kotlin.android", version = "1.9.0" }\n'
+                ),
+                "original": 'kotlin-android = { id = "org.jetbrains.kotlin.android", version = "1.9.0" }',
+                "declaration": (
+                    'kotlin-android = { id = "org.jetbrains.kotlin.android", version = "2.0.0" }'
+                ),
+            },
+            {
+                "name": "plugin shorthand",
+                "kind": "plugin",
+                "coordinate": plugin,
+                "version": "2.0.0",
+                "catalog": '[plugins]\nkotlin-android = "org.jetbrains.kotlin.android:1.9.0"\n',
+                "original": 'kotlin-android = "org.jetbrains.kotlin.android:1.9.0"',
+                "declaration": 'kotlin-android = "org.jetbrains.kotlin.android:2.0.0"',
+            },
+            {
+                "name": "group and name stay",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { group = "com.example", name = "some-lib", version = "1.0.0" }\n'
+                ),
+                "original": 'some-lib = { group = "com.example", name = "some-lib", version = "1.0.0" }',
+                "declaration": (
+                    'some-lib = { group = "com.example", name = "some-lib", version = "1.2.3" }'
+                ),
+            },
+            {
+                "name": "not a blind substitution",
+                "kind": "library",
+                "coordinate": library,
+                "version": "2.0.0",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib-1.0.0", version="1.0.0", extra = "keep" }\n'
+                ),
+                "original": 'some-lib = { module = "com.example:some-lib-1.0.0", version="1.0.0", extra = "keep" }',
+                "declaration": (
+                    'some-lib = { module = "com.example:some-lib-1.0.0", version="2.0.0", extra = "keep" }'
+                ),
+            },
+            {
+                "name": "library section not the plugin alias",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": (
+                    "[plugins]\n"
+                    'some-lib = { id = "com.example", version = "9.9.9" }\n'
+                    "\n"
+                    "[libraries]\n"
+                    + inline
+                    + "\n"
+                ),
+                "original": inline,
+                "declaration": 'some-lib = { module = "com.example:some-lib", version = "1.2.3" }',
+                "unchanged": 'some-lib = { id = "com.example", version = "9.9.9" }',
+            },
+            {
+                "name": "multi-line table",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib",\n'
+                    '  version = "1.0.0" }\n'
+                ),
+                "original": (
+                    'some-lib = { module = "com.example:some-lib",\n'
+                    '  version = "1.0.0" }'
+                ),
+                "declaration": (
+                    'some-lib = { module = "com.example:some-lib",\n'
+                    '  version = "1.2.3" }'
+                ),
+            },
+            {
+                "name": "trailing comment and old version text stay",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib", version = "1.0.0" } # pin 1.0.0\n'
+                ),
+                "original": 'some-lib = { module = "com.example:some-lib", version = "1.0.0" } # pin 1.0.0',
+                "declaration": (
+                    'some-lib = { module = "com.example:some-lib", version = "1.2.3" } # pin 1.0.0'
+                ),
+            },
+            {
+                "name": "library shorthand version is text after the second colon",
+                "kind": "library",
+                "coordinate": library,
+                "version": "1.2.3",
+                "catalog": '[libraries]\nsome-lib = "com.example:some-lib:1.0.0:meta"\n',
+                "original": 'some-lib = "com.example:some-lib:1.0.0:meta"',
+                "declaration": 'some-lib = "com.example:some-lib:1.2.3"',
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                self._assert_literal_replace(
+                    catalog=case["catalog"],
+                    kind=case["kind"],
+                    coordinate=case["coordinate"],
+                    version=case["version"],
+                    section="plugins" if case["kind"] == "plugin" else "libraries",
+                    alias=case["original"].split("=", 1)[0].strip(),
+                    original=case["original"],
+                    declaration=case["declaration"],
+                    unchanged=case.get("unchanged"),
+                )
+
+    def test_generate_without_plain_literal_does_not_invent_version_ref(self):
+        """Versionless and rich pins are not a bump. Do not emit version.ref (#32)."""
+        library = {"groupId": "com.example", "artifactId": "some-lib"}
+        version = "1.2.3"
+        cases = (
+            {
+                "name": "versionless table",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib" }\n'
+                ),
+                "declaration": 'some-lib = { module = "com.example:some-lib" }',
+            },
+            {
+                "name": "versionless shorthand",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = "com.example:some-lib"\n'
+                ),
+                "declaration": 'some-lib = "com.example:some-lib"',
+            },
+            {
+                "name": "rich version pin",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib", version = { strictly = "1.0.0" } }\n'
+                ),
+                "declaration": (
+                    'some-lib = { module = "com.example:some-lib", version = { strictly = "1.0.0" } }'
+                ),
+            },
+            {
+                "name": "versionless table comment is not a pin",
+                "catalog": (
+                    "[libraries]\n"
+                    'some-lib = { module = "com.example:some-lib" } # version = "9.9.9"\n'
+                ),
+                "declaration": 'some-lib = { module = "com.example:some-lib" } # version = "9.9.9"',
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                result = self._generate(case["catalog"], "library", library, version)
+                declaration = case["declaration"]
+                expected = (
+                    "# Update version on existing [libraries] alias 'some-lib'\n"
+                    f"{declaration}\n"
+                )
+                self.assertEqual(result["suggestedDiff"].strip(), expected.strip())
+                self.assertEqual(result["entry"]["updateKind"], "inline_or_line_replace")
+                self.assertIsNone(result["entry"]["versionRef"])
+                self.assertIsNone(result["entry"]["versionLine"])
+                self.assertEqual(result["entry"]["tomlLine"], declaration)
+                self.assertEqual(result["entry"]["tomlSnippet"], result["suggestedDiff"])
+                self.assertNotIn("version.ref", result["suggestedDiff"])
+                self.assertNotIn(version, result["suggestedDiff"])
+                non_comment = self._non_comment_declaration(result["suggestedDiff"])
+                self.assertEqual(non_comment, declaration)
+                applied = case["catalog"].replace(declaration, non_comment, 1)
+                validated = server.handle_catalog_entry({
+                    "mode": "validate",
+                    "catalogToml": applied,
+                })
+                rules = [item["rule"] for item in validated["violations"]]
+                self.assertNotIn("undefined_version_ref", rules)
+
 
 class CatalogValidateTest(unittest.TestCase):
     def test_validate_flags_reserved_and_first_segment(self):
