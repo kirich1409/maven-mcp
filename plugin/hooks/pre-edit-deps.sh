@@ -4,7 +4,9 @@
 # Checks NEW coordinates being added to a build file for:
 #   - Non-existent / likely-hallucinated coords (absent + likelyHallucination)                  → deny
 #   - CRITICAL/HIGH CVEs on a pinned version                                                   → ask
-#   - Version compatibility conflicts (Spring Boot BOM / AGP↔Gradle↔Kotlin↔JDK / javax→jakarta) → ask (#285)
+#   - Real in-range compatibility conflicts (kotlin_gradle / kotlin_agp / agp_gradle /
+#     agp_jdk / spring_boot_bom / javax_to_jakarta) → ask (#285). Gap kinds
+#     kotlin_unknown / agp_unknown do not ask and are not worded as a conflict.
 # Any uncertainty, failure, or network error → fail-open (edit proceeds).
 #
 # IMPORTANT — existence guard scope: the guard is Maven-Central-scoped.
@@ -521,7 +523,8 @@ if [ -n "$DEPS_VULN" ]; then
 fi
 
 # ── Optional check_version_compatibility (id:3) — richer write-time messages (#285)
-# Fail-open advisory only (ask, never deny). Triggered when NEW_CONTENT exposes
+# Fail-open. A real in-range conflict asks, never denies. Gap kinds
+# kotlin_unknown / agp_unknown do not ask. Triggered when NEW_CONTENT exposes
 # a Spring Boot / AGP / Kotlin / Gradle pin, or when extracted coords include
 # javax.* (Boot ≥3 migration). Extraction is best-effort regex on the edit
 # payload; missing signals simply skip this call.
@@ -873,7 +876,7 @@ if [ -n "$VULN_RESULT" ]; then
   done
 fi
 
-# ── Compatibility conflicts (#285) — advisory ask only ────────────────────────
+# ── Compatibility conflicts (#285) — ask only for a real in-range kind ───────
 RESP3=""
 COMPAT_RESULT=""
 if [ -n "$REQ3" ]; then
@@ -894,6 +897,7 @@ if [ -n "$COMPAT_RESULT" ]; then
     CCOUNT=0
     CCOUNT=$(printf '%s' "$COMPAT_RESULT" | jq '.conflicts | length' 2>/dev/null) || CCOUNT=0
     CIDX=0
+    COMPAT_ASK=0
     while [ "$CIDX" -lt "$CCOUNT" ] 2>/dev/null; do
       CITEM=""
       CITEM=$(printf '%s' "$COMPAT_RESULT" | jq -c ".conflicts[$CIDX]" 2>/dev/null) || CITEM=""
@@ -902,6 +906,13 @@ if [ -n "$COMPAT_RESULT" ]; then
       CKIND=""
       CKIND=$(printf '%s' "$CITEM" | jq -r '.kind // "compatibility"' 2>/dev/null) || CKIND="compatibility"
       CKIND=$(printf '%s' "$CKIND" | tr -cd 'A-Za-z0-9._-') || CKIND="compatibility"
+
+      # Matrix gap is uncovered, not a compatibility conflict. Skip before any
+      # reason is written. A real kind in the same result still asks.
+      if [ "$CKIND" = "kotlin_unknown" ] || [ "$CKIND" = "agp_unknown" ]; then
+        CIDX=$((CIDX+1))
+        continue
+      fi
 
       CREF=""
       CREF=$(printf '%s' "$CITEM" | jq -r '.reference // empty' 2>/dev/null) || CREF=""
@@ -921,10 +932,13 @@ if [ -n "$COMPAT_RESULT" ]; then
         REASON_LINE=$(printf 'Version compatibility conflict (%s). Verify versions before use.' "$CKIND")
       fi
       printf '%s\n' "$REASON_LINE" >> "$REASONS_FILE" || true
+      COMPAT_ASK=1
       CIDX=$((CIDX+1))
     done
-    # deny wins over ask
-    [ "$DECISION" = "deny" ] || DECISION="ask"
+    # deny wins over ask. A gap-only result leaves DECISION unset.
+    if [ "$COMPAT_ASK" = "1" ]; then
+      [ "$DECISION" = "deny" ] || DECISION="ask"
+    fi
   fi
 fi
 

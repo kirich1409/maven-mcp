@@ -8354,16 +8354,29 @@ def check_android_kotlin_compatibility(android: Dict, matrices: Dict) -> Tuple[L
     if kotlin:
         kgp_entry = _find_kgp_entry(kotlin, kgp_entries)
         if kgp_entry is None:
-            # Suggest the nearest band by kgpMin distance.
-            nearest_k = None
-            best_dist = None
-            for entry in kgp_entries:
-                a = _parse_segments(kotlin)
-                b = _parse_segments(entry["kgpMin"])
+            # Suggest the nearest published band. Distance is 0 inside the
+            # closed range, otherwise the minimum segment-sum to either
+            # endpoint — not to kgpMin alone. First minimum wins (d <, not <=).
+            def _segment_distance(left: str, right: str) -> int:
+                a = _parse_segments(left)
+                b = _parse_segments(right)
                 pad = max(len(a), len(b), 3)
                 a = (a + [0] * pad)[:pad]
                 b = (b + [0] * pad)[:pad]
-                d = sum(abs(x - y) for x, y in zip(a, b))
+                return sum(abs(x - y) for x, y in zip(a, b))
+
+            nearest_k = None
+            best_dist = None
+            for entry in kgp_entries:
+                kmin = entry["kgpMin"]
+                kmax = entry["kgpMax"]
+                if _version_in_closed_range(kotlin, kmin, kmax):
+                    d = 0
+                else:
+                    d = min(
+                        _segment_distance(kotlin, kmin),
+                        _segment_distance(kotlin, kmax),
+                    )
                 if best_dist is None or d < best_dist:
                     best_dist = d
                     nearest_k = entry

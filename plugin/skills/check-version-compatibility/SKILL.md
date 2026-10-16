@@ -36,7 +36,7 @@ migration need.
 
 ## Known limitations
 
-Coverage is intentionally bounded — AGP 7.0–9.2 lines, KGP 1.9.20–2.4.0 bands, no
+Coverage is intentionally bounded — AGP 7.0–9.2 lines, KGP 1.9.20–2.3.21 plus published 2.4.0–2.4.10 and 2.4.20–2.4.21 bands, no
 published AGP max-Gradle (only min enforced), javax→jakarta is a coordinate heuristic (not
 a bytecode scanner), Spring Cloud release trains are not a separate matrix. State the
 specific gap when a requested version falls outside shipped coverage — never imply
