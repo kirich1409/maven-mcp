@@ -58,6 +58,18 @@ def _dm(*items):
     return "<dependencyManagement>" + _deps(*items) + "</dependencyManagement>"
 
 
+def _pom_import(group, artifact, version):
+    return _dep(group, artifact, version, scope="import").replace(
+        "</dependency>", "<type>pom</type></dependency>"
+    )
+
+
+def _with_optional(dep_xml, value="true"):
+    return dep_xml.replace(
+        "</dependency>", f"<optional>{value}</optional></dependency>"
+    )
+
+
 def _license(name):
     return f"<licenses><license><name>{name}</name></license></licenses>"
 
@@ -1475,6 +1487,397 @@ class PomGraphTest(unittest.TestCase):
         self.assertNotIn(("com.example", "evil", "1.0"), calls)
         self.assertFalse(out["partial"])
         self.assertIsNone(out["error"])
+    def _resolve_parent_child(
+        self,
+        parent_body,
+        child_body,
+        extra=None,
+        parent_version="1.0",
+        child_version="1.0",
+        child_artifact="root",
+    ):
+        parent = _pom("parent", parent_version, parent_body)
+        child = _pom(
+            child_artifact,
+            child_version,
+            "<parent><groupId>com.example</groupId>"
+            f"<artifactId>parent</artifactId><version>{parent_version}</version></parent>"
+            + child_body,
+        )
+        mapping = {
+            ("com.example", "parent", parent_version): parent,
+            ("com.example", child_artifact, child_version): child,
+        }
+        if extra:
+            mapping.update(extra)
+        return self._resolve(
+            "com.example", child_artifact, child_version, mapping
+        )
+
+    def test_managed_test_scope_sees_child_property_and_is_not_an_edge(self):
+        # Combined fixture. Parent pins junit at scope test and ${junit.version}.
+        # Child property wins, so neither frozen parent version is an edge.
+        out, calls = self._resolve_parent_child(
+            "<properties><junit.version>4.12</junit.version></properties>"
+            + _dm(_dep("junit", "junit", "${junit.version}", scope="test")),
+            "<properties><junit.version>4.13.2</junit.version></properties>"
+            + _deps(_dep("junit", "junit")),
+            extra={
+                ("junit", "junit", "4.12"): _pom("junit", "4.12", group="junit"),
+                ("junit", "junit", "4.13.2"): _pom("junit", "4.13.2", group="junit"),
+            },
+        )
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertNotIn(("junit", "junit"), {
+            (n["groupId"], n["artifactId"]) for n in out["nodes"]
+        })
+        self.assertNotIn(("junit", "junit", "4.12"), calls)
+        self.assertNotIn(("junit", "junit", "4.13.2"), calls)
+
+    def test_child_only_property_resolves_parent_managed_version(self):
+        out, calls = self._resolve_parent_child(
+            _dm(_dep("com.example", "lib", "${lib.version}")),
+            "<properties><lib.version>9.9</lib.version></properties>"
+            + _deps(_dep("com.example", "lib")),
+            extra={("com.example", "lib", "9.9"): _pom("lib", "9.9")},
+        )
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "9.9")
+        self.assertIn(("com.example", "lib", "9.9"), calls)
+
+    def test_child_property_wins_on_compile_managed_pin(self):
+        out, calls = self._resolve_parent_child(
+            "<properties><junit.version>4.12</junit.version></properties>"
+            + _dm(_dep("junit", "junit", "${junit.version}")),
+            "<properties><junit.version>4.13.2</junit.version></properties>"
+            + _deps(_dep("junit", "junit")),
+            extra={
+                ("junit", "junit", "4.12"): _pom("junit", "4.12", group="junit"),
+                ("junit", "junit", "4.13.2"): _pom("junit", "4.13.2", group="junit"),
+            },
+        )
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("junit", "junit")], "4.13.2")
+        self.assertIn(("junit", "junit", "4.13.2"), calls)
+        self.assertNotIn(("junit", "junit", "4.12"), calls)
+
+    def test_managed_optional_is_emitted_and_not_walked(self):
+        opt = _pom("opt", "1.0", _deps(_dep("com.example", "child", "1.0")))
+        root = _pom(
+            "root",
+            "1.0",
+            _dm(_with_optional(_dep("com.example", "opt", "1.0")))
+            + _deps(_dep("com.example", "opt")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): root,
+            ("com.example", "opt", "1.0"): opt,
+            ("com.example", "child", "1.0"): _pom("child", "1.0"),
+        })
+        names = [n["artifactId"] for n in out["nodes"]]
+        self.assertEqual(names, ["root", "opt"])
+        self.assertIn(("com.example", "opt", "1.0"), calls)
+        self.assertNotIn("child", names)
+        self.assertNotIn(("com.example", "child", "1.0"), calls)
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+
+    def test_managed_test_provided_system_import_are_not_edges(self):
+        for scope in ("test", "provided", "system", "import"):
+            with self.subTest(scope=scope):
+                artifact = "lib-" + scope
+                root = _pom(
+                    "root",
+                    "1.0",
+                    _dm(_dep("com.example", artifact, "1.0", scope=scope))
+                    + _deps(_dep("com.example", artifact)),
+                )
+                out, calls = self._resolve("com.example", "root", "1.0", {
+                    ("com.example", "root", "1.0"): root,
+                    ("com.example", artifact, "1.0"): _pom(artifact, "1.0"),
+                })
+                self.assertNotIn(artifact, [n["artifactId"] for n in out["nodes"]])
+                self.assertNotIn(("com.example", artifact, "1.0"), calls)
+                self.assertFalse(out["partial"])
+                self.assertEqual(out["nodeErrors"], [])
+
+    def test_empty_and_whitespace_scope_inherit_managed_test(self):
+        cases = {
+            "empty": (
+                "<dependency><groupId>junit</groupId>"
+                "<artifactId>junit</artifactId><scope></scope></dependency>"
+            ),
+            "whitespace": _dep("junit", "junit", scope=" "),
+        }
+        for name, dep in cases.items():
+            with self.subTest(name=name):
+                root = _pom(
+                    "root",
+                    "1.0",
+                    _dm(_dep("junit", "junit", "4.13.2", scope="test"))
+                    + _deps(dep),
+                )
+                out, calls = self._resolve("com.example", "root", "1.0", {
+                    ("com.example", "root", "1.0"): root,
+                    ("junit", "junit", "4.13.2"): _pom(
+                        "junit", "4.13.2", group="junit"
+                    ),
+                })
+                self.assertNotIn(("junit", "junit"), {
+                    (n["groupId"], n["artifactId"]) for n in out["nodes"]
+                })
+                self.assertNotIn(("junit", "junit", "4.13.2"), calls)
+                self.assertFalse(out["partial"])
+                self.assertEqual(out["nodeErrors"], [])
+
+    def test_managed_scope_interpolates_with_merged_properties(self):
+        dropped = _pom(
+            "root",
+            "1.0",
+            "<properties><dep.scope>test</dep.scope></properties>"
+            + _dm(_dep("com.example", "lib", "1.0", scope="${dep.scope}"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): dropped,
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertNotIn(("com.example", "lib", "1.0"), calls)
+
+        kept = _pom(
+            "root",
+            "1.0",
+            "<properties><dep.scope>runtime</dep.scope></properties>"
+            + _dm(_dep("com.example", "lib", "1.0", scope="${dep.scope}"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): kept,
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertIn(("com.example", "lib", "1.0"), calls)
+
+        unresolved = _pom(
+            "root",
+            "1.0",
+            _dm(_dep("com.example", "lib", "1.0", scope="${missing.scope}"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): unresolved,
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+        })
+        self.assertTrue(out["partial"])
+        self.assertNotIn(("com.example", "lib", "1.0"), calls)
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertTrue(out["nodeErrors"])
+        self.assertIn(
+            "unresolved property in coordinate",
+            out["nodeErrors"][0]["errors"][0],
+        )
+
+    def test_set_unresolved_managed_version_does_not_keep_parent(self):
+        out, calls = self._resolve_parent_child(
+            _dm(_dep("com.example", "lib", "4.12")),
+            _dm(_dep("com.example", "lib", "${missing.version}"))
+            + _deps(_dep("com.example", "lib")),
+            extra={("com.example", "lib", "4.12"): _pom("lib", "4.12")},
+        )
+        self.assertTrue(out["partial"])
+        self.assertNotIn(("com.example", "lib", "4.12"), calls)
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertTrue(out["nodeErrors"])
+        self.assertEqual(
+            out["nodeErrors"][0]["errors"][0],
+            "unresolved property in version",
+        )
+
+    def test_omitted_version_keeps_concrete_parent_pin(self):
+        out, calls = self._resolve_parent_child(
+            _dm(_dep("com.example", "lib", "4.12")),
+            _deps(_dep("com.example", "lib")),
+            extra={("com.example", "lib", "4.12"): _pom("lib", "4.12")},
+        )
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertIn(("com.example", "lib", "4.12"), calls)
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "4.12")
+
+    def test_project_version_follows_child(self):
+        out, calls = self._resolve_parent_child(
+            _dm(_dep("com.example", "lib", "${project.version}")),
+            _deps(_dep("com.example", "lib")),
+            extra={
+                ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+                ("com.example", "lib", "2.0"): _pom("lib", "2.0"),
+            },
+            child_version="2.0",
+        )
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "2.0")
+        self.assertIn(("com.example", "lib", "2.0"), calls)
+        self.assertNotIn(("com.example", "lib", "1.0"), calls)
+
+    def test_import_bom_scope_overlays_parent_version(self):
+        bom = _pom(
+            "bom",
+            "1.0",
+            _dm(_dep("com.example", "lib", scope="test")),
+            group="org.example",
+        )
+        out, calls = self._resolve_parent_child(
+            _dm(_dep("com.example", "lib", "4.12")),
+            _dm(_pom_import("org.example", "bom", "1.0"))
+            + _deps(_dep("com.example", "lib")),
+            extra={
+                ("org.example", "bom", "1.0"): bom,
+                ("com.example", "lib", "4.12"): _pom("lib", "4.12"),
+            },
+        )
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertNotIn(("com.example", "lib", "4.12"), calls)
+        self.assertIn(("org.example", "bom", "1.0"), calls)
+
+    def test_imported_project_version_follows_child(self):
+        bom = _pom(
+            "bom",
+            "1.0",
+            _dm(_dep("com.example", "lib", "${project.version}")),
+            group="org.example",
+        )
+        root = _pom(
+            "root",
+            "2.0",
+            _dm(_pom_import("org.example", "bom", "1.0"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "2.0", {
+            ("com.example", "root", "2.0"): root,
+            ("org.example", "bom", "1.0"): bom,
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+            ("com.example", "lib", "2.0"): _pom("lib", "2.0"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "2.0")
+        self.assertIn(("com.example", "lib", "2.0"), calls)
+        self.assertNotIn(("com.example", "lib", "1.0"), calls)
+
+    def test_imported_version_uses_child_property(self):
+        bom = _pom(
+            "bom",
+            "1.0",
+            _dm(_dep("com.example", "lib", "${lib.version}")),
+            group="org.example",
+        )
+        root = _pom(
+            "root",
+            "1.0",
+            "<properties><lib.version>9.9</lib.version></properties>"
+            + _dm(_pom_import("org.example", "bom", "1.0"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): root,
+            ("org.example", "bom", "1.0"): bom,
+            ("com.example", "lib", "9.9"): _pom("lib", "9.9"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "9.9")
+        self.assertIn(("com.example", "lib", "9.9"), calls)
+
+    def test_imported_scope_uses_child_property(self):
+        bom = _pom(
+            "bom",
+            "1.0",
+            _dm(_dep("com.example", "lib", "1.0", scope="${dep.scope}")),
+            group="org.example",
+        )
+        root = _pom(
+            "root",
+            "1.0",
+            "<properties><dep.scope>test</dep.scope></properties>"
+            + _dm(_pom_import("org.example", "bom", "1.0"))
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): root,
+            ("org.example", "bom", "1.0"): bom,
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertNotIn(("com.example", "lib", "1.0"), calls)
+
+    def test_versionless_scope_does_not_occupy_later_version(self):
+        root = _pom(
+            "root",
+            "1.0",
+            _dm(
+                _dep("com.example", "lib", scope="test"),
+                _dep("com.example", "lib", "4.13"),
+            )
+            + _deps(_dep("com.example", "lib")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): root,
+            ("com.example", "lib", "4.13"): _pom("lib", "4.13"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertNotIn("lib", [n["artifactId"] for n in out["nodes"]])
+        self.assertNotIn(("com.example", "lib", "4.13"), calls)
+
+    def test_dependency_property_version_uses_concrete_managed_version(self):
+        root = _pom(
+            "root",
+            "1.0",
+            _dm(_dep("com.example", "lib", "1.2.3"))
+            + _deps(_dep("com.example", "lib", "${missing}")),
+        )
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): root,
+            ("com.example", "lib", "1.2.3"): _pom("lib", "1.2.3"),
+        })
+        self.assertFalse(out["partial"])
+        self.assertEqual(out["nodeErrors"], [])
+        self.assertIn(("com.example", "lib", "1.2.3"), calls)
+        versions = {
+            (n["groupId"], n["artifactId"]): n["version"] for n in out["nodes"]
+        }
+        self.assertEqual(versions[("com.example", "lib")], "1.2.3")
 
     def _write_under(self, directory, name, text):
         directory.mkdir(parents=True, exist_ok=True)

@@ -3668,14 +3668,28 @@ def _pom_ga_excluded(ga: Tuple[str, str], exclusions) -> bool:
     return False
 
 
+def _pom_set_tag(block: str, tag: str) -> Tuple[Optional[str], bool]:
+    """Stripped tag text, and whether a non-empty tag was present.
+
+    ``_extract_tag`` already misses an empty tag. Whitespace-only is omitted
+    too: it is not an explicit value, so managed fill can still run.
+    """
+    raw = _extract_tag(block, tag)
+    if not raw or not raw.strip():
+        return None, False
+    return raw.strip(), True
+
+
 def _parse_direct_pom_dependencies(
     pom_xml: str, props: Dict[str, str]
 ) -> List[Dict[str, Any]]:
-    """Compile and runtime dependencies in document order.
+    """Direct dependencies in document order.
 
-    Empty scope is compile. ``test``, ``provided``, ``system``, and ``import``
-    are dropped. The version is interpolated and may still be empty, a range,
-    or an unresolved ``${}``.
+    Omitted scope and optional stay omitted so the walk can fill them from
+    dependencyManagement. Empty and whitespace-only scope are omitted. A
+    present non-empty tag wins for that field and is interpolated with
+    ``props``, including a present optional ``false`` and a present scope
+    that still contains ``${}``. Non-kept scopes are not dropped here.
     """
     xml = _pom_dependency_xml(pom_xml)
     results: List[Dict[str, Any]] = []
@@ -3690,34 +3704,51 @@ def _parse_direct_pom_dependencies(
             artifact_id = _interpolate_pom_props(aid_raw.strip(), props) or ""
             if not group_id or not artifact_id:
                 continue
-            scope_raw = _extract_tag(block, "scope")
-            scope = _interpolate_pom_props(scope_raw.strip(), props) if scope_raw else "compile"
-            scope = (scope or "compile").strip().lower()
-            if scope not in _POM_KEPT_SCOPES:
-                continue
-            if "${" in group_id or "${" in artifact_id or "${" in scope:
+            scope, scope_set = _pom_set_tag(block, "scope")
+            if scope_set:
+                scope = _interpolate_pom_props(scope, props)
+            ver_raw = _extract_tag(block, "version")
+            version = (
+                _interpolate_pom_props(ver_raw.strip(), props) if ver_raw else None
+            )
+            optional, optional_set = _pom_set_tag(block, "optional")
+            if optional_set:
+                optional = _interpolate_pom_props(optional, props)
+            unresolved_scope = bool(scope_set and scope and "${" in scope)
+            if "${" in group_id or "${" in artifact_id or unresolved_scope:
                 results.append({
                     "groupId": group_id,
                     "artifactId": artifact_id,
                     "version": None,
-                    "optional": False,
+                    "scope": scope,
+                    "scope_set": scope_set,
+                    "optional": optional,
+                    "optional_set": optional_set,
                     "exclusions": [],
                     "skip": "unresolved property in coordinate",
                 })
                 continue
-            ver_raw = _extract_tag(block, "version")
-            version = _interpolate_pom_props(ver_raw.strip(), props) if ver_raw else None
-            opt_raw = _extract_tag(block, "optional")
-            optional = bool(opt_raw and opt_raw.strip().lower() == "true")
             results.append({
                 "groupId": group_id,
                 "artifactId": artifact_id,
                 "version": version,
+                "scope": scope,
+                "scope_set": scope_set,
                 "optional": optional,
+                "optional_set": optional_set,
                 "exclusions": _pom_exclusions(block, props),
                 "skip": None,
             })
     return results
+
+
+def _managed_text(dep: Dict[str, Any], record: Optional[Dict[str, Any]], field: str) -> Any:
+    """Present dependency tag wins. Otherwise the managed record's set field."""
+    if dep.get(field + "_set"):
+        return dep.get(field)
+    if record and record.get(field + "_set"):
+        return record.get(field)
+    return None
 
 
 def _resolve_declared_version(
@@ -3756,7 +3787,77 @@ def _resolve_declared_version(
     return None, reason(declared)
 
 
-def _managed_version_map(
+_MANAGED_RECORD_FIELDS = ("version", "scope", "optional")
+
+
+def _blank_managed_record() -> Dict[str, Any]:
+    return {
+        "version": None,
+        "version_set": False,
+        "scope": None,
+        "scope_set": False,
+        "optional": None,
+        "optional_set": False,
+    }
+
+
+def _copy_managed_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    out = _blank_managed_record()
+    for field in _MANAGED_RECORD_FIELDS:
+        if rec.get(field + "_set"):
+            out[field] = rec.get(field)
+            out[field + "_set"] = True
+    return out
+
+
+def _raw_dm_entries(pom_xml: str) -> List[Dict[str, Any]]:
+    """dependencyManagement entries as raw templates. No interpolation.
+
+    A whitespace-only tag is omitted, so it does not occupy that field ahead
+    of a later set tag. Import, for this reader only, is a present scope tag
+    equal to ``import`` plus type ``pom``.
+    """
+    xml = _strip_xml_comments(pom_xml)
+    dm_m = re.search(
+        r"<dependencyManagement>([\s\S]*?)</dependencyManagement>", xml
+    )
+    if not dm_m:
+        return []
+    deps_m = re.search(r"<dependencies>([\s\S]*?)</dependencies>", dm_m.group(1))
+    block = deps_m.group(1) if deps_m else dm_m.group(1)
+    entries: List[Dict[str, Any]] = []
+    for match in re.finditer(r"<dependency>([\s\S]*?)</dependency>", block):
+        dep_block = match.group(1)
+        group_id, group_set = _pom_set_tag(dep_block, "groupId")
+        artifact_id, artifact_set = _pom_set_tag(dep_block, "artifactId")
+        if not group_set or not artifact_set or not group_id or not artifact_id:
+            continue
+        entry: Dict[str, Any] = {
+            "groupId": group_id,
+            "artifactId": artifact_id,
+        }
+        for field in _MANAGED_RECORD_FIELDS + ("type",):
+            value, value_set = _pom_set_tag(dep_block, field)
+            entry[field] = value
+            entry[field + "_set"] = value_set
+        entries.append(entry)
+    return entries
+
+
+def _dm_entry_is_import(entry: Dict[str, Any]) -> bool:
+    if not entry.get("scope_set"):
+        return False
+    scope = (entry.get("scope") or "").strip().lower()
+    if scope != "import":
+        return False
+    if entry.get("type_set"):
+        dep_type = (entry.get("type") or "").strip().lower()
+    else:
+        dep_type = "jar"
+    return dep_type == "pom"
+
+
+def _dm_layers(
     group_id: str,
     artifact_id: str,
     version: str,
@@ -3764,34 +3865,27 @@ def _managed_version_map(
     reader: Callable[..., Optional[str]],
     depth: int = 0,
     seen: Optional[Set[str]] = None,
-    props: Optional[Dict[str, str]] = None,
-) -> Dict[Tuple[str, str], str]:
-    """Effective dependencyManagement for one POM. Child wins over parent.
-
-    Import BOMs stay inside ``expand_bom`` (first-wins). Parent management is
-    the fallback for versions this POM does not set. ``props``, when passed,
-    is the map already collected for this POM so ``expand_bom`` does not walk
-    the same parent again. The recursive parent call collects its own.
-    """
+) -> List[Tuple[int, List[Dict[str, Any]]]]:
+    """Raw dependencyManagement lists, oldest parent first. No interpolation."""
     if seen is None:
         seen = set()
     key = f"{group_id}:{artifact_id}:{version}"
     if depth > MAX_BOM_DEPTH or key in seen:
-        return {}
+        return []
     seen.add(key)
     pom = reader(group_id, artifact_id, version, ctx)
     # "" is a readable empty file (a cache hit). Only a real miss is None.
     if pom is None:
-        return {}
-    out: Dict[Tuple[str, str], str] = {}
-    local: Dict[str, str] = {}
-    local.update(_pom_project_property_defaults(pom, version))
-    local.update(_parse_pom_properties(pom))
+        return []
+    layers: List[Tuple[int, List[Dict[str, Any]]]] = []
     if depth < MAX_BOM_DEPTH:
+        local: Dict[str, str] = {}
+        local.update(_pom_project_property_defaults(pom, version))
+        local.update(_parse_pom_properties(pom))
         parent_gav = _resolved_parent_gav(pom, local)
         if parent_gav:
-            out.update(
-                _managed_version_map(
+            layers.extend(
+                _dm_layers(
                     parent_gav[0],
                     parent_gav[1],
                     parent_gav[2],
@@ -3801,22 +3895,220 @@ def _managed_version_map(
                     seen,
                 )
             )
-    if props is None:
-        props = _collect_bom_properties(
-            pom, version, ctx, depth, _pom_reader=reader,
-        )
-    for item in expand_bom(
-        group_id,
-        artifact_id,
-        version,
-        ctx,
-        _depth=depth,
-        _pom_reader=reader,
-        _version_fallback=out,
-        _props=props,
+    layers.append((depth, _raw_dm_entries(pom)))
+    return layers
+
+
+def _merge_managed_first_set(
+    layer: Dict[Tuple[str, str], Dict[str, Any]],
+    entry: Dict[str, Any],
+) -> None:
+    """Within one POM, the first set field wins. An unset field does not occupy."""
+    ga = (entry["groupId"], entry["artifactId"])
+    slot = layer.get(ga)
+    if slot is None:
+        slot = _blank_managed_record()
+        layer[ga] = slot
+    for field in _MANAGED_RECORD_FIELDS:
+        if entry.get(field + "_set") and not slot.get(field + "_set"):
+            slot[field] = entry.get(field)
+            slot[field + "_set"] = True
+
+
+def _overlay_managed_child_wins(
+    base: Dict[Tuple[str, str], Dict[str, Any]],
+    layer: Dict[Tuple[str, str], Dict[str, Any]],
+) -> None:
+    """Child-set fields win. An unset child field keeps the parent template."""
+    for ga, incoming in layer.items():
+        slot = base.get(ga)
+        if slot is None:
+            base[ga] = _copy_managed_record(incoming)
+            continue
+        for field in _MANAGED_RECORD_FIELDS:
+            if incoming.get(field + "_set"):
+                slot[field] = incoming.get(field)
+                slot[field + "_set"] = True
+
+
+def _inherited_managed_record(
+    inherited: Dict[Tuple[str, str], Dict[str, Any]],
+    group_id: str,
+    artifact_id: str,
+    props: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    direct = inherited.get((group_id, artifact_id))
+    if direct is not None:
+        return direct
+    for (raw_group, raw_artifact), rec in inherited.items():
+        resolved_group = _interpolate_pom_props(raw_group, props) or ""
+        resolved_artifact = _interpolate_pom_props(raw_artifact, props) or ""
+        if resolved_group == group_id and resolved_artifact == artifact_id:
+            return rec
+    return None
+
+
+def _import_fetch_version(
+    entry: Dict[str, Any],
+    props: Dict[str, str],
+    inherited: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Version used only to choose the import POM.
+
+    A tag that still contains ``${}`` is not replaced by a parent concrete
+    version. An omitted tag may use the parent template, interpolated with
+    the same map, and only for the fetch.
+    """
+    if entry.get("version_set"):
+        version = _interpolate_pom_props(entry.get("version"), props)
+    elif inherited and inherited.get("version_set"):
+        version = _interpolate_pom_props(inherited.get("version"), props)
+    else:
+        return None
+    if not version or "${" in version:
+        return None
+    version = version.strip()
+    if not version or any(ch in _POM_RANGE_CHARS for ch in version):
+        return None
+    return version
+
+
+def _consume_dm_entries(
+    entries: List[Dict[str, Any]],
+    layer: Dict[Tuple[str, str], Dict[str, Any]],
+    props: Dict[str, str],
+    inherited: Dict[Tuple[str, str], Dict[str, Any]],
+    ctx: "ResolutionContext",
+    reader: Callable[..., Optional[str]],
+    depth: int,
+    seen: Set[str],
+) -> None:
+    for entry in entries:
+        if _dm_entry_is_import(entry):
+            _inline_import_bom(
+                entry, layer, props, inherited, ctx, reader, depth, seen
+            )
+            continue
+        _merge_managed_first_set(layer, entry)
+
+
+def _inline_import_bom(
+    entry: Dict[str, Any],
+    layer: Dict[Tuple[str, str], Dict[str, Any]],
+    props: Dict[str, str],
+    inherited: Dict[Tuple[str, str], Dict[str, Any]],
+    ctx: "ResolutionContext",
+    reader: Callable[..., Optional[str]],
+    depth: int,
+    seen: Set[str],
+) -> None:
+    """Inline an import as raw templates. A miss does not set ``partial``.
+
+    ``props`` chooses the POM only. Imported records stay raw until the one
+    consumer interpolation pass. A set tag that still contains ``${}`` is not
+    replaced by a parent concrete version.
+    """
+    if depth > MAX_BOM_DEPTH:
+        return
+    group_id = _interpolate_pom_props(entry.get("groupId"), props) or ""
+    artifact_id = _interpolate_pom_props(entry.get("artifactId"), props) or ""
+    if (
+        not group_id
+        or not artifact_id
+        or "${" in group_id
+        or "${" in artifact_id
     ):
-        out[(item["groupId"], item["artifactId"])] = item["version"]
+        return
+    version = _import_fetch_version(
+        entry,
+        props,
+        _inherited_managed_record(inherited, group_id, artifact_id, props),
+    )
+    if not version:
+        return
+    key = f"{group_id}:{artifact_id}:{version}"
+    if key in seen:
+        return
+    seen.add(key)
+    pom = reader(group_id, artifact_id, version, ctx)
+    if not pom:
+        return
+    _consume_dm_entries(
+        _raw_dm_entries(pom),
+        layer,
+        props,
+        inherited,
+        ctx,
+        reader,
+        depth + 1,
+        seen,
+    )
+
+
+def _interpolate_managed_map(
+    raw: Dict[Tuple[str, str], Dict[str, Any]],
+    props: Dict[str, str],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """One pass. A set tag that still contains ``${}`` stays set."""
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for (group_id, artifact_id), rec in raw.items():
+        group_id = _interpolate_pom_props(group_id, props) or ""
+        artifact_id = _interpolate_pom_props(artifact_id, props) or ""
+        if (
+            not group_id
+            or not artifact_id
+            or "${" in group_id
+            or "${" in artifact_id
+        ):
+            continue
+        interpolated = _blank_managed_record()
+        for field in _MANAGED_RECORD_FIELDS:
+            if not rec.get(field + "_set"):
+                continue
+            value = _interpolate_pom_props(rec.get(field), props)
+            value = (value or "").strip()
+            interpolated[field] = value or None
+            interpolated[field + "_set"] = True
+        ga = (group_id, artifact_id)
+        slot = out.get(ga)
+        if slot is None:
+            out[ga] = interpolated
+            continue
+        for field in _MANAGED_RECORD_FIELDS:
+            if interpolated.get(field + "_set"):
+                slot[field] = interpolated.get(field)
+                slot[field + "_set"] = True
     return out
+
+
+def _managed_record_map(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+    reader: Callable[..., Optional[str]],
+    props: Dict[str, str],
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Effective dependencyManagement for the POM walk.
+
+    Parent recursion and imported BOMs keep raw templates. One interpolation
+    pass then uses ``props`` (parent properties, then this POM; child wins,
+    including ``project.version``). That map also chooses which import POM
+    to fetch. A version tag that is set and still contains ``${}`` is not
+    replaced by the parent version. This does not call ``expand_bom`` or
+    ``parse_dependency_management``.
+    """
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    import_seen: Set[str] = set()
+    for depth, entries in _dm_layers(
+        group_id, artifact_id, version, ctx, reader
+    ):
+        layer: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        _consume_dm_entries(
+            entries, layer, props, merged, ctx, reader, depth, import_seen
+        )
+        _overlay_managed_child_wins(merged, layer)
+    return _interpolate_managed_map(merged, props)
 
 
 def _empty_pom_graph() -> Dict[str, Any]:
@@ -3929,7 +4221,9 @@ def _resolve_pom_graph_impl(
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     ga_index: Dict[Tuple[str, str], int] = {}
-    managed_cache: Dict[Tuple[str, str, str], Dict[Tuple[str, str], str]] = {}
+    managed_cache: Dict[
+        Tuple[str, str, str], Dict[Tuple[str, str], Dict[str, Any]]
+    ] = {}
 
     def note_capability(cap: Optional[str]) -> None:
         nonlocal capability
@@ -3965,16 +4259,16 @@ def _resolve_pom_graph_impl(
 
     def managed_for(
         node: Dict[str, Any], props: Dict[str, str]
-    ) -> Dict[Tuple[str, str], str]:
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
         key = (node["groupId"], node["artifactId"], node["version"])
         if key not in managed_cache:
-            managed_cache[key] = _managed_version_map(
+            managed_cache[key] = _managed_record_map(
                 node["groupId"],
                 node["artifactId"],
                 node["version"],
                 ctx,
                 reader,
-                props=props,
+                props,
             )
         return managed_cache[key]
 
@@ -4160,6 +4454,22 @@ def _resolve_pom_graph_impl(
                 if not only_new:
                     note_skip(dep, dep["skip"])
                 continue
+            record = managed.get(ga)
+            scope = _managed_text(dep, record, "scope")
+            if scope is None or not str(scope).strip():
+                scope_cmp = "compile"
+            else:
+                scope_cmp = str(scope).strip().lower()
+            if "${" in scope_cmp:
+                note_skip(dep, "unresolved property in coordinate")
+                continue
+            if scope_cmp not in _POM_KEPT_SCOPES:
+                continue
+            optional_text = _managed_text(dep, record, "optional")
+            optional = bool(
+                optional_text
+                and str(optional_text).strip().lower() == "true"
+            )
             if paths_omit(selected, ga):
                 continue
             if only_new and (
@@ -4172,8 +4482,11 @@ def _resolve_pom_graph_impl(
                 )
             ):
                 continue
+            managed_version = None
+            if record and record.get("version_set"):
+                managed_version = record.get("version")
             resolved, reason = _resolve_declared_version(
-                dep.get("version"), managed.get(ga)
+                dep.get("version"), managed_version
             )
             if reason or not resolved:
                 if not only_new:
@@ -4184,7 +4497,7 @@ def _resolve_pom_graph_impl(
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "version": resolved,
-                "optional": bool(dep.get("optional")),
+                "optional": optional,
                 "paths": child_paths(selected, list(dep.get("exclusions") or [])),
             })
 
