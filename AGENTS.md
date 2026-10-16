@@ -12,6 +12,8 @@ Rules that are not open for discussion. Violating these is an error, not a judgm
 
 MCP server for Maven dependency intelligence. Provides tools to query artifact versions from Maven repositories (Maven Central, Google Maven, Gradle Plugin Portal).
 
+**Product behavior.** Target behavior for search, versions, existence, resolution, and upgrade labels is [docs/product-behavior.md](docs/product-behavior.md). This file describes the current implementation. Where they differ, the product spec is the target.
+
 **Implementation:** `plugin/server/server.py` — a single-file Python 3 server (stdlib only, zero pip dependencies). It speaks MCP over stdio (JSON-RPC 2.0 on stdin/stdout) or, when `MAVEN_MCP_TRANSPORT=http`, over a stateless Streamable HTTP endpoint (`POST /mcp`, stdlib `http.server.ThreadingHTTPServer`, JSON responses, no SSE/sessions). The stdio mode is registered via `plugin/.claude-plugin/plugin.json` as `command: python3`. Runs as an MCP server in local and cloud agent environments without Node.js or npm, and standalone with any MCP-compatible client.
 
 **Stack:** Python 3.9+ standard library only (`urllib`, `json`, `re`, `typing`). No build step, no install step.
