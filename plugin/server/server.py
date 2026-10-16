@@ -10613,6 +10613,127 @@ def _validate_alias_name(alias: str, section: str) -> List[Dict[str, str]]:
     return violations
 
 
+# Copies of the declaration patterns in _parse_toml_catalog. Do not retune them
+# so a shorthand capture becomes the version — library shorthand's optional
+# group does not hold it (see _replace_library_shorthand_version).
+_CATALOG_TABLE_DECL_RE = re.compile(r"^(\S+)\s*=\s*\{([^}]+)\}", re.MULTILINE)
+_CATALOG_LIB_SHORT_DECL_RE = re.compile(
+    r'^(\S+)\s*=\s*"([^"]+):([^":]+)(?::([^"]+))?"',
+    re.MULTILINE,
+)
+_CATALOG_PLUGIN_SHORT_DECL_RE = re.compile(
+    r'^(\S+)\s*=\s*"([^":]+):([^"]+)"',
+    re.MULTILINE,
+)
+# Plain version = "..." only. \bversion does not match version.ref, and the
+# required quote does not match version = { ... }.
+_CATALOG_PLAIN_VERSION_RE = re.compile(r'\bversion\s*=\s*"([^"]+)"')
+
+
+def _first_named_alias(pattern, body, alias):
+    """First parser-shaped declaration of ``alias`` in a catalog section body."""
+    for match in pattern.finditer(body):
+        if match.group(1) == alias:
+            return match
+    return None
+
+
+def _declaration_through_closing_line(body, match):
+    """Parser match extended through the closing physical line, including a trailing comment."""
+    line_end = body.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(body)
+    return body[match.start():line_end]
+
+
+def _replace_table_version(declaration, match, version):
+    """Replace the first plain ``version = "..."`` the parser reads, or leave the line.
+
+    Search is the table props (match group 2), not a trailing comment. That is
+    the span ``_parse_toml_catalog`` reads, so a comment cannot become a pin.
+    """
+    props_start = match.start(2) - match.start()
+    props_end = match.end(2) - match.start()
+    found = _CATALOG_PLAIN_VERSION_RE.search(declaration, props_start, props_end)
+    if not found:
+        return declaration
+    return declaration[:found.start(1)] + version + declaration[found.end(1):]
+
+
+def _replace_library_shorthand_version(declaration, match, version):
+    """Replace the text after the second colon in the quoted shorthand value.
+
+    Do not read the version from group 3, group 4, or the parsed ``version``
+    field. On ``alias = "g:a:1.0.0"`` those groups are ``1.0.0``, empty, and
+    None — the pin is still there. On ``alias = "g:a"`` group 3 is the
+    artifact id; replacing it would add a pin. Fewer than two colons means
+    versionless: leave the declaration unchanged.
+    """
+    text = match.group(0)
+    open_rel = text.index('"')
+    quoted_start = open_rel + 1
+    quoted_end = len(text) - 1
+    quoted = declaration[quoted_start:quoted_end]
+    first = quoted.find(":")
+    second = quoted.find(":", first + 1) if first != -1 else -1
+    if second == -1:
+        return declaration
+    return declaration[:quoted_start + second + 1] + version + declaration[quoted_end:]
+
+
+def _replace_plugin_shorthand_version(declaration, match, version):
+    """Replace the segment after the first colon (parser group 3)."""
+    rel_start = match.start(3) - match.start()
+    rel_end = match.end(3) - match.start()
+    return declaration[:rel_start] + version + declaration[rel_end:]
+
+
+def _locate_catalog_alias(body, section, alias):
+    """Declaration the catalog parser accepts for ``alias``, plus how to rewrite it.
+
+    Libraries: first table match, else shorthand. Plugins: first shorthand
+    match, else table. Same precedence as ``_parse_toml_catalog``.
+    """
+    if section == "plugins":
+        match = _first_named_alias(_CATALOG_PLUGIN_SHORT_DECL_RE, body, alias)
+        if match is not None:
+            return match, "plugin_shorthand"
+        match = _first_named_alias(_CATALOG_TABLE_DECL_RE, body, alias)
+        if match is not None:
+            return match, "table"
+        return None
+    match = _first_named_alias(_CATALOG_TABLE_DECL_RE, body, alias)
+    if match is not None:
+        return match, "table"
+    match = _first_named_alias(_CATALOG_LIB_SHORT_DECL_RE, body, alias)
+    if match is not None:
+        return match, "library_shorthand"
+    return None
+
+
+def _rewrite_inline_catalog_declaration(catalog_toml, section, alias, version):
+    """Existing alias declaration with only its plain version literal replaced.
+
+    Returns the original declaration when it has no plain version literal
+    (versionless table or shorthand, or ``version = { ... }``), and None when
+    that declaration cannot be located. Does not invent ``version.ref`` or a
+    new pin. Section bounds match ``_parse_toml_catalog``.
+    """
+    found = re.search(rf"\[{section}\]([\s\S]*?)(?=\n\[|$)", catalog_toml)
+    if not found:
+        return None
+    located = _locate_catalog_alias(found.group(1), section, alias)
+    if located is None:
+        return None
+    match, kind = located
+    declaration = _declaration_through_closing_line(found.group(1), match)
+    if kind == "library_shorthand":
+        return _replace_library_shorthand_version(declaration, match, version)
+    if kind == "plugin_shorthand":
+        return _replace_plugin_shorthand_version(declaration, match, version)
+    return _replace_table_version(declaration, match, version)
+
+
 def generate_catalog_entry(
     group_id: str,
     artifact_id: str,
@@ -10730,11 +10851,25 @@ def generate_catalog_entry(
             entry["updateKind"] = "version_ref_bump"
             entry["versionRef"] = vref
         else:
-            # Inline version in the table/shorthand — replace just the version literal on that alias line.
-            bump_lines.append(f"# Update version on existing [{section}] alias {chosen!r}")
-            bump_lines.append(lib_line)
-            suggested = "\n".join(bump_lines) + "\n"
+            # Inline version in the table/shorthand — replace just the version
+            # literal. A synthetic version.ref line points at a [versions] key
+            # this alias does not have.
+            header = f"# Update version on existing [{section}] alias {chosen!r}"
+            declaration = _rewrite_inline_catalog_declaration(
+                catalog_toml or "",
+                section,
+                chosen,
+                version,
+            )
+            if declaration is None:
+                suggested = header + "\n"
+                entry["tomlLine"] = None
+            else:
+                suggested = header + "\n" + declaration + "\n"
+                entry["tomlLine"] = declaration
             entry["updateKind"] = "inline_or_line_replace"
+            entry["versionRef"] = None
+            entry["versionLine"] = None
         entry["tomlSnippet"] = suggested
     else:
         entry["updateKind"] = "add"
