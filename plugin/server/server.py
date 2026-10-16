@@ -15110,31 +15110,50 @@ def _parse_single_invocation_gradle_output(
     """Parse the init-script dump (#401) into
     ``{module: {configuration: [(group, artifact, version), ...]}}``, a list of
     per-configuration resolution-error strings, the buildEnvironment classpath
-    GAVs, and an optional buildEnvironment error string."""
+    GAVs, and an optional buildEnvironment error string.
+
+    A module is committed only when ``===MAVEN_MCP_MODULE_END===`` is seen, and
+    buildenv GAVs only on ``===MAVEN_MCP_BUILDENV_END===``. A crash that leaves
+    a block unclosed drops that block's GAVs — including configs that already
+    reached CONFIG_END, and a later module marker that starts before the
+    previous MODULE_END — instead of treating the prefix as finished. A printed
+    CONFIG_ERROR / BUILDENV_ERROR line is still recorded; a truncated block
+    that printed no error marker does not invent one.
+    """
     modules: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {}
     errors: List[str] = []
     buildenv: List[Tuple[str, str, str]] = []
     buildenv_error: Optional[str] = None
 
-    current_module: Optional[str] = None
+    # Open blocks stay off the result until their END marker. Marker checks
+    # stay in this order: MODULE_END does not start with the module marker,
+    # and the error/end markers do not start with the start markers.
+    pending_module: Optional[str] = None
+    pending_configs: Dict[str, List[Tuple[str, str, str]]] = {}
     current_config: Optional[str] = None
+    pending_buildenv: List[Tuple[str, str, str]] = []
     in_buildenv = False
     for line in stdout.splitlines():
         if line.startswith(_INIT_MODULE):
-            current_module = line[len(_INIT_MODULE):].strip()
-            modules.setdefault(current_module, {})
+            pending_module = line[len(_INIT_MODULE):].strip()
+            pending_configs = {}
+            current_config = None
             continue
         if line.startswith(_INIT_MODULE_END):
-            current_module = None
+            if pending_module is not None:
+                modules[pending_module] = pending_configs
+            pending_module = None
+            pending_configs = {}
+            current_config = None
             continue
-        if line.startswith(_INIT_CONFIG) and current_module is not None:
+        if line.startswith(_INIT_CONFIG) and pending_module is not None:
             current_config = line[len(_INIT_CONFIG):].strip()
-            modules[current_module].setdefault(current_config, [])
+            pending_configs.setdefault(current_config, [])
             continue
         if line.startswith(_INIT_CONFIG_ERROR):
-            if current_module is not None and current_config is not None:
+            if pending_module is not None and current_config is not None:
                 msg = line[len(_INIT_CONFIG_ERROR):].strip()
-                errors.append(f"{current_module}:{current_config} resolution error: {msg}")
+                errors.append(f"{pending_module}:{current_config} resolution error: {msg}")
             continue
         if line.startswith(_INIT_CONFIG_END):
             current_config = None
@@ -15143,20 +15162,24 @@ def _parse_single_invocation_gradle_output(
             buildenv_error = line[len(_INIT_BUILDENV_ERROR):].strip()
             continue
         if line.startswith(_INIT_BUILDENV_END):
+            if in_buildenv:
+                buildenv.extend(pending_buildenv)
+            pending_buildenv = []
             in_buildenv = False
             continue
         if line.startswith(_INIT_BUILDENV):
+            pending_buildenv = []
             in_buildenv = True
             continue
         if in_buildenv:
             gav = _parse_gav_triplet(line)
             if gav:
-                buildenv.append(gav)
+                pending_buildenv.append(gav)
             continue
-        if current_module is not None and current_config is not None:
+        if pending_module is not None and current_config is not None:
             gav = _parse_gav_triplet(line)
             if gav:
-                modules[current_module][current_config].append(gav)
+                pending_configs[current_config].append(gav)
 
     return modules, errors, buildenv, buildenv_error
 
@@ -15189,7 +15212,11 @@ def _gradle_resolve_dependencies(project_root: str) -> Dict:
     modules, config_errors, buildenv_gavs, buildenv_error = _parse_single_invocation_gradle_output(stdout)
     errors.extend(config_errors)
 
-    invocation_failed = code != 0 and not modules
+    # Non-zero is a failed invocation even when a prefix of module markers
+    # parsed. The message is gradleErrors on a partial return and the raise
+    # detail otherwise. Exit 0 never sets partial, including a CONFIG_ERROR
+    # or a dump whose unclosed tail the parser dropped.
+    invocation_failed = code != 0
     if invocation_failed:
         msg = f"Gradle init-script invocation exited with code {code}"
         if stderr.strip():
@@ -15237,23 +15264,31 @@ def _gradle_resolve_dependencies(project_root: str) -> Dict:
 
     deduped = _dedupe_gradle_resolved_deps(collected)
     production_count = _count_production_runtime_deps(deduped)
-    if production_count == 0:
+    # The no-production sentences describe an exit-0 result. A non-zero exit
+    # already names the invocation on errors. The catalog-fallback note stays
+    # so a failed resolve is not described as a missing variant.
+    if production_count == 0 and invocation_failed:
+        notes.append("All Gradle dependency tasks failed.")
+    elif production_count == 0:
         if deduped:
             errors.append(
                 "No production runtime dependencies resolved; only build classpath/"
                 + "plugin dependencies were found"
             )
-        elif invocation_failed:
-            notes.append("All Gradle dependency tasks failed.")
         elif not errors:
             notes.append("No production configurations resolved; project may lack applicable variants.")
 
-    return {
+    result: Dict[str, Any] = {
         "dependencies": deduped,
         "notes": notes,
         "errors": errors,
         "productionCount": production_count,
     }
+    # Returned prefix only: a finished module produced a production runtime
+    # dependency, and the invocation still failed. Omit the key otherwise.
+    if invocation_failed and production_count > 0:
+        result["partial"] = True
+    return result
 
 
 def _collect_gradle_provenance(project_root: str) -> Dict:
@@ -15658,6 +15693,8 @@ def scan_project(project_root: str) -> Dict:
             result["resolvedBy"] = "gradle"
         if resolved.get("errors"):
             result["gradleErrors"] = resolved["errors"]
+        if resolved.get("partial"):
+            result["partial"] = resolved["partial"]
         return result
 
     elif build_system == "maven":
@@ -15729,6 +15766,8 @@ def flatten_scan_result(scan: Dict) -> Dict:
         result["notes"] = scan["notes"]
     if scan.get("gradleErrors"):
         result["gradleErrors"] = scan["gradleErrors"]
+    if scan.get("partial"):
+        result["partial"] = scan["partial"]
     return result
 
 
@@ -16820,11 +16859,15 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         out["licenses"] = licenses_section
     if new_license_categories is not None:
         out["newLicenseCategories"] = new_license_categories
+    # Forward even when the scan is not partial (exit-0 CONFIG_ERROR). The
+    # deadline note below stays the deadline sentence; a Gradle failure stays
+    # on gradleErrors. If both fire, partial stays true. A successful scan
+    # with neither gradleErrors nor a deadline stays byte-for-byte unchanged.
+    if scan.get("gradleErrors"):
+        out["gradleErrors"] = list(scan["gradleErrors"])
+    if scan.get("partial"):
+        out["partial"] = True
     if resolution_failed:
-        # Copied only on the failed-resolution path. A successful Gradle scan
-        # stays byte-for-byte unchanged, including the deadline assignment below.
-        if scan.get("gradleErrors"):
-            out["gradleErrors"] = list(scan["gradleErrors"])
         resolution_notes = list(scan.get("notes") or [])
         if deadline_hit:
             out["partial"] = True
