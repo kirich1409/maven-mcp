@@ -62,6 +62,19 @@ def _license(name):
     return f"<licenses><license><name>{name}</name></license></licenses>"
 
 
+def _between(out, src, dst):
+    src_ids = [i for i, node in enumerate(out["nodes"]) if node["artifactId"] == src]
+    dst_ids = [i for i, node in enumerate(out["nodes"]) if node["artifactId"] == dst]
+    return [
+        edge for edge in out["edges"]
+        if edge["from"] in src_ids and edge["to"] in dst_ids
+    ]
+
+
+def _names(out):
+    return [node["artifactId"] for node in out["nodes"]]
+
+
 def _ga(nodes):
     return [(n["groupId"], n["artifactId"], n["version"], n["relation"]) for n in nodes]
 
@@ -975,6 +988,493 @@ class PomGraphTest(unittest.TestCase):
         })
         self.assertIn("evil", [n["artifactId"] for n in out["nodes"]])
         self.assertIn(("com.example", "evil", "1.0"), calls)
+
+    def test_later_promoted_optional_replaces_same_depth_version(self):
+        # Both shared edges are depth 2. The later promotion must win, and the
+        # shallower deep → opt edge must still be recorded.
+        shared_1 = _pom("shared", "1.0", _deps(_dep("com.example", "from1", "1.0")))
+        shared_2 = _pom("shared", "2.0", _deps(_dep("com.example", "from2", "1.0")))
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "shared", "1.0"),
+            )),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "shared", "2.0"),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+            )),
+            ("com.example", "shared", "1.0"): shared_1,
+            ("com.example", "shared", "2.0"): shared_2,
+            ("com.example", "from1", "1.0"): _pom("from1", "1.0"),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+        })
+        shared = next(node for node in out["nodes"] if node["artifactId"] == "shared")
+        self.assertEqual(shared["version"], "2.0")
+        self.assertNotIn("from1", _names(out))
+        self.assertIn("from2", _names(out))
+        self.assertIn(("com.example", "shared", "2.0"), calls)
+        opt_edges = _between(out, "opt", "shared")
+        self.assertEqual([edge["requirement"] for edge in opt_edges], ["2.0"])
+        deep_edges = _between(out, "deep", "opt")
+        self.assertEqual([edge["requirement"] for edge in deep_edges], ["1.0"])
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_later_promotion_drops_already_created_loser_expansion(self):
+        # One hop longer than far → opt, so from1child exists before promotion.
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "shared", "1.0"),
+            )),
+            ("com.example", "shared", "1.0"): _pom("shared", "1.0", _deps(
+                _dep("com.example", "from1", "1.0"),
+            )),
+            ("com.example", "from1", "1.0"): _pom("from1", "1.0", _deps(
+                _dep("com.example", "from1child", "1.0"),
+            )),
+            ("com.example", "from1child", "1.0"): _pom("from1child", "1.0"),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "shared", "2.0"),
+            )),
+            ("com.example", "shared", "2.0"): _pom("shared", "2.0", _deps(
+                _dep("com.example", "from2", "1.0"),
+            )),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "far", "1.0"),
+            )),
+            ("com.example", "far", "1.0"): _pom("far", "1.0", _deps(
+                _dep("com.example", "farther", "1.0"),
+            )),
+            ("com.example", "farther", "1.0"): _pom("farther", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+            )),
+        })
+        names = _names(out)
+        self.assertNotIn("from1", names)
+        self.assertNotIn("from1child", names)
+        self.assertIn("from2", names)
+        shared = next(node for node in out["nodes"] if node["artifactId"] == "shared")
+        self.assertEqual(shared["version"], "2.0")
+        self.assertIn(("com.example", "shared", "2.0"), calls)
+        for edge in out["edges"]:
+            self.assertNotIn(out["nodes"][edge["from"]]["artifactId"], ("from1", "from1child"))
+            self.assertNotIn(out["nodes"][edge["to"]]["artifactId"], ("from1", "from1child"))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_later_required_path_restores_omitted_child(self):
+        lib = _pom("lib", "1.0", _deps(
+            _dep("com.example", "evil", "1.0"),
+            _dep("com.example", "kept", "1.0"),
+        ))
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "near", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "near", "1.0"): _pom("near", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("com.example", "evil")]),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "lib", "1.0"),
+            )),
+            ("com.example", "lib", "1.0"): lib,
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+        })
+        self.assertIn("evil", _names(out))
+        self.assertIn("kept", _names(out))
+        self.assertIn(("com.example", "evil", "1.0"), calls)
+        self.assertEqual(len(_between(out, "lib", "kept")), 1)
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_promoted_optional_restores_omitted_child(self):
+        lib = _pom("lib", "1.0", _deps(
+            _dep("com.example", "evil", "1.0"),
+            _dep("com.example", "kept", "1.0"),
+        ))
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("com.example", "evil")]),
+            )),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "lib", "1.0"),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+            )),
+            ("com.example", "lib", "1.0"): lib,
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+        })
+        self.assertIn("evil", _names(out))
+        self.assertIn("kept", _names(out))
+        self.assertIn(("com.example", "evil", "1.0"), calls)
+        self.assertEqual(len(_between(out, "lib", "kept")), 1)
+        self.assertEqual(
+            [edge["requirement"] for edge in _between(out, "deep", "opt")],
+            ["1.0"],
+        )
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_dropped_same_depth_intro_keeps_deeper_version_and_omits_orphan(self):
+        # Root order records the deeper kept:2.0 introduction before promotion.
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "side", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "shared", "1.0"),
+            )),
+            ("com.example", "shared", "1.0"): _pom("shared", "1.0", _deps(
+                _dep("com.example", "onlyfrom1", "1.0"),
+                _dep("com.example", "kept", "1.0"),
+            )),
+            ("com.example", "onlyfrom1", "1.0"): _pom("onlyfrom1", "1.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+            ("com.example", "side", "1.0"): _pom("side", "1.0", _deps(
+                _dep("com.example", "side2", "1.0"),
+            )),
+            ("com.example", "side2", "1.0"): _pom("side2", "1.0", _deps(
+                _dep("com.example", "side3", "1.0"),
+            )),
+            ("com.example", "side3", "1.0"): _pom("side3", "1.0", _deps(
+                _dep("com.example", "kept", "2.0"),
+            )),
+            ("com.example", "kept", "2.0"): _pom("kept", "2.0"),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "shared", "2.0"),
+            )),
+            ("com.example", "shared", "2.0"): _pom("shared", "2.0", _deps(
+                _dep("com.example", "from2", "1.0"),
+            )),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "far", "1.0"),
+            )),
+            ("com.example", "far", "1.0"): _pom("far", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+            )),
+        })
+        shared = next(node for node in out["nodes"] if node["artifactId"] == "shared")
+        kept = next(node for node in out["nodes"] if node["artifactId"] == "kept")
+        self.assertEqual(shared["version"], "2.0")
+        self.assertIn(("com.example", "shared", "2.0"), calls)
+        self.assertNotIn("onlyfrom1", _names(out))
+        self.assertFalse(any(
+            out["nodes"][edge["to"]]["artifactId"] == "onlyfrom1"
+            or out["nodes"][edge["from"]]["artifactId"] == "onlyfrom1"
+            for edge in out["edges"]
+        ))
+        self.assertEqual(kept["version"], "1.0")
+        self.assertNotIn(("com.example", "kept", "2.0"), calls)
+        self.assertIn("from2", _names(out))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_deeper_unwalked_same_depth_higher_version_replaces(self):
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "optA", "1.0", optional=True),
+                _dep("com.example", "near", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "optA", "1.0"): _pom("optA", "1.0", _deps(
+                _dep("com.example", "late", "2.0"),
+            )),
+            ("com.example", "late", "2.0"): _pom("late", "2.0", _deps(
+                _dep("com.example", "from2", "1.0"),
+            )),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+            ("com.example", "near", "1.0"): _pom("near", "1.0", _deps(
+                _dep("com.example", "late", "1.0", optional=True),
+            )),
+            ("com.example", "late", "1.0"): _pom("late", "1.0", _deps(
+                _dep("com.example", "from1", "1.0"),
+            )),
+            ("com.example", "from1", "1.0"): _pom("from1", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "optA", "1.0"),
+            )),
+        })
+        late = next(node for node in out["nodes"] if node["artifactId"] == "late")
+        self.assertEqual(late["version"], "2.0")
+        self.assertIn("from2", _names(out))
+        self.assertNotIn("from1", _names(out))
+        self.assertIn(("com.example", "late", "2.0"), calls)
+        self.assertEqual(
+            [edge["requirement"] for edge in _between(out, "near", "late")],
+            ["2.0"],
+        )
+        self.assertEqual(
+            [edge["requirement"] for edge in _between(out, "optA", "late")],
+            ["2.0"],
+        )
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_required_intro_walks_deeper_unwalked_node(self):
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "optA", "1.0", optional=True),
+                _dep("com.example", "near", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "optA", "1.0"): _pom("optA", "1.0", _deps(
+                _dep("com.example", "late", "1.0"),
+            )),
+            ("com.example", "near", "1.0"): _pom("near", "1.0", _deps(
+                _dep("com.example", "late", "1.0", optional=True),
+            )),
+            ("com.example", "late", "1.0"): _pom("late", "1.0", _deps(
+                _dep("com.example", "latechild", "1.0"),
+            )),
+            ("com.example", "latechild", "1.0"): _pom("latechild", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "optA", "1.0"),
+            )),
+        })
+        late = next(node for node in out["nodes"] if node["artifactId"] == "late")
+        self.assertIn("latechild", _names(out))
+        self.assertIn(("com.example", "latechild", "1.0"), calls)
+        self.assertEqual(
+            [edge["requirement"] for edge in _between(out, "optA", "late")],
+            [late["version"]],
+        )
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_restored_child_is_mediated_at_node_depth(self):
+        # deep also depends on evil:2.0. Mediating the restored 1.0 at the
+        # caller frontier would keep 1.0 and fetch the loser.
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("com.example", "evil")]),
+            )),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "lib", "1.0"),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+                _dep("com.example", "evil", "2.0"),
+            )),
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0", _deps(
+                _dep("com.example", "evil", "1.0"),
+                _dep("com.example", "kept", "1.0"),
+            )),
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("com.example", "evil", "2.0"): _pom("evil", "2.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+        })
+        evil = next(node for node in out["nodes"] if node["artifactId"] == "evil")
+        self.assertEqual(evil["version"], "2.0")
+        self.assertNotIn(("com.example", "evil", "1.0"), calls)
+        self.assertIn(("com.example", "evil", "2.0"), calls)
+        self.assertIn("kept", _names(out))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_reverse_promoted_optional_keeps_nearer_higher_version(self):
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "opt", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "shared", "2.0"),
+            )),
+            ("com.example", "shared", "2.0"): _pom("shared", "2.0", _deps(
+                _dep("com.example", "from2", "1.0"),
+            )),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+            ("com.example", "opt", "1.0"): _pom("opt", "1.0", _deps(
+                _dep("com.example", "shared", "1.0"),
+            )),
+            ("com.example", "shared", "1.0"): _pom("shared", "1.0", _deps(
+                _dep("com.example", "from1", "1.0"),
+            )),
+            ("com.example", "from1", "1.0"): _pom("from1", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "opt", "1.0"),
+            )),
+        })
+        shared = next(node for node in out["nodes"] if node["artifactId"] == "shared")
+        self.assertEqual(shared["version"], "2.0")
+        self.assertNotIn(("com.example", "shared", "1.0"), calls)
+        self.assertNotIn("from1", _names(out))
+        self.assertIn("from2", _names(out))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_later_excluding_path_keeps_already_emitted_child(self):
+        lib = _pom("lib", "1.0", _deps(
+            _dep("com.example", "evil", "1.0"),
+            _dep("com.example", "kept", "1.0"),
+        ))
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "near", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "near", "1.0"): _pom("near", "1.0", _deps(
+                _dep("com.example", "lib", "1.0"),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("com.example", "evil")]),
+            )),
+            ("com.example", "lib", "1.0"): lib,
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+        })
+        self.assertIn("evil", _names(out))
+        self.assertIn(("com.example", "evil", "1.0"), calls)
+        self.assertIn("kept", _names(out))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_non_shared_exclusion_tuples_still_omit(self):
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "near", "1.0"),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "near", "1.0"): _pom("near", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("com.example", "*")]),
+            )),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "deep", "1.0"),
+            )),
+            ("com.example", "deep", "1.0"): _pom("deep", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", exclusions=[("*", "evil")]),
+            )),
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0", _deps(
+                _dep("com.example", "evil", "1.0"),
+                _dep("org.other", "kept", "1.0"),
+            )),
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("org.other", "kept", "1.0"): _pom("kept", "1.0", group="org.other"),
+        })
+        self.assertNotIn("evil", _names(out))
+        self.assertNotIn(("com.example", "evil", "1.0"), calls)
+        self.assertIn("kept", _names(out))
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
+
+    def test_deleted_required_intro_keeps_optional_node_and_child(self):
+        # Optional lib is recorded first. The required introduction is deleted
+        # with shared:1.0. lib stays optional; kept, already emitted, stays.
+        # Do not reopen and do not fall back to the optional pattern pool.
+        out, calls = self._resolve("com.example", "root", "1.0", {
+            ("com.example", "root", "1.0"): _pom("root", "1.0", _deps(
+                _dep("com.example", "optparent", "1.0"),
+                _dep("com.example", "a", "1.0"),
+                _dep("com.example", "promo", "1.0", optional=True),
+                _dep("com.example", "mid", "1.0"),
+            )),
+            ("com.example", "optparent", "1.0"): _pom("optparent", "1.0", _deps(
+                _dep("com.example", "lib", "1.0", optional=True),
+            )),
+            ("com.example", "a", "1.0"): _pom("a", "1.0", _deps(
+                _dep("com.example", "shared", "1.0"),
+            )),
+            ("com.example", "shared", "1.0"): _pom("shared", "1.0", _deps(
+                _dep(
+                    "com.example", "lib", "1.0",
+                    exclusions=[("com.example", "evil")],
+                ),
+            )),
+            ("com.example", "lib", "1.0"): _pom("lib", "1.0", _deps(
+                _dep("com.example", "evil", "1.0"),
+                _dep("com.example", "kept", "1.0"),
+            )),
+            ("com.example", "evil", "1.0"): _pom("evil", "1.0"),
+            ("com.example", "kept", "1.0"): _pom("kept", "1.0"),
+            ("com.example", "promo", "1.0"): _pom("promo", "1.0", _deps(
+                _dep("com.example", "shared", "2.0"),
+            )),
+            ("com.example", "shared", "2.0"): _pom("shared", "2.0", _deps(
+                _dep("com.example", "from2", "1.0"),
+            )),
+            ("com.example", "from2", "1.0"): _pom("from2", "1.0"),
+            ("com.example", "mid", "1.0"): _pom("mid", "1.0", _deps(
+                _dep("com.example", "d1", "1.0"),
+            )),
+            ("com.example", "d1", "1.0"): _pom("d1", "1.0", _deps(
+                _dep("com.example", "d2", "1.0"),
+            )),
+            ("com.example", "d2", "1.0"): _pom("d2", "1.0", _deps(
+                _dep("com.example", "promo", "1.0"),
+            )),
+        })
+        shared = next(node for node in out["nodes"] if node["artifactId"] == "shared")
+        self.assertEqual(shared["version"], "2.0")
+        self.assertIn(("com.example", "shared", "2.0"), calls)
+        self.assertIn("from2", _names(out))
+        self.assertIn("lib", _names(out))
+        self.assertEqual(len(_between(out, "optparent", "lib")), 1)
+        self.assertIn("kept", _names(out))
+        self.assertNotIn("evil", _names(out))
+        self.assertNotIn(("com.example", "evil", "1.0"), calls)
+        self.assertFalse(out["partial"])
+        self.assertIsNone(out["error"])
 
     def _write_under(self, directory, name, text):
         directory.mkdir(parents=True, exist_ok=True)
