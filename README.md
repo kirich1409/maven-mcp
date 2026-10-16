@@ -35,6 +35,7 @@ Version lookups use the repositories the build file declares. Maven Central, Goo
 | `verify_coordinates` | Tri-state existence check + did-you-mean for hallucinated coordinates |
 | `get_eol_status` | End-of-life / support status for JDK (vendor-specific), Kotlin, Gradle, and Spring Boot via endoflife.date |
 | `compare_upgrade_closure` | Compare an upgrade's closure. Gradle when a wrapper exists; the POM graph is the single-upgrade path |
+| `get_aar_sdk_requirements` | Read an AAR's compileSdk / minSdk floor without downloading the whole archive |
 
 ### Skills
 

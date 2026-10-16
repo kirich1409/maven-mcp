@@ -186,7 +186,7 @@ class McpJsonLaunchTest(unittest.TestCase):
                 msg = json.loads(line)
                 responses[msg.get("id")] = msg
         self.assertEqual(responses[1]["result"]["serverInfo"]["name"], "maven-mcp")
-        self.assertEqual(len(responses[2]["result"]["tools"]), 21)
+        self.assertEqual(len(responses[2]["result"]["tools"]), 22)
 
 
 if __name__ == "__main__":

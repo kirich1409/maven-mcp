@@ -498,6 +498,16 @@ _FIXTURES = {
             "Graphs are resolved per root in isolation from published POMs — not a full Maven/Gradle project resolve.",
         ],
     },
+    "get_aar_sdk_requirements": {
+        "groupId": "androidx.core",
+        "artifactId": "core-ktx",
+        "version": "1.19.1",
+        "requiresCompileSdk": 37,
+        "requiresMinSdk": 24,
+        "projectCompileSdk": 36,
+        "projectMinSdk": 23,
+        "note": "project SDK is not a literal integer",
+    },
 }
 
 

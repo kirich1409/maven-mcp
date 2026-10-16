@@ -1930,6 +1930,11 @@ def _pom_url(base: str, group_id: str, artifact_id: str, version: str) -> str:
     return f"{base.rstrip('/')}/{gp}/{artifact_id}/{version}/{artifact_id}-{version}.pom"
 
 
+def _aar_url(base: str, group_id: str, artifact_id: str, version: str) -> str:
+    gp = group_path(group_id)
+    return f"{base.rstrip('/')}/{gp}/{artifact_id}/{version}/{artifact_id}-{version}.aar"
+
+
 class ResolutionContext:
     """Repository-resolution context built ONCE at the handler boundary and
     threaded down to every resolver. ``scoped_repos`` is the
@@ -2331,10 +2336,12 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
     version sets are unioned, deduped and sorted ascending so a private repo's
     extra versions are not lost to a first-hit short-circuit (#311); ``lastUpdated``
     carries the most-recent value across answering repos. If NO repo answers (all
-    404/error) a ``ValueError`` is raised with the same message as the legacy
-    first-hit code, so unwrapped callers keep working. The single-repo result is
-    identical to the legacy path (union/sort of one ascending set = itself).
-    Intentionally diverges from the retired TS ``resolveAll``: no proxy-dedup."""
+    404/error) a ``ValueError`` is raised. One queried repo keeps the legacy
+    clause; more than one names every queried repo, joined with ``"; "``. An
+    empty repo list keeps the offline / content-filter messages. The single-repo
+    result is identical to the legacy path (union/sort of one ascending set =
+    itself). Intentionally diverges from the retired TS ``resolveAll``: no
+    proxy-dedup."""
     repos = _repos_for(group_id, artifact_id, ctx)
     merged_versions: List[str] = []
     last_updated: Optional[str] = None
@@ -2357,6 +2364,10 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             )
     else:
         last_err = None
+    # One clause per queried repo that did not answer 200, in _repos_for order.
+    # A single clause stays byte-identical to the previous last_err overwrite.
+    # Joined with "; " only when more than one repo was queried and none answered.
+    miss_clauses: List[str] = []
     # First repo (in _repos_for order: declared repos before any public-fallback
     # append) that answers 200 — surfaced as resolvedFrom for #317 provenance.
     resolved_from: Optional[Dict[str, Any]] = None
@@ -2377,10 +2388,12 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             if tool_deadline is not None and _now() >= tool_deadline:
                 # A later repository was never tried. Name the one we stopped on
                 # instead of a deadline-only phrase (#41). Do not publish a
-                # probe label: this GET is not sent.
-                if last_err:
+                # probe label: this GET is not sent. Prior miss clauses stay
+                # in the message so a 404 still names every repo that was asked.
+                prior = "; ".join(miss_clauses)
+                if prior:
                     last_err = (
-                        f"{last_err}; skipped {name} after the "
+                        f"{prior}; skipped {name} after the "
                         f"{TOOL_DEADLINE}s tool deadline"
                     )
                 else:
@@ -2393,7 +2406,7 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             if tool_deadline is not None:
                 remembered = _repo_failure_lookup(url)
                 if remembered is not None:
-                    last_err = remembered
+                    miss_clauses.append(remembered)
                     continue
             # Publish only once the request is about to be sent.
             _note_repo_probe(name, index + 1 < len(repos))
@@ -2414,13 +2427,14 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
                 # scheme://user:pass@host URL, not a credential fragment embedded in
                 # free text). Build the message from known-safe components instead:
                 # the exception type name plus the already-redacted repo name.
-                last_err = f"{type(e).__name__} from {name}"
+                clause = f"{type(e).__name__} from {name}"
+                miss_clauses.append(clause)
                 if (
                     tool_deadline is not None
                     and not _untried_probe(e)
                     and isinstance(e, (urllib.error.URLError, socket.timeout))
                 ):
-                    _repo_failure_remember(url, last_err)
+                    _repo_failure_remember(url, clause)
                 continue
             if status in (200, 404):
                 _repo_failure_forget(url)
@@ -2440,15 +2454,22 @@ def fetch_metadata(group_id: str, artifact_id: str, ctx: "ResolutionContext") ->
             # Private/corporate repos reject unauthenticated (or wrong-cred)
             # probes with 401/403 — surface a clear "auth required" signal
             # rather than a bare HTTP code (#291). Never include secrets.
-            last_err = _auth_required_message(entry, status)
+            miss_clauses.append(_auth_required_message(entry, status))
         else:
-            last_err = f"HTTP {status} from {name}"
+            clause = f"HTTP {status} from {name}"
+            miss_clauses.append(clause)
             # 429 stays uncached (rate-limit must re-hit). 5xx is remembered
             # in memory only — FileCache.set still refuses it. A cached 404
             # is a definitive absence, not a failure to remember.
             if tool_deadline is not None and 500 <= status < 600:
-                _repo_failure_remember(url, last_err)
+                _repo_failure_remember(url, clause)
     if not answered:
+        # Empty `repos` keeps the two messages above byte-for-byte. A queried
+        # set joins every clause so a 404 names every repo that was asked, not
+        # only the last last_err. One queried repo stays byte-identical.
+        # A deadline break already composed last_err, including prior clauses.
+        if repos and last_err is None:
+            last_err = "; ".join(miss_clauses)
         raise ValueError(f"Could not fetch metadata for {group_id}:{artifact_id}: {last_err}")
     versions = sorted(set(merged_versions), key=functools.cmp_to_key(compare_versions))
     return {
@@ -2505,6 +2526,627 @@ def check_relocation(
     if pom is None:
         return None
     return extract_relocation_from_pom(pom, group_id, artifact_id, version)
+
+
+# ---------------------------------------------------------------------------
+# AAR SDK floors (get_aar_sdk_requirements)
+# ---------------------------------------------------------------------------
+# CheckAarMetadata reads minCompileSdk from
+# META-INF/com/android/build/gradle/aar-metadata.properties. minSdk is only on
+# the AAR AndroidManifest.xml. Do not download the archive through http_get:
+# that advertises gzip, inflates the body, and reads up to HTTP_MAX_RESPONSE_BYTES.
+# A Range request that advertises gzip is answered against the compressed
+# representation, not the zip. Identity encoding is required. A still-gzip
+# response is closed unread — never passed to _inflate_gzip_capped.
+
+_AAR_METADATA_NAME = "META-INF/com/android/build/gradle/aar-metadata.properties"
+_AAR_MANIFEST_NAME = "AndroidManifest.xml"
+# Exactly 64 KiB plus the 22-byte EOCD. Do not widen this tail or issue a
+# second, larger Range when the EOCD is not in it.
+_AAR_EOCD_TAIL_BYTES = 64 * 1024 + 22
+_AAR_CENTRAL_DIR_MAX_BYTES = 1024 * 1024
+_AAR_ENTRY_MAX_BYTES = 64 * 1024
+_AAR_LOCAL_HEADER_BYTES = 30
+_EOCD_SIG = b"PK\x05\x06"
+_CD_SIG = b"PK\x01\x02"
+_LOCAL_SIG = b"PK\x03\x04"
+
+_APP_PLUGIN_RE = re.compile(r"com\.android\.application(?![\w.])")
+_SDK_LITERAL_RE = re.compile(
+    r"\b(?P<key>compileSdkVersion|compileSdk|minSdkVersion|minSdk)\b"
+    r"\s*(?:=\s*)?"
+    r"(?:(?P<q>[\"'])(?P<qnum>\d+)(?P=q)|(?P<num>\d+))"
+    r"(?![\w.])"
+)
+_MIN_COMPILE_SDK_RE = re.compile(r"(?m)^minCompileSdk=(\d+)\s*$")
+_MANIFEST_MIN_SDK_RE = re.compile(
+    r"""android:minSdkVersion\s*=\s*["'](\d+)["']"""
+)
+_CONTENT_RANGE_RE = re.compile(
+    r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE
+)
+
+
+def _strip_gradle_comments(content: str) -> str:
+    """Drop ``//`` and ``/* */`` comments. Quoted strings are left intact."""
+    out: List[str] = []
+    i = 0
+    n = len(content)
+    while i < n:
+        c = content[i]
+        if c == '"' or c == "'":
+            end = _skip_string_literal(content, i)
+            out.append(content[i:end])
+            i = end
+            continue
+        if c == "/" and i + 1 < n and content[i + 1] == "/":
+            nl = content.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if c == "/" and i + 1 < n and content[i + 1] == "*":
+            end = content.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _sdk_literals_in(content: str) -> Dict[str, int]:
+    """Last literal ``compileSdk`` / ``minSdk`` assignment in ``content``.
+
+    Catalog accessors and ``.get().toInt()`` are not evaluated. A missing key
+    is omitted rather than invented."""
+    found: Dict[str, int] = {}
+    for match in _SDK_LITERAL_RE.finditer(_strip_gradle_comments(content)):
+        key = match.group("key")
+        canon = "compileSdk" if key.startswith("compile") else "minSdk"
+        raw = match.group("qnum") or match.group("num")
+        if not raw:
+            continue
+        found[canon] = int(raw)
+    return found
+
+
+def _is_android_application_file(content: str) -> bool:
+    return _APP_PLUGIN_RE.search(_strip_gradle_comments(content)) is not None
+
+
+def _iter_gradle_sdk_files(project_root: str) -> List[str]:
+    """Build files the scanner already walks, as absolute paths.
+
+    Root ``build.gradle[.kts]``, included modules, and convention-plugin
+    ``*.gradle.kts`` under ``buildSrc`` / ``build-logic``. No Gradle evaluator.
+    """
+    paths: List[str] = []
+    seen = set()
+
+    def add(path: str) -> None:
+        if path in seen or not os.path.isfile(path):
+            return
+        seen.add(path)
+        paths.append(path)
+
+    settings_content = ""
+    for name in GRADLE_SETTINGS_FILES:
+        settings_path = os.path.join(project_root, name)
+        if os.path.isfile(settings_path):
+            settings_content = _read_build_file(settings_path)
+            break
+    for module_path in _parse_settings_modules(settings_content) if settings_content else []:
+        dir_path = _module_path_to_dir(project_root, module_path)
+        for build_file in GRADLE_BUILD_FILES:
+            candidate = os.path.join(dir_path, build_file)
+            if os.path.isfile(candidate):
+                add(candidate)
+                break
+    for build_file in GRADLE_BUILD_FILES:
+        candidate = os.path.join(project_root, build_file)
+        if os.path.isfile(candidate):
+            add(candidate)
+            break
+
+    def add_convention(src_kotlin_dir: str) -> None:
+        if not os.path.isdir(src_kotlin_dir):
+            return
+        for dirpath, _dirnames, filenames in os.walk(src_kotlin_dir):
+            for name in sorted(filenames):
+                if name.endswith(".gradle.kts"):
+                    add(os.path.join(dirpath, name))
+
+    buildsrc = os.path.join(project_root, "buildSrc")
+    if os.path.isdir(buildsrc):
+        for build_file in GRADLE_BUILD_FILES:
+            candidate = os.path.join(buildsrc, build_file)
+            if os.path.isfile(candidate):
+                add(candidate)
+                break
+        add_convention(os.path.join(buildsrc, "src", "main", "kotlin"))
+    build_logic = os.path.join(project_root, "build-logic")
+    if os.path.isdir(build_logic):
+        for sub in sorted(os.listdir(build_logic)):
+            sub_dir = os.path.join(build_logic, sub)
+            if not os.path.isdir(sub_dir):
+                continue
+            for build_file in GRADLE_BUILD_FILES:
+                candidate = os.path.join(sub_dir, build_file)
+                if os.path.isfile(candidate):
+                    add(candidate)
+                    break
+            add_convention(os.path.join(sub_dir, "src", "main", "kotlin"))
+    return paths
+
+
+def _project_sdk_literals(project_root: str) -> Dict[str, Optional[int]]:
+    """Minimum literal SDK across application modules. Library modules do not
+    fill a missing application literal."""
+    compile_vals: List[int] = []
+    min_vals: List[int] = []
+    for path in _iter_gradle_sdk_files(project_root):
+        content = _read_build_file(path)
+        if not _is_android_application_file(content):
+            continue
+        literals = _sdk_literals_in(content)
+        if "compileSdk" in literals:
+            compile_vals.append(literals["compileSdk"])
+        if "minSdk" in literals:
+            min_vals.append(literals["minSdk"])
+    return {
+        "compileSdk": min(compile_vals) if compile_vals else None,
+        "minSdk": min(min_vals) if min_vals else None,
+    }
+
+
+def _pom_packaging(pom_xml: str) -> Optional[str]:
+    """Project ``<packaging>``, or None when the tag is absent.
+
+    Dependency and profile containers are stripped first so a nested tag is
+    not the project's packaging. Absent packaging is not treated as jar —
+    the caller still tries the ``.aar`` URL."""
+    xml = _strip_xml_comments(pom_xml)
+    for tag in ("dependencies", "dependencyManagement", "build", "profiles"):
+        xml = re.sub(r"<" + tag + r">[\s\S]*?</" + tag + r">", "", xml)
+    match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", xml)
+    if not match:
+        return None
+    return match.group(1).strip().lower()
+
+
+def _aar_request_headers(entry: Dict[str, Any]) -> Dict[str, str]:
+    """Identity encoding plus the Authorization ``_repo_request_headers`` would add.
+
+    Do not call ``_repo_request_headers``: it calls ``_make_headers()`` with no
+    extra, which advertises gzip before the request is sent."""
+    headers = _make_headers({"Accept-Encoding": "identity"})
+    creds = resolve_repo_credentials(entry)
+    if creds:
+        headers["Authorization"] = _authorization_header(creds)
+    return headers
+
+
+def _close_http_response(resp: Any) -> None:
+    close = getattr(resp, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _content_length_within(resp: Any, bound: int) -> Optional[int]:
+    """Non-negative Content-Length within ``bound``, else None.
+
+    Missing, non-integer, and oversized lengths are the same refusal: the body
+    must not be read to discover its size."""
+    raw = _response_header(resp, "Content-Length")
+    if not raw:
+        return None
+    try:
+        length = int(raw)
+    except ValueError:
+        return None
+    if length < 0 or length > bound:
+        return None
+    return length
+
+
+def _bounded_repo_get(
+    entry: Dict[str, Any],
+    url: str,
+    bound: int,
+    range_header: str,
+) -> Optional[Tuple[int, bytes, str]]:
+    """GET ``url`` with ``Range``. Read only a non-gzip 200/206 whose
+    Content-Length is present and within ``bound``.
+
+    Anything else is closed unread. Never uses ``http_get``,
+    ``_request_with_retry``, ``_read_response_body``, or ``_inflate_gzip_capped``.
+    """
+    headers = _aar_request_headers(entry)
+    headers["Range"] = range_header
+    req = urllib.request.Request(url, headers=headers)
+    resp: Any = None
+    try:
+        try:
+            resp = _urlopen(req, HTTP_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            resp = exc
+        except Exception:
+            return None
+        status = getattr(resp, "status", None)
+        if status is None:
+            status = getattr(resp, "code", None)
+        if status not in (200, 206):
+            return None
+        encoding = _response_header(resp, "Content-Encoding").lower()
+        if encoding and encoding != "identity":
+            return None
+        length = _content_length_within(resp, bound)
+        if length is None:
+            return None
+        body = resp.read(length)
+        if not isinstance(body, bytes) or len(body) > bound:
+            return None
+        return int(status), body, _response_header(resp, "Content-Range")
+    finally:
+        if resp is not None:
+            _close_http_response(resp)
+
+
+def _parse_eocd(data: bytes) -> Optional[Tuple[int, int]]:
+    """Return (central-directory size, offset) when an EOCD ends ``data``.
+
+    Zip64 (0xFFFFFFFF size or offset) is a stop, not a wider read."""
+    pos = len(data)
+    while True:
+        idx = data.rfind(_EOCD_SIG, 0, pos)
+        if idx < 0 or idx + 22 > len(data):
+            return None
+        comment_len = int.from_bytes(data[idx + 20:idx + 22], "little")
+        if idx + 22 + comment_len == len(data):
+            cd_size = int.from_bytes(data[idx + 12:idx + 16], "little")
+            cd_offset = int.from_bytes(data[idx + 16:idx + 20], "little")
+            if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+                return None
+            return cd_size, cd_offset
+        pos = idx
+        if pos == 0:
+            return None
+
+
+def _parse_central_directory(cd: bytes) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    i = 0
+    n = len(cd)
+    while i + 46 <= n and cd[i:i + 4] == _CD_SIG:
+        method = int.from_bytes(cd[i + 10:i + 12], "little")
+        comp_size = int.from_bytes(cd[i + 20:i + 24], "little")
+        name_len = int.from_bytes(cd[i + 28:i + 30], "little")
+        extra_len = int.from_bytes(cd[i + 30:i + 32], "little")
+        comment_len = int.from_bytes(cd[i + 32:i + 34], "little")
+        local_offset = int.from_bytes(cd[i + 42:i + 46], "little")
+        if i + 46 + name_len > n:
+            break
+        name = cd[i + 46:i + 46 + name_len].decode("utf-8", "replace")
+        entries.append({
+            "name": name,
+            "method": method,
+            "comp_size": comp_size,
+            "local_offset": local_offset,
+        })
+        step = 46 + name_len + extra_len + comment_len
+        if step <= 0:
+            break
+        i += step
+    return entries
+
+
+def _inflate_zip_deflate(data: bytes, cap: int) -> Optional[bytes]:
+    """Inflate a zip method-8 (raw deflate) entry, capped at ``cap``.
+
+    This is not a license to inflate a gzip HTTP body. The window bits are
+    raw deflate (``-MAX_WBITS``), not gzip."""
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    try:
+        out = decompressor.decompress(data, cap + 1)
+        while decompressor.unconsumed_tail and len(out) <= cap:
+            out += decompressor.decompress(
+                decompressor.unconsumed_tail, cap + 1 - len(out)
+            )
+        if len(out) <= cap:
+            rest = decompressor.flush()
+            if len(out) + len(rest) > cap:
+                return None
+            out += rest
+    except zlib.error:
+        return None
+    if len(out) > cap:
+        return None
+    return out
+
+
+def _decode_zip_entry(data: bytes, method: int) -> Optional[bytes]:
+    if len(data) > _AAR_ENTRY_MAX_BYTES:
+        return None
+    if method == 0:
+        return data
+    if method == 8:
+        return _inflate_zip_deflate(data, _AAR_ENTRY_MAX_BYTES)
+    return None
+
+
+def _entry_payload_from_blob(
+    blob: bytes, local_offset: int, comp_size: int, method: int
+) -> Optional[bytes]:
+    if (
+        comp_size < 0
+        or comp_size > _AAR_ENTRY_MAX_BYTES
+        or local_offset < 0
+        or local_offset + _AAR_LOCAL_HEADER_BYTES > len(blob)
+    ):
+        return None
+    if blob[local_offset:local_offset + 4] != _LOCAL_SIG:
+        return None
+    name_len = int.from_bytes(blob[local_offset + 26:local_offset + 28], "little")
+    extra_len = int.from_bytes(blob[local_offset + 28:local_offset + 30], "little")
+    data_off = local_offset + _AAR_LOCAL_HEADER_BYTES + name_len + extra_len
+    if data_off < 0 or data_off + comp_size > len(blob):
+        return None
+    return _decode_zip_entry(blob[data_off:data_off + comp_size], method)
+
+
+def _texts_from_complete_zip(blob: bytes) -> Optional[Dict[str, Optional[bytes]]]:
+    parsed = _parse_eocd(blob)
+    if not parsed:
+        return None
+    cd_size, cd_offset = parsed
+    if (
+        cd_size < 0
+        or cd_size > _AAR_CENTRAL_DIR_MAX_BYTES
+        or cd_offset < 0
+        or cd_offset + cd_size > len(blob)
+    ):
+        return None
+    entries = _parse_central_directory(blob[cd_offset:cd_offset + cd_size])
+    out: Dict[str, Optional[bytes]] = {}
+    for name in (_AAR_METADATA_NAME, _AAR_MANIFEST_NAME):
+        match = next((item for item in entries if item["name"] == name), None)
+        if match is None or match["comp_size"] > _AAR_ENTRY_MAX_BYTES:
+            out[name] = None
+            continue
+        out[name] = _entry_payload_from_blob(
+            blob, match["local_offset"], match["comp_size"], match["method"]
+        )
+    return out
+
+
+def _content_range_span(value: str) -> Optional[Tuple[int, int, Optional[int]]]:
+    match = _CONTENT_RANGE_RE.match((value or "").strip())
+    if not match:
+        return None
+    total = None if match.group(3) == "*" else int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), total
+
+
+def _slice_absolute(
+    blob: bytes, blob_start: int, offset: int, length: int
+) -> Optional[bytes]:
+    if length < 0:
+        return None
+    rel = offset - blob_start
+    if rel < 0 or rel + length > len(blob):
+        return None
+    return blob[rel:rel + length]
+
+
+def _read_absolute_range(
+    entry: Dict[str, Any], url: str, start: int, length: int
+) -> Optional[bytes]:
+    """Range-read exactly ``length`` bytes at ``start``. ``length`` is the bound.
+
+    A 200 whose body is larger than ``length`` is already refused by
+    ``_bounded_repo_get``. A 200 is accepted only when ``start`` is 0, because
+    that response is the whole resource, not a slice from a non-zero offset.
+    """
+    if length < 0 or length > _AAR_CENTRAL_DIR_MAX_BYTES or start < 0:
+        return None
+    if length == 0:
+        return b""
+    end = start + length - 1
+    got = _bounded_repo_get(entry, url, length, f"bytes={start}-{end}")
+    if got is None:
+        return None
+    status, body, content_range = got
+    if status == 200:
+        if start != 0:
+            return None
+        return body
+    span = _content_range_span(content_range)
+    if span is None or span[0] != start:
+        return None
+    if len(body) < length:
+        return None
+    return body[:length]
+
+
+def _member_from_ranges(
+    entry: Dict[str, Any],
+    url: str,
+    item: Dict[str, Any],
+    tail: bytes,
+    tail_start: int,
+) -> Optional[bytes]:
+    local_offset = item["local_offset"]
+    comp_size = item["comp_size"]
+    if not isinstance(local_offset, int) or not isinstance(comp_size, int):
+        return None
+    if comp_size > _AAR_ENTRY_MAX_BYTES or comp_size < 0 or local_offset < 0:
+        return None
+    header = _slice_absolute(tail, tail_start, local_offset, _AAR_LOCAL_HEADER_BYTES)
+    if header is None:
+        header = _read_absolute_range(entry, url, local_offset, _AAR_LOCAL_HEADER_BYTES)
+    if header is None or len(header) < _AAR_LOCAL_HEADER_BYTES or header[:4] != _LOCAL_SIG:
+        return None
+    name_len = int.from_bytes(header[26:28], "little")
+    extra_len = int.from_bytes(header[28:30], "little")
+    data_off = local_offset + _AAR_LOCAL_HEADER_BYTES + name_len + extra_len
+    data = _slice_absolute(tail, tail_start, data_off, comp_size)
+    if data is None:
+        data = _read_absolute_range(entry, url, data_off, comp_size)
+    if data is None or len(data) != comp_size:
+        return None
+    return _decode_zip_entry(data, item["method"])
+
+
+def _members_from_central_directory(
+    entry: Dict[str, Any],
+    url: str,
+    cd: bytes,
+    tail: bytes,
+    tail_start: int,
+) -> Dict[str, Optional[bytes]]:
+    entries = _parse_central_directory(cd)
+    out: Dict[str, Optional[bytes]] = {}
+    for name in (_AAR_METADATA_NAME, _AAR_MANIFEST_NAME):
+        match = next((item for item in entries if item["name"] == name), None)
+        if match is None:
+            out[name] = None
+            continue
+        out[name] = _member_from_ranges(entry, url, match, tail, tail_start)
+    return out
+
+
+def _read_aar_members(
+    entry: Dict[str, Any], url: str
+) -> Optional[Dict[str, Optional[bytes]]]:
+    """Read the two AAR metadata entries, or None when this repo yields no zip.
+
+    The EOCD tail bound is exactly ``_AAR_EOCD_TAIL_BYTES``. A missing EOCD
+    stops; there is no second, larger Range.
+    """
+    got = _bounded_repo_get(
+        entry, url, _AAR_EOCD_TAIL_BYTES, f"bytes=-{_AAR_EOCD_TAIL_BYTES}"
+    )
+    if got is None:
+        return None
+    status, body, content_range = got
+    if status == 200:
+        return _texts_from_complete_zip(body)
+    span = _content_range_span(content_range)
+    if span is None:
+        return None
+    start, _end, total = span
+    if start == 0 and total is not None and len(body) == total:
+        return _texts_from_complete_zip(body)
+    parsed = _parse_eocd(body)
+    if parsed is None:
+        return None
+    cd_size, cd_offset = parsed
+    if cd_size < 0 or cd_size > _AAR_CENTRAL_DIR_MAX_BYTES or cd_offset < 0:
+        return None
+    if cd_size == 0:
+        return {_AAR_METADATA_NAME: None, _AAR_MANIFEST_NAME: None}
+    cd_rel = cd_offset - start
+    if 0 <= cd_rel and cd_rel + cd_size <= len(body):
+        cd = body[cd_rel:cd_rel + cd_size]
+    else:
+        cd_bytes = _read_absolute_range(entry, url, cd_offset, cd_size)
+        if cd_bytes is None or len(cd_bytes) < cd_size:
+            return None
+        cd = cd_bytes[:cd_size]
+    return _members_from_central_directory(entry, url, cd, body, start)
+
+
+def _parse_min_compile_sdk(payload: Optional[bytes]) -> Optional[int]:
+    if not payload:
+        return None
+    text = payload.decode("utf-8", "replace")
+    match = _MIN_COMPILE_SDK_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _parse_manifest_min_sdk(payload: Optional[bytes]) -> Optional[int]:
+    if not payload:
+        return None
+    text = payload.decode("utf-8", "replace")
+    match = _MANIFEST_MIN_SDK_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def handle_get_aar_sdk_requirements(args: Dict) -> Any:
+    """Read AAR SDK floors for one confirmed candidate version.
+
+    Sets ``requiresCompileSdk`` / ``requiresMinSdk`` only when the AAR value is
+    a parsed integer strictly above the project's literal application-module
+    value. Never raises for a missing AAR, a missing entry, an unparsed SDK,
+    or a range read this server will not complete. Notes are static strings —
+    no exception text and no repository URL.
+    """
+    group_id = args["groupId"]
+    artifact_id = args["artifactId"]
+    version = args["version"]
+    result: Dict[str, Any] = {
+        "groupId": group_id,
+        "artifactId": artifact_id,
+        "version": version,
+    }
+    try:
+        ctx = build_resolution_context(args)
+        project_sdk = _project_sdk_literals(ctx.project_path)
+        if project_sdk["compileSdk"] is not None:
+            result["projectCompileSdk"] = project_sdk["compileSdk"]
+        if project_sdk["minSdk"] is not None:
+            result["projectMinSdk"] = project_sdk["minSdk"]
+
+        pom = fetch_pom(group_id, artifact_id, version, ctx)
+        if pom:
+            packaging = _pom_packaging(pom)
+            if packaging and packaging != "aar":
+                result["note"] = "artifact packaging is not aar"
+                return result
+
+        members: Optional[Dict[str, Optional[bytes]]] = None
+        for repo in _repos_for(group_id, artifact_id, ctx):
+            url = _aar_url(repo["url"], group_id, artifact_id, version)
+            try:
+                members = _read_aar_members(repo, url)
+            except Exception:
+                members = None
+            if members is not None:
+                break
+        if members is None:
+            result["note"] = "aar was not read"
+            return result
+
+        min_compile = _parse_min_compile_sdk(members.get(_AAR_METADATA_NAME))
+        manifest_min = _parse_manifest_min_sdk(members.get(_AAR_MANIFEST_NAME))
+        project_compile = project_sdk["compileSdk"]
+        project_min = project_sdk["minSdk"]
+        if (
+            min_compile is not None
+            and project_compile is not None
+            and min_compile > project_compile
+        ):
+            result["requiresCompileSdk"] = min_compile
+        if (
+            manifest_min is not None
+            and project_min is not None
+            and manifest_min > project_min
+        ):
+            result["requiresMinSdk"] = manifest_min
+        if "requiresCompileSdk" not in result and "requiresMinSdk" not in result:
+            if project_compile is None and project_min is None:
+                result["note"] = "project SDK is not a literal integer"
+            elif members.get(_AAR_METADATA_NAME) is None and members.get(_AAR_MANIFEST_NAME) is None:
+                result["note"] = "aar entry is missing"
+        return result
+    except Exception:
+        result["note"] = "aar was not read"
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -6855,6 +7497,22 @@ def detect_dependency_conflicts(
     scan = scan_project(project_path)
     if scan.get("resolvedBy") == "gradle":
         return _detect_conflicts_from_gradle_scan(scan)
+    # A failed Gradle resolve must not BOM-guess or fall back to a POM graph.
+    # Issue 21 owns the empty configuration-cache dump; this is the report.
+    if scan.get("buildSystem") == "gradle":
+        errors = list(scan.get("gradleErrors") or [])
+        notes = list(scan.get("notes") or [])
+        return {
+            "buildSystem": "gradle",
+            "strategy": strategy_for_build_system("gradle"),
+            "conflicts": [],
+            "scannedRoots": 0,
+            "graphsFetched": 0,
+            "graphsFailed": 0,
+            "partial": bool(errors),
+            "errors": errors,
+            "notes": notes,
+        }
     apply_bom_managed_versions(scan, ctx)
 
     detected_bs = scan.get("buildSystem") or "unknown"
@@ -11388,22 +12046,90 @@ def _attach_group_filters(entry: Dict[str, Any], filters: List[Dict[str, str]]) 
     return entry
 
 
+# Block form of the three well-known shorthand accessors. `_find_block` requires
+# `{` after the header, so `google()` is not a block. Word boundaries already
+# stop `maven` from matching `mavenCentral`.
+_SHORTHAND_BLOCK_HEADERS = ("mavenCentral", "google", "gradlePluginPortal")
+
+
+def _shorthand_repo_lookup() -> Dict[str, Tuple[str, str]]:
+    return {fn: (name, url) for fn, name, url in _GRADLE_SHORTHANDS}
+
+
+def _find_next_shorthand_block(
+    content: str, start: int = 0
+) -> Optional[Tuple[str, str, int, int]]:
+    """Earliest ``google { }`` / ``mavenCentral { }`` / ``gradlePluginPortal { }``
+    at or after ``start``. Returns (header, body, header_start, index_past_close)."""
+    best: Optional[Tuple[str, str, int, int]] = None
+    for header in _SHORTHAND_BLOCK_HEADERS:
+        found = _find_block(content, header, start)
+        if not found:
+            continue
+        body, header_start, after = found
+        if best is None or header_start < best[2]:
+            best = (header, body, header_start, after)
+    return best
+
+
+def _shorthand_block_entry(
+    header: str,
+    body: str,
+    extra_filters: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Map a shorthand block through ``_GRADLE_SHORTHANDS`` and attach nested
+    ``content { }`` filters, OR-merged with any outer ``filter { }`` list."""
+    name, url = _shorthand_repo_lookup()[header]
+    filters: List[Dict[str, str]] = list(extra_filters or [])
+    content_body = _extract_block(body, "content")
+    if content_body is not None:
+        filters.extend(_parse_group_filters(content_body))
+    return _attach_group_filters({"name": name, "url": url}, filters)
+
+
+def _consume_shorthand_blocks(
+    content: str,
+    extra_filters: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Record shorthand blocks in source order and return ``content`` with those
+    spans excised, so a later ``google()`` scan does not also record the block."""
+    found_entries: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    while True:
+        found = _find_next_shorthand_block(content, pos)
+        if not found:
+            break
+        header, body, start, after = found
+        spans.append((start, after))
+        found_entries.append(_shorthand_block_entry(header, body, extra_filters))
+        pos = after
+    return found_entries, _excise_spans(content, spans)
+
+
 def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
     """Parse a Gradle `repositories { ... }` body into RepoEntry dicts
     ``{"name", "url"}`` (scope is filled in by the caller). Handles shorthand
     accessors, explicit `maven("url")` / `maven(url = "url")` calls, and
     `maven { ... }` blocks (whose URL is extracted from the balanced body via the
     brace scanner — NOT a brace-naive regex, so `maven { credentials{…}; url=… }`
-    is handled). A `maven { }` block's nested `content { includeGroup(...) }` /
-    `includeGroupByRegex(...)`, and the `exclusiveContent { forRepository { maven
-    {...} | google() | mavenCentral() }; filter {...} }` form, are both captured
-    onto the entry as an optional `group_filters` list (#320 — see *Repository
-    resolution* in AGENTS.md). Deduped by URL, declaration order preserved."""
+    is handled). Also handles the block form of the well-known shorthands
+    ``google { }``, ``mavenCentral { }``, and ``gradlePluginPortal { }``,
+    including inside ``exclusiveContent { forRepository { } }``. A nested
+    ``content { includeGroup(...) }`` / ``includeGroupByRegex(...)`` is captured
+    onto the entry as an optional `group_filters` list (doubled backslashes
+    collapsed by ``_parse_group_filters``). A block with no ``content`` block,
+    or a ``content`` block with none of those calls, stays unfiltered. The
+    ``exclusiveContent { forRepository { maven {...} | google() | google { }
+    | mavenCentral() }; filter {...} }`` form is the same shape. Deduped by
+    URL, declaration order preserved; shorthand blocks are recorded before the
+    call-form scan so a file that contains both ``google()`` and ``google { }``
+    keeps the block entry (and its filters)."""
     entries: List[Dict[str, Any]] = []
 
     # exclusiveContent is parsed first and its span is excised before the bare
-    # shorthand / maven scans. A `google()` inside `forRepository` must pick up
-    # `filter { }`, not fall through to the unfiltered shorthand scan.
+    # shorthand / maven scans. A `google()` or `google { }` inside `forRepository`
+    # must pick up `filter { }`, not fall through to the unfiltered shorthand scan.
     exclusive_spans: List[Tuple[int, int]] = []
     pos = 0
     while True:
@@ -11418,11 +12144,18 @@ def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
             continue
         filter_body = _extract_block(body, "filter")
         filters = _parse_group_filters(filter_body) if filter_body is not None else []
-        for shorthand in _gradle_shorthand_entries(for_repo_body):
+        # Block form first, then excise it, so `google { }` is not also recorded
+        # as an unfiltered call-form shorthand. Outer filter { } and nested
+        # content { } are OR-merged onto the same entry.
+        block_entries, for_repo_sans_blocks = _consume_shorthand_blocks(
+            for_repo_body, filters
+        )
+        entries.extend(block_entries)
+        for shorthand in _gradle_shorthand_entries(for_repo_sans_blocks):
             entries.append(_attach_group_filters(shorthand, filters))
         maven_pos = 0
         while True:
-            maven_found = _find_block(for_repo_body, "maven", maven_pos)
+            maven_found = _find_block(for_repo_sans_blocks, "maven", maven_pos)
             if not maven_found:
                 break
             maven_body, _mstart, maven_after = maven_found
@@ -11435,7 +12168,14 @@ def _parse_gradle_repos(block_body: str) -> List[Dict[str, str]]:
             entry = {"name": nm.group(1) if nm else url, "url": url}
             entries.append(_attach_group_filters(entry, filters))
     block_body_sans_exclusive = _excise_spans(block_body, exclusive_spans)
-    entries.extend(_gradle_shorthand_entries(block_body_sans_exclusive))
+    # Record shorthand blocks before the call-form scan and excise their spans
+    # so `google { }` is one entry, not also an unfiltered `google()`.
+    shorthand_block_entries, block_body_sans_shorthand = _consume_shorthand_blocks(
+        block_body_sans_exclusive
+    )
+    entries.extend(shorthand_block_entries)
+    entries.extend(_gradle_shorthand_entries(block_body_sans_shorthand))
+    block_body_sans_exclusive = block_body_sans_shorthand
 
     # Explicit maven("url") and maven(url = "url") (optionally wrapped in uri()).
     for m in re.finditer(
@@ -12858,11 +13598,9 @@ def scan_project(project_root: str) -> Dict:
             )
         resolved = _gradle_resolve_dependencies(project_root)
         production_count = resolved.get("productionCount", 0)
-        if production_count == 0:
-            detail = resolved.get("errors") or resolved.get("notes") or ["no production runtime dependencies resolved"]
-            raise ValueError(
-                "Gradle dependency resolution failed: " + "; ".join(detail)
-            )
+        # A failed or empty production resolve still returns catalog provenance
+        # so version lookup can run. Missing gradlew already raised above.
+        # resolvedBy is "gradle" only when Gradle produced production runtime rows.
         provenance = _collect_gradle_provenance(project_root)
         dependencies = _merge_gradle_with_provenance(
             resolved["dependencies"], provenance["dependencies"]
@@ -12880,9 +13618,10 @@ def scan_project(project_root: str) -> Dict:
             "dependencies": dependencies,
             "deadRepositoryHints": provenance.get("deadRepositoryHints", []),
             "managedPins": managed_pins,
-            "resolvedBy": "gradle",
             "notes": resolved.get("notes", []),
         }
+        if production_count > 0:
+            result["resolvedBy"] = "gradle"
         if resolved.get("errors"):
             result["gradleErrors"] = resolved["errors"]
         return result
@@ -13169,7 +13908,7 @@ def handle_scan_project_dependencies(args: Dict) -> Any:
     project_path = args.get("projectPath") or os.getcwd()
     ctx = build_resolution_context(args)
     scan = scan_project(project_path)
-    if scan.get("resolvedBy") != "gradle":
+    if scan.get("buildSystem") != "gradle":
         apply_bom_managed_versions(scan, ctx)
     return flatten_scan_result(scan)
 
@@ -13575,6 +14314,18 @@ def _dedup_resolved_from(audit_deps: List[Dict[str, Any]]) -> Optional[Dict[str,
     return default_rf
 
 
+def _tool_deadline_note() -> str:
+    """The single sentence assigned when only the tool deadline fires.
+
+    Not a Gradle resolution diagnostic. Callers that also have resolution-failure
+    notes must keep both, not replace one with this sentence."""
+    return (
+        f"Stopped early after exceeding the {TOOL_DEADLINE}s tool "
+        f"deadline; some dependencies were not fully processed and are "
+        f"marked with an error noting the skip."
+    )
+
+
 def _has_audit_issue(entry: Dict[str, Any]) -> bool:
     """True when an audit_deps entry carries a signal worth surfacing under
     ``onlyIssues`` (#405): a fetch error, an available upgrade, a known
@@ -13658,7 +14409,10 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
     # byte-for-byte unchanged.
     deadline_hit = False
     scan = scan_project(project_path)
-    if scan.get("resolvedBy") != "gradle":
+    # BOM guessing is the Maven path only. A failed Gradle scan omits
+    # resolvedBy and must not start guessing (that would treat catalog rows
+    # as Maven-managed versions).
+    if scan.get("buildSystem") != "gradle":
         apply_bom_managed_versions(scan, ctx)
     # Start the budget after the scan: the Gradle resolve alone can take longer
     # than TOOL_DEADLINE and would leave the fan-out phases no time at all.
@@ -13666,6 +14420,9 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
     # the whole budget before the next declared repository is queried (#41).
     deadline = _now() + TOOL_DEADLINE
     ctx.tool_deadline = deadline
+    resolution_failed = (
+        scan.get("buildSystem") == "gradle" and scan.get("resolvedBy") != "gradle"
+    )
 
     def is_included_in_production(dep: Dict) -> bool:
         source = dep["source"]
@@ -14003,17 +14760,25 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         out["licenses"] = licenses_section
     if new_license_categories is not None:
         out["newLicenseCategories"] = new_license_categories
-    if deadline_hit:
+    if resolution_failed:
+        # Copied only on the failed-resolution path. A successful Gradle scan
+        # stays byte-for-byte unchanged, including the deadline assignment below.
+        if scan.get("gradleErrors"):
+            out["gradleErrors"] = list(scan["gradleErrors"])
+        resolution_notes = list(scan.get("notes") or [])
+        if deadline_hit:
+            out["partial"] = True
+            out["notes"] = resolution_notes + [_tool_deadline_note()]
+        elif resolution_notes:
+            out["notes"] = resolution_notes
+    elif deadline_hit:
         # #402: at least one fan-out phase above hit the shared tool-wide
         # deadline and stopped early — surfaced only in this (rare,
         # degenerate-batch) case so the common fast path's output shape is
-        # completely unchanged.
+        # completely unchanged. This assignment stays an assignment: do not
+        # merge it with empty resolution notes.
         out["partial"] = True
-        out["notes"] = [
-            f"Stopped early after exceeding the {TOOL_DEADLINE}s tool "
-            f"deadline; some dependencies were not fully processed and are "
-            f"marked with an error noting the skip."
-        ]
+        out["notes"] = [_tool_deadline_note()]
     return _with_capability(out, osv_capability)
 
 
@@ -15737,6 +16502,50 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
+    {
+        "name": "get_aar_sdk_requirements",
+        "description": (
+            "Read minCompileSdk and android:minSdkVersion from a candidate AAR "
+            "without downloading the whole archive. Sets requiresCompileSdk or "
+            "requiresMinSdk only when that AAR value is a parsed integer strictly "
+            "above the project's literal compileSdk or minSdk on an application "
+            "module (com.android.application). Omits a floor when packaging is not "
+            "aar, the entry is missing, the project SDK is not a literal, or the "
+            "bounded range read cannot be completed. Does not edit the project."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "groupId": {"type": "string", "description": "Maven group ID"},
+                "artifactId": {"type": "string", "description": "Maven artifact ID"},
+                "version": {
+                    "type": "string",
+                    "description": "Candidate pin the user confirmed, not the current version",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Project root. Defaults to the current working directory.",
+                },
+            },
+            "required": ["groupId", "artifactId", "version"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "groupId": {"type": "string"},
+                "artifactId": {"type": "string"},
+                "version": {"type": "string"},
+                "requiresCompileSdk": {"type": "integer"},
+                "requiresMinSdk": {"type": "integer"},
+                "projectCompileSdk": {"type": "integer"},
+                "projectMinSdk": {"type": "integer"},
+                "note": {"type": "string"},
+            },
+            "required": ["groupId", "artifactId", "version"],
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": True},
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -15761,6 +16570,7 @@ TOOL_HANDLERS = {
     "verify_coordinates": handle_verify_coordinates,
     "get_eol_status": handle_get_eol_status,
     "compare_upgrade_closure": handle_compare_upgrade_closure,
+    "get_aar_sdk_requirements": handle_get_aar_sdk_requirements,
 }
 
 # Name -> inputSchema, for the dispatcher's own required-argument pre-check
