@@ -1621,6 +1621,91 @@ class CompatAskTest(unittest.TestCase):
         )
 
 
+def _kotlin_jvm_edit(kotlin_version, gradle_distribution=None):
+    """build.gradle.kts body the real hook can extract.
+
+    ``kotlin("jvm") version "…"`` is the form the hook reads. ``id("org.jetbrains.kotlin.jvm")``
+    is not, and ``kotlin("jvm")`` alone never reaches the compatibility call
+    because no coordinate is extracted. A silent result on either is not a pass.
+    """
+    lines = [
+        'kotlin("jvm") version "%s"' % kotlin_version,
+        'implementation("com.google.guava:guava:33.0.0-jre")',
+    ]
+    if gradle_distribution:
+        lines.append(
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-%s-bin.zip"
+            % gradle_distribution
+        )
+    return "\n".join(lines) + "\n"
+
+
+@_require_jq_and_timeout()
+class Kotlin24RealHookTest(unittest.TestCase):
+    """Real pre-edit-deps.sh against the shipped server, not a stub.
+
+    A canned compat response cannot show the 2.4 matrix miss. Without
+    timeout/gtimeout the hook fail-opens before the compatibility call, so a
+    green result would hide the bug.
+    """
+
+    def _run(self, content):
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT")
+        }
+        env["MAVEN_MCP_OFFLINE"] = "1"
+        return subprocess.run(
+            ["bash", _HOOK_PATH],
+            input=json.dumps(_edit_stdin("build.gradle.kts", content)).encode(),
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_published_2421_does_not_ask(self):
+        proc = self._run(_kotlin_jvm_edit("2.4.21"))
+        self.assertEqual(proc.returncode, 0)
+        stdout = proc.stdout.decode()
+        self.assertNotIn("Version compatibility conflict", stdout)
+        self.assertIsNone(_parse_decision(proc.stdout))
+
+    def test_uncovered_250_does_not_ask_or_say_incompatible(self):
+        proc = self._run(_kotlin_jvm_edit("2.5.0"))
+        self.assertEqual(proc.returncode, 0)
+        stdout = proc.stdout.decode()
+        self.assertNotIn("Version compatibility conflict", stdout)
+        self.assertNotIn("incompatible", stdout)
+        self.assertIsNone(_parse_decision(proc.stdout))
+
+    def test_kotlin_2120_with_gradle_900_still_asks(self):
+        proc = self._run(_kotlin_jvm_edit("2.1.20", gradle_distribution="9.0.0"))
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertIsNotNone(decision)
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("Version compatibility conflict (kotlin_gradle)", reason)
+
+    def test_real_conflict_asks_without_labeling_the_gap(self):
+        """In-range miss still asks; a matrix gap in the same result is omitted."""
+        content = _kotlin_jvm_edit("2.4.21", gradle_distribution="9.7.1")
+        content += 'id("com.android.application") version "9.3.2"\n'
+        proc = self._run(content)
+        self.assertEqual(proc.returncode, 0)
+        decision = _parse_decision(proc.stdout)
+        self.assertIsNotNone(decision)
+        ho = decision["hookSpecificOutput"]
+        self.assertEqual(ho["permissionDecision"], "ask")
+        reason = ho["permissionDecisionReason"]
+        self.assertIn("Version compatibility conflict (kotlin_gradle)", reason)
+        self.assertIn("Version compatibility conflict (kotlin_agp)", reason)
+        self.assertNotIn("kotlin_unknown", reason)
+        self.assertNotIn("agp_unknown", reason)
+        self.assertNotIn("incompatible", reason)
+
+
 def _grok_search_replace_stdin(filename, new_string):
     """Grok Build camelCase PreToolUse payload for search_replace."""
     return {

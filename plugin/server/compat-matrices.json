@@ -1,7 +1,7 @@
 {
   "_meta": {
     "version": 1,
-    "updated": "2026-07-09",
+    "updated": "2026-10-15",
     "refreshProcedure": [
       "1. AGP↔Gradle↔JDK: open https://developer.android.com/build/releases/about-agp (Gradle min table) and the latest AGP release-notes Compatibility tables (JDK). Update agpEntries: for each Plugin major.minor, set minGradle and minJdk; keep referenceUrl pointing at about-agp or the release-notes page used.",
       "2. Kotlin Gradle plugin↔Gradle/AGP: open https://kotlinlang.org/docs/gradle-configure-project.html (KGP compatibility tables). Replace kotlinGradlePluginEntries ranges (kgpMin/kgpMax, gradleMin/gradleMax, agpMin/agpMax) to match the published tables. Prefer inclusive ranges that cover each documented KGP band.",
@@ -17,7 +17,7 @@
     ],
     "limitations": [
       "AGP matrix covers stable 7.0–9.2 lines commonly used in 2024–2026; older 3.x/4.x rows are omitted.",
-      "Kotlin matrix covers KGP 1.9.20–2.4.0 bands from the Kotlin docs; earlier 1.6–1.8 bands are omitted in v1.",
+      "Kotlin matrix covers KGP 1.9.20–2.3.21 plus the published 2.4.0–2.4.10 and 2.4.20–2.4.21 bands from the Kotlin docs; earlier 1.6–1.8 bands are omitted in v1.",
       "AGP max Gradle is not published as a hard ceiling — only minGradle is enforced for AGP↔Gradle.",
       "Spring Cloud release-train pairing is not a separate matrix; pass Cloud-managed deps under dependencies with springBoot set so Boot BOM mismatches still surface.",
       "javax→jakarta is a coordinate heuristic for known EE GAs, not a full bytecode/import scanner."
@@ -49,8 +49,17 @@
   ],
   "kotlinGradlePluginEntries": [
     {
+      "kgpMin": "2.4.20",
+      "kgpMax": "2.4.21",
+      "gradleMin": "7.6.3",
+      "gradleMax": "9.7.0",
+      "agpMin": "8.5.2",
+      "agpMax": "9.3.1",
+      "referenceUrl": "https://kotlinlang.org/docs/gradle-configure-project.html"
+    },
+    {
       "kgpMin": "2.4.0",
-      "kgpMax": "2.4.0",
+      "kgpMax": "2.4.10",
       "gradleMin": "7.6.3",
       "gradleMax": "9.5.0",
       "agpMin": "8.5.2",

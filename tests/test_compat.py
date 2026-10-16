@@ -292,5 +292,80 @@ class TestCheckVersionCompatibilityTool(unittest.TestCase):
         )
 
 
+class TestKotlin24PublishedBands(unittest.TestCase):
+    """Published 2.4 bands are covered; a miss stays a gap, not 2.3.x."""
+
+    def _result(self, **android):
+        return server.handle_check_version_compatibility({"android": android})
+
+    def _kinds(self, result):
+        return [c["kind"] for c in result["conflicts"]]
+
+    def test_published_points_are_not_kotlin_unknown(self):
+        for version in ("2.4.0", "2.4.1", "2.4.10", "2.4.20", "2.4.21"):
+            with self.subTest(version=version):
+                result = self._result(kotlin=version)
+                self.assertTrue(result["compatible"])
+                self.assertNotIn("kotlin_unknown", self._kinds(result))
+
+    def test_2421_in_range_gradle_and_agp_are_not_kotlin_conflicts(self):
+        result = self._result(kotlin="2.4.21", gradle="9.7.0", agp="9.3.1")
+        kinds = set(self._kinds(result))
+        self.assertFalse(kinds & {"kotlin_unknown", "kotlin_gradle", "kotlin_agp"})
+        # AGP 9.3 is outside agpEntries. Do not treat that gap as this bug.
+        self.assertIn("agp_unknown", kinds)
+
+    def test_2421_gradle_above_row_is_kotlin_gradle_only(self):
+        result = self._result(kotlin="2.4.21", gradle="9.7.1")
+        self.assertEqual(self._kinds(result), ["kotlin_gradle"])
+
+    def test_2421_agp_above_row_is_kotlin_agp_not_a_coverage_miss(self):
+        result = self._result(kotlin="2.4.21", agp="9.3.2")
+        kinds = self._kinds(result)
+        self.assertIn("kotlin_agp", kinds)
+        self.assertNotIn("kotlin_unknown", kinds)
+        self.assertNotIn("kotlin_gradle", kinds)
+
+    def test_2410_in_range_gradle_and_agp_are_compatible(self):
+        result = self._result(kotlin="2.4.10", gradle="9.5.0", agp="9.1.0")
+        self.assertTrue(result["compatible"])
+        self.assertEqual(result["conflicts"], [])
+
+    def test_2410_gradle_above_row_is_kotlin_gradle_not_unknown(self):
+        result = self._result(kotlin="2.4.10", gradle="9.6.0")
+        self.assertEqual(self._kinds(result), ["kotlin_gradle"])
+        self.assertNotIn("kotlin_unknown", self._kinds(result))
+
+    def test_2411_suggests_the_2410_band_not_2310(self):
+        result = self._result(kotlin="2.4.11")
+        self.assertFalse(result["compatible"])
+        unknown = next(c for c in result["conflicts"] if c["kind"] == "kotlin_unknown")
+        self.assertEqual(unknown["suggestion"]["kotlin"], "2.4.0-2.4.10")
+        self.assertNotEqual(unknown["suggestion"]["kotlin"], "2.3.10-2.3.10")
+
+    def test_2422_suggests_the_2421_band_not_2321(self):
+        result = self._result(kotlin="2.4.22")
+        self.assertFalse(result["compatible"])
+        unknown = next(c for c in result["conflicts"] if c["kind"] == "kotlin_unknown")
+        self.assertEqual(unknown["suggestion"]["kotlin"], "2.4.20-2.4.21")
+        self.assertNotEqual(unknown["suggestion"]["kotlin"], "2.3.20-2.3.21")
+
+    def test_limitation_names_published_24_bands(self):
+        matrices = server._load_compat_matrices()
+        self.assertEqual(matrices["_meta"]["updated"], "2026-10-15")
+        self.assertEqual(matrices["_meta"]["version"], 1)
+        notes = [
+            n for n in matrices["_meta"]["limitations"] if n.startswith("Kotlin matrix")
+        ]
+        self.assertEqual(len(notes), 1)
+        note = notes[0]
+        self.assertIn("2.4.0\u20132.4.10", note)
+        self.assertIn("2.4.20\u20132.4.21", note)
+        self.assertNotIn("1.9.20\u20132.4.0 bands", note)
+        self.assertNotIn("1.9.20\u20132.4.21", note)
+        echoed = self._result(kotlin="2.4.21")["notes"]
+        self.assertIn(note, echoed)
+
+
 if __name__ == "__main__":
     unittest.main()
