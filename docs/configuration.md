@@ -38,7 +38,13 @@ OSV vulnerability queries, GitHub API calls, and any response that used a privat
 
 Version lookups use the repositories declared in the project. Maven Central, Google Maven, and the Gradle Plugin Portal are used when that scope (dependencies or plugins) declares none.
 
-`MAVEN_MCP_PUBLIC_FALLBACK` (default off) also queries those public repositories when the project already declares its own. Turn it on when versions come from a repository the build file does not name. `resolvedFrom.viaPublicFallback` is true when only a public fallback answered.
+`MAVEN_MCP_PUBLIC_FALLBACK` (default off) also queries those public repositories when the project already declares its own. Turn it on when versions come from a repository the build file does not name. Fallback off stays declared-repo-only.
+
+`resolvedFrom` is per-version: it names the first repository, in query order, that lists the version the result describes — not the first repository that answered HTTP 200. A version listed by both a declared repository and a public fallback stays on the declared repository (`viaPublicFallback` false). A version listed only by a public fallback has that fallback URL and `viaPublicFallback` true, even when a declared repository answered HTTP 200 with older versions or an empty version list. A declared 404 is absence: the selected version still comes from the fallback, `viaPublicFallback` is true, and the 404 is not a `repositoryErrors` entry. A project with no declared repositories uses the same public-fallback flag, so that sentence applies there too.
+
+`repositoryErrors` lists failures a later success used to drop: `{url, message}` and `status` when there is an HTTP status. It includes 401, 403, 5xx, other non-404 HTTP failures, and transport errors. URLs and messages are redacted the same way as `resolvedFrom`; exception text is never interpolated. If every repository fails, the lookup still raises and does not return `repositoryErrors`.
+
+`warnings` is one plain-language string when the selected version was found only on a public fallback, or a declared repository returned 401, 403, or 5xx. Both facts are one sentence when both are true, for example `1.5.0 found only on Maven Central (public fallback); declared repo https://nexus.example.com/m2 returned 401`. Public-repository failures stay in `repositoryErrors` and do not by themselves add the status clause. Transport errors and 429 do not add it. Empty `warnings` and `repositoryErrors` are omitted.
 
 `mavenLocal()` is recognized and is not queried over HTTP. A repository URL that still contains `${...}` is used as written.
 

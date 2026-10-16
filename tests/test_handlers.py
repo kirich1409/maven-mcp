@@ -542,8 +542,8 @@ class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
             self.assertNotIn("Could not fetch metadata", row["error"])
             self.assertNotIn("upgradeType", row)
             self.assertNotIn("upgradeAvailable", row)
-            self.assertIn("resolvedFrom", row)
-            self.assertIn("url", row["resolvedFrom"])
+            # No version was selected, so there is no per-version resolvedFrom.
+            self.assertNotIn("resolvedFrom", row)
         self.assertEqual(out["summary"]["upgradeable"], 0)
 
     def test_published_stable_equal_to_current_is_still_no_upgrade(self):
@@ -641,8 +641,8 @@ class TestAuditFailedLookupIsNotCurrent(unittest.TestCase):
             self.assertNotIn("Could not fetch metadata", row["error"])
             self.assertNotIn("upgradeType", row)
             self.assertNotIn("latestVersion", row)
-            self.assertIn("resolvedFrom", row)
-            self.assertIn("url", row["resolvedFrom"])
+            # No version was selected, so there is no per-version resolvedFrom.
+            self.assertNotIn("resolvedFrom", row)
             self.assertEqual(out["summary"]["upgradeable"], 0)
 
     def test_latest_equal_to_current_is_still_no_upgrade(self):
