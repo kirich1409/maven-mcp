@@ -2,8 +2,8 @@
 
 #401 collapsed the previous "1 probe + P*(1+C) `gradlew` invocations" model
 into a single ``--init-script`` invocation whose Groovy script dumps resolved
-first-level GAVs for every project/configuration plus the buildscript
-classpath in one configuration phase. These tests exercise: the init-script
+first-level GAVs for the production runtime configurations the selector keeps,
+plus the buildscript classpath, in one configuration phase. These tests exercise: the init-script
 generator, the single-invocation output parser, and the end-to-end
 ``_gradle_resolve_dependencies``/``scan_project`` behavior against mocked
 ``_run_gradle_command`` output shaped like a real init-script dump.
@@ -103,6 +103,243 @@ class TestGenerateGradleResolveInitScript(unittest.TestCase):
         # Static script string, not an f-string / .format() with project data.
         script = server._generate_gradle_resolve_init_script()
         self.assertNotIn("{project_root}", script)
+
+    def test_project_walk_reads_resolution_result_only_for_selected_configurations(self):
+        """Fail if a dropped project configuration can reach resolutionResult.
+
+        A parsed dump that lacks compileClasspath does not show this bug: that
+        absence is the Python drop after Gradle has already resolved the graph.
+        """
+        script = server._generate_gradle_resolve_init_script()
+        marker = "===MAVEN_MCP_BUILDENV==="
+        self.assertIn(marker, script)
+        prefix, suffix = script.split(marker, 1)
+        # BUILDENV is the root buildscript classpath, not a project configuration.
+        # Deleting it is not a pass; its resolutionResult read is not a failure.
+        self.assertIn("buildscript.configurations", suffix)
+        self.assertIn("resolutionResult", suffix)
+
+        self.assertIn("gradle.projectsEvaluated", prefix)
+        self.assertEqual(
+            prefix.count("resolutionResult"),
+            1,
+            "the project walk must still read resolutionResult, and only once",
+        )
+        read_at = prefix.index("resolutionResult")
+        self.assertLess(prefix.index("gradle.projectsEvaluated"), read_at)
+        help_at = prefix.find("help.doFirst")
+        if help_at >= 0:
+            _, brace, close, _ = _closure_after(prefix, "help.doFirst")
+            self.assertFalse(
+                brace < read_at < close,
+                "project-configuration resolutionResult read must not be inside help.doFirst",
+            )
+
+        self.assertEqual(prefix.count("p.configurations.each"), 1)
+        each_idx, _, each_close, each_body = _closure_after(prefix, "p.configurations.each")
+        self.assertNotIn(
+            "resolutionResult",
+            each_body,
+            "p.configurations.each must only build the selected set; "
+            "reading resolutionResult here resolves configurations the selector drops",
+        )
+        self.assertIn(
+            "canBeResolved && isProductionRuntime(",
+            _normalize_ws(each_body),
+        )
+        self.assertTrue(
+            any(each_close > site > each_idx for site in _call_sites(prefix, "isProductionRuntime")),
+            "the configuration walk must call isProductionRuntime before a name enters the set",
+        )
+
+        self.assertEqual(prefix.count("allprojects.each"), 1)
+        _, ap_brace, ap_close, _ = _closure_after(prefix, "allprojects.each")
+        self.assertTrue(
+            ap_brace < read_at < ap_close,
+            "project-configuration read must stay inside the per-project loop",
+        )
+
+        release_at = prefix.find('startsWith("release")', each_close)
+        ends_at = prefix.find('endsWith("RuntimeClasspath")', each_close)
+        exclude_at = prefix.find('!= "runtimeClasspath"', each_close)
+        self.assertGreater(release_at, each_close, "missing per-project release drop")
+        self.assertGreater(ends_at, each_close, "missing per-project release drop")
+        self.assertGreater(exclude_at, each_close, "missing exclusion of bare runtimeClasspath")
+        # A sibling project's release*RuntimeClasspath must not drop this
+        # project's runtimeClasspath. The drop is inside this project's loop,
+        # not on one flat list of every project.
+        self.assertLess(
+            max(release_at, ends_at, exclude_at),
+            ap_close,
+            "release drop must be inside the per-project allprojects.each",
+        )
+        self.assertEqual(prefix.count('startsWith("release")'), 1)
+
+        self.assertTrue(
+            _call_sites(prefix, "isProductionRuntime"),
+            "resolutionResult read is not after an isProductionRuntime call",
+        )
+        self.assertLess(min(_call_sites(prefix, "isProductionRuntime")), read_at)
+
+        containing = [
+            span for span in _each_spans(prefix)
+            if span[1] < read_at < span[2]
+        ]
+        self.assertTrue(containing, "resolutionResult is not inside an each iteration")
+        innermost = min(containing, key=lambda span: span[2] - span[1])
+        self.assertFalse(
+            prefix[:innermost[0]].rstrip().endswith("configurations"),
+            "resolutionResult read is still the unfiltered configurations walk",
+        )
+        self.assertGreater(
+            innermost[1],
+            max(release_at, ends_at, exclude_at),
+            "resolutionResult read must iterate the already-filtered collection",
+        )
+
+        upgrade = server._generate_gradle_upgrade_init_script()
+        for name in ("isTestConfiguration", "isProductionRuntime"):
+            self.assertEqual(
+                _normalize_ws(_groovy_def_body(script, name)),
+                _normalize_ws(_groovy_def_body(upgrade, name)),
+                name + " body must match the upgrade script",
+            )
+
+        # With that shape, names that can reach the project-walk read are the
+        # names this selector keeps. The table is the oracle for that claim.
+        kept_alone = (
+            "runtimeClasspath",
+            "releaseRuntimeClasspath",
+            "debugRuntimeClasspath",
+        )
+        for name in kept_alone:
+            self.assertEqual(server._select_configurations_to_resolve([name]), [name], name)
+        dropped_alone = (
+            "testRuntimeClasspath",
+            "testCompileClasspath",
+            "androidTestRuntimeClasspath",
+            "compileClasspath",
+            "releaseCompileClasspath",
+            "debugCompileClasspath",
+            "classpath",
+            "compileOnly",
+            "annotationProcessor",
+        )
+        for name in dropped_alone:
+            self.assertEqual(server._select_configurations_to_resolve([name]), [], name)
+        selected = server._select_configurations_to_resolve([
+            "runtimeClasspath",
+            "releaseRuntimeClasspath",
+            "debugRuntimeClasspath",
+        ])
+        self.assertNotIn("runtimeClasspath", selected)
+        self.assertIn("releaseRuntimeClasspath", selected)
+        self.assertIn("debugRuntimeClasspath", selected)
+
+
+def _normalize_ws(text):
+    return " ".join(text.split())
+
+
+def _brace_interior(text, open_index):
+    """Return (close_index, interior) for the ``{`` at open_index.
+
+    Skips quotes and comments so a brace in either does not change depth.
+    This matches spans. It does not interpret Groovy.
+    """
+    if open_index < 0 or open_index >= len(text) or text[open_index] != "{":
+        raise AssertionError("expected an opening brace")
+    i = open_index + 1
+    depth = 1
+    limit = len(text)
+    while i < limit:
+        char = text[i]
+        if char == "/" and i + 1 < limit and text[i + 1] == "/":
+            newline = text.find("\n", i)
+            i = limit if newline < 0 else newline + 1
+            continue
+        if char == "/" and i + 1 < limit and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise AssertionError("unclosed block comment")
+            i = end + 2
+            continue
+        if char in ("'", '"'):
+            quote = char
+            i += 1
+            while i < limit:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            else:
+                raise AssertionError("unclosed string")
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return i, text[open_index + 1:i]
+        i += 1
+    raise AssertionError("unclosed brace")
+
+
+def _closure_after(text, needle, start=0):
+    idx = text.find(needle, start)
+    if idx < 0:
+        raise AssertionError("missing " + needle)
+    brace = text.find("{", idx + len(needle))
+    if brace < 0:
+        raise AssertionError("missing brace after " + needle)
+    close, interior = _brace_interior(text, brace)
+    return idx, brace, close, interior
+
+
+def _groovy_def_body(script, name):
+    needle = "def " + name + "("
+    idx = script.find(needle)
+    if idx < 0:
+        raise AssertionError("missing " + needle)
+    brace = script.find("{", idx + len(needle))
+    if brace < 0:
+        raise AssertionError("missing body for " + name)
+    _, interior = _brace_interior(script, brace)
+    return interior
+
+
+def _each_spans(text):
+    spans = []
+    start = 0
+    while True:
+        idx = text.find(".each", start)
+        if idx < 0:
+            return spans
+        brace = text.find("{", idx + len(".each"))
+        if brace < 0:
+            return spans
+        if text[idx + len(".each"):brace].strip() != "":
+            start = idx + len(".each")
+            continue
+        close, interior = _brace_interior(text, brace)
+        spans.append((idx, brace, close, interior))
+        start = idx + len(".each")
+
+
+def _call_sites(text, name):
+    needle = name + "("
+    sites = []
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx < 0:
+            return sites
+        if not text[:idx].rstrip().endswith("def"):
+            sites.append(idx)
+        start = idx + len(needle)
 
 
 class TestParseSingleInvocationGradleOutput(unittest.TestCase):
