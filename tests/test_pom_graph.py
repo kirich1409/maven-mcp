@@ -111,7 +111,7 @@ class PomGraphTest(unittest.TestCase):
     def _fetch(self, mapping):
         calls = []
 
-        def fetch(group_id, artifact_id, version, ctx):
+        def fetch(group_id, artifact_id, version, ctx, deadline_monotonic=None):
             calls.append((group_id, artifact_id, version))
             return mapping.get((group_id, artifact_id, version))
 
@@ -523,7 +523,7 @@ class PomGraphTest(unittest.TestCase):
         }
         _calls, fetch = self._fetch(mapping)
 
-        def osv(deps):
+        def osv(deps, deadline=None):
             rows = []
             for dep in deps:
                 vulns = []

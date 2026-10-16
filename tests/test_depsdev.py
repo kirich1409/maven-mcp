@@ -290,7 +290,7 @@ class TestResolveConflictVersion(unittest.TestCase):
 
 class TestGetTransitiveGraph(unittest.TestCase):
     def test_handler_shape(self):
-        def fetch(group_id, artifact_id, version, _ctx):
+        def fetch(group_id, artifact_id, version, _ctx, deadline=None):
             return _pom_ok(
                 [
                     {
@@ -397,7 +397,7 @@ class TestDetectDependencyConflicts(unittest.TestCase):
             "relation": relation,
         }
 
-    def _route_pom(self, _group_id, artifact_id, _version, _ctx):
+    def _route_pom(self, _group_id, artifact_id, _version, _ctx, deadline=None):
         if artifact_id == "left":
             return _pom_ok(
                 [
@@ -496,7 +496,7 @@ class TestDetectDependencyConflicts(unittest.TestCase):
     def test_partial_when_one_root_fails(self):
         files = self._two_root_project()
 
-        def fetch(_group_id, artifact_id, _version, _ctx):
+        def fetch(_group_id, artifact_id, _version, _ctx, deadline=None):
             if artifact_id == "left":
                 return self._route_pom(_group_id, artifact_id, _version, _ctx)
             return {
@@ -539,7 +539,7 @@ class TestDetectDependencyConflicts(unittest.TestCase):
             """,
         }
 
-        def fetch(_group_id, _artifact_id, _version, _ctx):
+        def fetch(_group_id, _artifact_id, _version, _ctx, deadline=None):
             return {
                 "ok": True,
                 "nodes": [self._pom_node("lib", "1.0", "SELF")],

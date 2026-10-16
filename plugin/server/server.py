@@ -210,6 +210,35 @@ MAX_GITHUB_PARALLEL_FETCHES = 3
 # data rather than running to real completion.
 TOOL_DEADLINE = 30.0
 
+
+def _tool_deadline_note() -> str:
+    """Partial-result sentence shared with ``check_license_compliance``.
+
+    Not the audit sentence: that one marks skipped items with an error, and
+    a deadline stop on a POM walk must not.
+    """
+    return (
+        f"Stopped early after exceeding the {TOOL_DEADLINE}s tool "
+        f"deadline; remaining roots/nodes were not processed and "
+        f"results are partial."
+    )
+
+
+def _has_deadline_note(result: Dict[str, Any]) -> bool:
+    note = _tool_deadline_note()
+    return any(item == note for item in (result.get("notes") or []))
+
+
+def _deadline_unfinished_graph(fetched: Dict[str, Any]) -> bool:
+    """Not-ok graph whose only reason is the deadline note.
+
+    That is an abandoned walk, not a POM miss: do not count it as fetched or
+    failed, and do not read ``error`` (there isn't one).
+    """
+    if fetched.get("ok") or fetched.get("error"):
+        return False
+    return _has_deadline_note(fetched)
+
 # End-of-life / support status via endoflife.date (#415). Support windows are
 # announced well in advance and change rarely — cache far longer than the
 # volatile version-list TTLs above.
@@ -2479,12 +2508,25 @@ def check_version_in_repos(group_id: str, artifact_id: str, version: str, ctx: "
     return None
 
 
-def fetch_pom(group_id: str, artifact_id: str, version: str, ctx: "ResolutionContext") -> Optional[str]:
+def fetch_pom(
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+    deadline_monotonic: Optional[float] = None,
+) -> Optional[str]:
     repos = _repos_for(group_id, artifact_id, ctx)
     for entry in repos:
+        # One shared monotonic bound for every repository. Do not split the
+        # remaining time across hosts — that share is the audit deadline
+        # hole (#41), not this walk. An exhausted bound skips the GET.
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            break
         url = _pom_url(entry["url"], group_id, artifact_id, version)
         try:
-            status, body = _repo_http_get(entry, url, TTL_POM)
+            status, body = _repo_http_get(
+                entry, url, TTL_POM, deadline_monotonic=deadline_monotonic,
+            )
             if status == 200:
                 return body.decode("utf-8", errors="replace")
         except Exception:
@@ -2866,6 +2908,7 @@ def locate_pom(
     artifact_id: str,
     version: str,
     ctx: "ResolutionContext",
+    deadline_monotonic: Optional[float] = None,
 ) -> Optional[str]:
     """Return POM text from the Gradle user cache, then ``~/.m2``, then ``fetch_pom``.
 
@@ -2907,6 +2950,13 @@ def locate_pom(
         text = _read_pom_file(m2_path)
         if text is not None:
             return text
+    # Omit the keyword when unset so existing 4-argument fetch_pom doubles
+    # keep working. A bound is passed only for the tools that opted in.
+    if deadline_monotonic is not None:
+        return fetch_pom(
+            group_id, artifact_id, version, ctx,
+            deadline_monotonic=deadline_monotonic,
+        )
     return fetch_pom(group_id, artifact_id, version, ctx)
 
 
@@ -3130,6 +3180,8 @@ def resolve_pom_graph(
     artifact_id: str,
     version: str,
     ctx: "ResolutionContext",
+    *,
+    deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Transitive graph of one Maven GAV from published POMs.
 
@@ -3138,13 +3190,29 @@ def resolve_pom_graph(
     that are not walked, and BFS nearest-wins. Version ranges, profiles, and
     classifiers are out of scope. Never raises. ``error`` never contains
     exception text or URL userinfo.
+
+    ``deadline`` is an optional ``_now()`` wall-clock bound, keyword-only.
+    ``None`` (the default) stays unbounded so callers that do not pass it
+    keep the previous behavior. When the bound is passed, the walk stops
+    before the next POM load, keeps nodes already collected, and sets
+    ``partial`` with the shared deadline note. ``truncated`` stays the node
+    cap. An abandoned root fetch is an empty partial graph, not a POM miss.
     """
     try:
-        return _resolve_pom_graph_impl(group_id, artifact_id, version, ctx)
+        return _resolve_pom_graph_impl(
+            group_id, artifact_id, version, ctx, deadline=deadline,
+        )
     except Exception as exc:
         out = _empty_pom_graph()
         out["error"] = type(exc).__name__
         return out
+
+
+def _deadline_abandoned_graph() -> Dict[str, Any]:
+    """Root fetch never started or did not finish inside the deadline."""
+    out = _empty_pom_graph()
+    out["notes"] = [_tool_deadline_note()]
+    return out
 
 
 def _resolve_pom_graph_impl(
@@ -3152,16 +3220,44 @@ def _resolve_pom_graph_impl(
     artifact_id: str,
     version: str,
     ctx: "ResolutionContext",
+    *,
+    deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     cache: Dict[Tuple[str, str, str], Optional[str]] = {}
+    deadline_hit = False
+
+    def _past_deadline() -> bool:
+        return deadline is not None and _now() >= deadline
 
     def reader(g: str, a: str, v: str, c: "ResolutionContext") -> Optional[str]:
+        nonlocal deadline_hit
         key = (g, a, v)
-        if key not in cache:
-            cache[key] = locate_pom(g, a, v, c)
-        return cache[key]
+        if key in cache:
+            return cache[key]
+        # Do not cache a skip. A later caller in this walk must not treat
+        # "we never asked" as a missing POM.
+        if deadline_hit or _past_deadline():
+            deadline_hit = True
+            return None
+        if deadline is not None:
+            # Convert at the fetch, not at tool entry: wall clock and
+            # time.monotonic are different clocks.
+            remaining = max(0.0, deadline - _now())
+            pom = locate_pom(
+                g, a, v, c,
+                deadline_monotonic=time.monotonic() + remaining,
+            )
+        else:
+            pom = locate_pom(g, a, v, c)
+        if pom is None and _past_deadline():
+            deadline_hit = True
+            return None
+        cache[key] = pom
+        return pom
 
     root_pom = reader(group_id, artifact_id, version, ctx)
+    if root_pom is None and deadline_hit:
+        return _deadline_abandoned_graph()
     if root_pom is None:
         err, cap = _pom_absence_reason(ctx, group_id, artifact_id, version)
         out = _empty_pom_graph()
@@ -3188,7 +3284,13 @@ def _resolve_pom_graph_impl(
         nonlocal partial
         if node.get("_loaded"):
             return node.get("_pom")
+        if deadline_hit:
+            return None
         pom = reader(node["groupId"], node["artifactId"], node["version"], ctx)
+        # An abandoned fetch is not a miss. Leave the node unloaded so the
+        # caller can drop it instead of recording "POM not found".
+        if deadline_hit and pom is None:
+            return None
         node["_loaded"] = True
         node["_pom"] = pom
         if pom is None:
@@ -3262,6 +3364,8 @@ def _resolve_pom_graph_impl(
 
     def collect_from(index: int, declared: List[Dict[str, Any]]) -> None:
         nonlocal partial
+        if deadline_hit:
+            return
         if index in expanded_nodes:
             return
         node = nodes[index]
@@ -3274,7 +3378,11 @@ def _resolve_pom_graph_impl(
         props = _collect_bom_properties(
             pom, node["version"], ctx, _pom_reader=reader
         )
+        if deadline_hit:
+            return
         managed = managed_for(node, props)
+        if deadline_hit:
+            return
         for dep in _parse_direct_pom_dependencies(pom, props):
             ga = (dep["groupId"], dep["artifactId"])
             if dep.get("skip"):
@@ -3354,6 +3462,8 @@ def _resolve_pom_graph_impl(
         depth: int, declared: List[Dict[str, Any]], defer_new: bool
     ) -> List[Dict[str, Any]]:
         nonlocal partial, truncated
+        if deadline_hit:
+            return []
         fresh: List[Dict[str, Any]] = []
         groups, order = group_declared(declared)
         for ga in order:
@@ -3406,6 +3516,8 @@ def _resolve_pom_graph_impl(
                 "_pom": None,
             }
             load_pom(node)
+            if deadline_hit and not node.get("_loaded"):
+                break
             if node["errors"]:
                 node["walk"] = False
             nodes.append(node)
@@ -3422,6 +3534,9 @@ def _resolve_pom_graph_impl(
         return fresh
 
     while pending or deferred:
+        if deadline_hit or _past_deadline():
+            deadline_hit = True
+            break
         # Apply a held frontier only once every still-pending bucket is at
         # least as deep, so the shallower node's children occupy ga_index first.
         if deferred and (
@@ -3441,7 +3556,11 @@ def _resolve_pom_graph_impl(
             declared = []
             for index in batch:
                 collect_from(index, declared)
+        if deadline_hit:
+            break
         promote_same_depth(depth, declared)
+        if deadline_hit:
+            break
         groups, order = group_declared(declared)
         defer_new = False
         for ga in order:
@@ -3458,7 +3577,11 @@ def _resolve_pom_graph_impl(
             ):
                 defer_new = True
                 break
+        if deadline_hit:
+            break
         held = mediate(depth, declared, defer_new)
+        if deadline_hit:
+            break
         if defer_new and held:
             deferred.append((depth, held))
 
@@ -3481,6 +3604,9 @@ def _resolve_pom_graph_impl(
         "error": None,
         "nodeErrors": skipped,
     }
+    if deadline_hit:
+        out["partial"] = True
+        out["notes"] = [_tool_deadline_note()]
     return _with_capability(out, capability)
 
 
@@ -3987,7 +4113,10 @@ def get_transitive_graph(
     """
     if ctx is None:
         ctx = build_resolution_context({})
-    fetched = resolve_pom_graph(group_id, artifact_id, version, ctx)
+    deadline = _now() + TOOL_DEADLINE
+    fetched = resolve_pom_graph(
+        group_id, artifact_id, version, ctx, deadline=deadline,
+    )
     result: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -4003,11 +4132,19 @@ def get_transitive_graph(
         "partial": fetched["partial"],
         "truncated": fetched["truncated"],
     }
+    if fetched.get("notes"):
+        result["notes"] = list(fetched["notes"])
     if fetched.get("capabilityUnavailable"):
         result["capabilityUnavailable"] = fetched["capabilityUnavailable"]
     if not fetched["ok"]:
         result["partial"] = True
-        result["error"] = fetched.get("error") or "POM graph unavailable"
+        # A deadline-only stop has error None and the shared note. Do not
+        # invent "POM graph unavailable" for that case.
+        err = fetched.get("error")
+        if err:
+            result["error"] = err
+        elif not _has_deadline_note(fetched):
+            result["error"] = "POM graph unavailable"
     else:
         node_errors = []
         for i, n in enumerate(fetched["nodes"]):
@@ -4088,7 +4225,10 @@ def get_vulnerability_paths(
     """
     if ctx is None:
         ctx = build_resolution_context({})
-    fetched = resolve_pom_graph(group_id, artifact_id, version, ctx)
+    deadline = _now() + TOOL_DEADLINE
+    fetched = resolve_pom_graph(
+        group_id, artifact_id, version, ctx, deadline=deadline,
+    )
     result: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -4099,9 +4239,15 @@ def get_vulnerability_paths(
     }
     if fetched.get("capabilityUnavailable"):
         result["capabilityUnavailable"] = fetched["capabilityUnavailable"]
+    if fetched.get("notes"):
+        result["notes"] = list(fetched["notes"])
     if not fetched.get("ok"):
         result["partial"] = True
-        result["error"] = fetched.get("error") or "POM graph unavailable"
+        err = fetched.get("error")
+        if err:
+            result["error"] = err
+        elif not _has_deadline_note(fetched):
+            result["error"] = "POM graph unavailable"
         return result
 
     nodes = fetched.get("nodes") or []
@@ -4138,7 +4284,17 @@ def get_vulnerability_paths(
     if not unique_gavs:
         return result
 
-    notes: List[str] = []
+    # The walk already stopped, or the clock expired after it returned.
+    # Do not start the querybatch POST, so hydration does not start either.
+    if _has_deadline_note(fetched) or _now() >= deadline:
+        result["partial"] = True
+        notes = list(result.get("notes") or [])
+        if not _has_deadline_note(result):
+            notes.append(_tool_deadline_note())
+        result["notes"] = notes
+        return result
+
+    notes: List[str] = list(result.get("notes") or [])
     if len(unique_gavs) > MAX_VULN_DEPENDENCIES:
         unique_gavs = unique_gavs[:MAX_VULN_DEPENDENCIES]
         key_order = key_order[:MAX_VULN_DEPENDENCIES]
@@ -4149,7 +4305,7 @@ def get_vulnerability_paths(
         )
 
     key_to_gav = dict(zip(key_order, unique_gavs))
-    osv_results = query_osv_batch(unique_gavs)
+    osv_results = query_osv_batch(unique_gavs, deadline=deadline)
 
     vulns_by_key: Dict[str, List[Dict[str, Any]]] = {}
     osv_capability: Optional[str] = None
@@ -6907,18 +7063,33 @@ def detect_dependency_conflicts(
     # check_license_compliance's per-node walk, this aggregation (min-depth,
     # append-to-sources) has no order-sensitive "upgrade in place" logic, so
     # keeping it sequential is purely for a minimal/obviously-correct diff,
-    # not a correctness requirement.
+    # not a correctness requirement. The same wall-clock bound is passed to
+    # the waiter and to each walk so an in-flight POM fetch stops instead of
+    # continuing after the waiter returns.
+    deadline = _now() + TOOL_DEADLINE
+
     def _fetch_conflict_root_graph(root: Dict[str, str]) -> Dict[str, Any]:
         return resolve_pom_graph(
             root["groupId"], root["artifactId"], root["version"], ctx,
+            deadline=deadline,
         )
 
-    root_graphs, _partial = _map_parallel(
+    root_graphs, map_partial = _map_parallel(
         unique_roots, _fetch_conflict_root_graph, max_workers=MAX_PARALLEL_FETCHES,
+        deadline=deadline,
     )
 
+    deadline_hit = bool(map_partial)
     for root, fetched in zip(unique_roots, root_graphs):
         root_label = f"{root['groupId']}:{root['artifactId']}:{root['version']}"
+        # None is an unfinished waiter slot. A not-ok graph whose only reason
+        # is the deadline note is the same case. Do not call .get, do not
+        # count it fetched or failed, and do not append "unavailable".
+        if not isinstance(fetched, dict) or _deadline_unfinished_graph(fetched):
+            deadline_hit = True
+            continue
+        if _has_deadline_note(fetched):
+            deadline_hit = True
         if fetched.get("capabilityUnavailable") and capability is None:
             capability = fetched["capabilityUnavailable"]
         if not fetched["ok"]:
@@ -7010,6 +7181,8 @@ def detect_dependency_conflicts(
             f"Direct roots truncated to {MAX_CONFLICT_SCAN_ROOTS} "
             + "(MAX_CONFLICT_SCAN_ROOTS); results are partial."
         )
+    if deadline_hit:
+        notes.append(_tool_deadline_note())
 
     out = {
         "buildSystem": bs_label,
@@ -7020,6 +7193,7 @@ def detect_dependency_conflicts(
         "graphsFailed": graphs_failed,
         "partial": bool(
             truncated_roots or graphs_failed or graphs_incomplete or errors
+            or deadline_hit
         ),
         "errors": errors,
         "notes": notes,
@@ -8596,11 +8770,7 @@ def check_license_compliance(
         )
     if deadline_hit:
         partial = True
-        notes.append(
-            f"Stopped early after exceeding the {TOOL_DEADLINE}s tool "
-            f"deadline; remaining roots/nodes were not processed and "
-            f"results are partial."
-        )
+        notes.append(_tool_deadline_note())
 
     out: Dict[str, Any] = {
         "policy": policy,
@@ -14935,7 +15105,7 @@ TOOLS = [
     },
     {
         "name": "get_transitive_graph",
-        "description": "Fetch the resolved transitive dependency graph for a Maven GAV from the artifact POM (Gradle cache, then the local Maven repository, then the project's repositories). Returns nodes (g/a/v) and edges (from/to indices). This is a documented Maven subset: compile and runtime scopes, nearest-wins mediation, no version ranges or profiles. Partial results are flagged when a POM is missing, a declaration is skipped, or the graph is truncated by the node cap.",
+        "description": "Fetch the resolved transitive dependency graph for a Maven GAV from the artifact POM (Gradle cache, then the local Maven repository, then the project's repositories). Returns nodes (g/a/v) and edges (from/to indices). This is a documented Maven subset: compile and runtime scopes, nearest-wins mediation, no version ranges or profiles. Partial results are flagged when a POM is missing, a declaration is skipped, or the graph is truncated by the node cap. A deadline stop is also partial.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -14966,6 +15136,7 @@ TOOLS = [
                 "capabilityUnavailable": {"type": "string"},
                 "error": {"type": "string"},
                 "nodeErrors": {"type": "array", "items": {"type": "object"}},
+                "notes": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["groupId", "artifactId", "version", "nodes", "edges", "partial", "truncated"],
         },
