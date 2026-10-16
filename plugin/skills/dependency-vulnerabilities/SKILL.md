@@ -35,10 +35,13 @@ scan.
    removing the dependency rather than just tracking the CVE.
 
    When findings exist, the tool also returns a per-dependency `safeUpgrade` — a
-   synthesized minimum version clearing every known CVE, computed from the same
-   `fixedVersion` data (ADVISORY ONLY, never a guaranteed-safe pin). Present
-   `safeUpgrade.version` as the suggested target when `fixesAllKnown: true`; when it is
-   `false`, say a version fixing every known issue is not yet known and surface `reason`.
+   synthesized minimum version clearing every known CVE on the queried package and the line
+   that contains the installed version, computed from the same line-matched `fixedVersion`
+   data (ADVISORY ONLY, never a guaranteed-safe pin). Recommend `safeUpgrade.version` only
+   when `fixesAllKnown` is `true`; that version is the fix on the queried package and the line
+   that contains the installed version, not a fix from another line or another artifact. When
+   `fixesAllKnown` is false, a version that fixes every known issue on that package and line
+   is not known — surface `reason` and do not recommend a version.
 
 **No findings:** say so plainly.
 
@@ -55,5 +58,10 @@ bundled inside a fat JAR may carry CVEs this check will not surface.
 POST the coordinates to `https://api.osv.dev/v1/querybatch`, then **hydrate** each unique
 returned id with `GET https://api.osv.dev/v1/vulns/{id}` before reporting
 severity/summary/fixedVersion — the bare querybatch response (`{id, modified}` only) is not
-enough to report severity. Note that Gradle plugin-marker resolution is skipped on this
-path.
+enough to report severity. `fixedVersion` is the `fixed` event of the ECOSYSTEM interval
+that contains the queried version on the affected entry whose `package.ecosystem` is `Maven`
+and whose `package.name` is `groupId:artifactId`. Do not take the first ECOSYSTEM `fixed`.
+`fixed` is exclusive. `last_affected` is inclusive and is not a fix. `limit` is not a fix.
+If the containing interval has no `fixed`, omit `fixedVersion`. Do not borrow a fix from
+another line of the same package or from a different package. Note that Gradle plugin-marker
+resolution is skipped on this path.

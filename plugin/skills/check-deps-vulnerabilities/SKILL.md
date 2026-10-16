@@ -69,10 +69,13 @@ When at least one finding exists, ask the user — one question, four options:
 4. **Report only** — make no changes.
 
 **Recommended fixed version per package:** use `safeUpgrade.version` from
-`get_dependency_vulnerabilities` when `safeUpgrade.fixesAllKnown` is `true` (the tool
-already computes `max(fixedVersion)` across findings for that GA server-side — do not
-re-derive it by hand). When `safeUpgrade` is absent or `fixesAllKnown` is `false`, list
-under "Manual upgrade required".
+`get_dependency_vulnerabilities` only when `fixesAllKnown` is `true`. That version is the
+fix on the queried package and the line that contains the installed version, not a fix
+from another line or another artifact (ADVISORY ONLY, never a guaranteed-safe pin). The
+tool already computes the highest of those line-matched `fixedVersion` strings server-side
+— do not re-derive it by hand. When `safeUpgrade` is absent or `fixesAllKnown` is false,
+a version that fixes every known issue on that package and line is not known; surface
+`reason` when present and list the package under "Manual upgrade required".
 
 ## Step 4 — Apply updates
 
@@ -101,8 +104,13 @@ State when relevant:
 Glob/Read build files, extract production GAVs, POST
 `https://api.osv.dev/v1/querybatch`, then **hydrate** each unique id with
 `GET https://api.osv.dev/v1/vulns/{id}` before reporting severity/summary/fixedVersion.
-Bare querybatch `{id, modified}` is not enough. Note that plugin-marker resolution and
-project-repo awareness are skipped on this path.
+Bare querybatch `{id, modified}` is not enough. `fixedVersion` is the `fixed` event of the
+ECOSYSTEM interval that contains the queried version on the affected entry whose
+`package.ecosystem` is `Maven` and whose `package.name` is `groupId:artifactId`. Do not take the first ECOSYSTEM `fixed`. `fixed` is exclusive. `last_affected` is inclusive and
+is not a fix. `limit` is not a fix. If the containing interval has no `fixed`, omit
+`fixedVersion`. Do not borrow a fix from another line of the same package or from a
+different package. Note that plugin-marker resolution and project-repo awareness are
+skipped on this path.
 
 ## Language
 
