@@ -1432,6 +1432,9 @@ class TestGradleResolveIntegration(unittest.TestCase):
         self.assertEqual(dep["version"], "3.1.2")
         flat = server.flatten_scan_result(result)
         self.assertIn("gradleErrors", flat)
+        # Exit 0 CONFIG_ERROR stays the existing gradleErrors path, not partial.
+        self.assertNotIn("partial", result)
+        self.assertNotIn("partial", flat)
 
 
 class TestGradleResolveSubprocessE2E(unittest.TestCase):
@@ -1511,6 +1514,317 @@ class TestFlattenScanResultResolvedBy(unittest.TestCase):
         flat = server.flatten_scan_result(scan)
         self.assertEqual(flat["resolvedBy"], "gradle")
         self.assertEqual(flat["dependencies"][0]["resolvedBy"], "gradle")
+
+
+_STDERR_ABORTED = "FAILURE: Build aborted in :lib"
+_INVOCATION_FAILED = (
+    "Gradle init-script invocation exited with code 1: " + _STDERR_ABORTED
+)
+_NO_PRODUCTION_NOTE = "No production configurations resolved"
+_CLASSPATH_ONLY_NOTE = "No production runtime dependencies resolved"
+
+# Closed :app plus an unclosed :lib whose resolution-only GAV is not in any
+# build file. CONFIG_END on :lib is not enough — the module never finishes.
+_CASE_A_STDOUT = (
+    "===MAVEN_MCP_MODULE=== :app\n"
+    "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+    "io.ktor:ktor-client-core:3.1.2\n"
+    "===MAVEN_MCP_CONFIG_END===\n"
+    "===MAVEN_MCP_MODULE_END===\n"
+    "===MAVEN_MCP_MODULE=== :lib\n"
+    "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+    "com.later:only-resolved-in-lib:9.9.9\n"
+    "===MAVEN_MCP_CONFIG_END===\n"
+)
+
+_CASE_A_FILES = {
+    "settings.gradle.kts": 'include(":app")\ninclude(":lib")\n',
+    "gradle/libs.versions.toml": (
+        "[libraries]\n"
+        'lib-api = { module = "com.declared:lib-api", version = "1.0.0" }\n'
+    ),
+    "lib/build.gradle.kts": (
+        "dependencies {\n"
+        "    implementation(libs.lib.api)\n"
+        "}\n"
+    ),
+}
+
+
+def _gavs(deps):
+    return {(d.get("groupId"), d.get("artifactId")) for d in deps}
+
+
+class TestGradleNonZeroExitAfterModuleMarker(unittest.TestCase):
+    """A non-zero Gradle exit after the first module marker is not a complete scan.
+
+    The parser used to insert a module at MODULE, so `code != 0 and not modules`
+    dropped stderr and scan_project described the crash as a missing production
+    configuration. These tests fail on that tree.
+    """
+
+    def _mock_run(self, stdout, code=0, stderr=""):
+        def _fake_run(project_root, gradlew, args, timeout=server.GRADLE_RESOLVE_TIMEOUT):
+            return code, stdout, stderr
+
+        return unittest.mock.patch.object(server, "_run_gradle_command", _fake_run)
+
+    def _audit_mocks(self):
+        def _metadata(group_id, artifact_id, ctx):
+            return {
+                "versions": ["1.0.0", "3.1.2", "9.9.9"],
+                "resolvedFrom": {
+                    "url": "https://repo1.maven.org/maven2",
+                    "scope": "dependency",
+                    "viaPublicFallback": False,
+                },
+            }
+
+        def _osv(deps, deadline=None):
+            return [{**dep, "vulnerabilities": []} for dep in deps]
+
+        return (
+            unittest.mock.patch.object(server, "fetch_metadata", _metadata),
+            unittest.mock.patch.object(server, "query_osv_batch", _osv),
+        )
+
+    def _assert_partial_prefix(self, result):
+        self.assertIs(result.get("partial"), True)
+        self.assertIn(_INVOCATION_FAILED, result.get("gradleErrors") or [])
+        blob = "\n".join(
+            [
+                "\n".join(result.get("gradleErrors") or []),
+                "\n".join(result.get("notes") or []),
+            ]
+        )
+        self.assertNotIn(_NO_PRODUCTION_NOTE, blob)
+        self.assertNotIn(_CLASSPATH_ONLY_NOTE, blob)
+        gavs = _gavs(result["dependencies"])
+        self.assertIn(("io.ktor", "ktor-client-core"), gavs)
+        self.assertNotIn(("com.later", "only-resolved-in-lib"), gavs)
+        self.assertIn(("com.declared", "lib-api"), gavs)
+
+    def test_case_a_partial_dump_keeps_finished_module_and_stderr(self):
+        with temp_project(_CASE_A_FILES) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(_CASE_A_STDOUT, code=1, stderr=_STDERR_ABORTED):
+                scan = server.scan_project(root)
+                flat = server.flatten_scan_result(scan)
+                tool = server.handle_scan_project_dependencies({"projectPath": root})
+                meta, osv = self._audit_mocks()
+                with meta, osv:
+                    audit = server.handle_audit_project_dependencies({"projectPath": root})
+        self._assert_partial_prefix(scan)
+        self._assert_partial_prefix(flat)
+        self._assert_partial_prefix(tool)
+        self._assert_partial_prefix(audit)
+        declared = next(
+            d for d in scan["dependencies"]
+            if d["artifactId"] == "lib-api"
+        )
+        self.assertEqual(declared.get("resolvedBy"), "provenance")
+
+    def test_case_b_no_production_raises_with_exit_code_and_stderr(self):
+        stdout = (
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+            "===MAVEN_MCP_MODULE=== :lib\n"
+        )
+        files = {"settings.gradle.kts": 'include(":app")\ninclude(":lib")\n'}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(stdout, code=1, stderr=_STDERR_ABORTED):
+                scan = server.scan_project(root)
+        blob = " ".join(scan.get("gradleErrors") or []) + " " + " ".join(scan.get("notes") or [])
+        self.assertIn("exited with code 1", blob)
+        self.assertIn(_STDERR_ABORTED, blob)
+        self.assertIn("All Gradle dependency tasks failed.", scan.get("notes") or [])
+        self.assertNotIn(_NO_PRODUCTION_NOTE, blob)
+        self.assertNotIn(_CLASSPATH_ONLY_NOTE, blob)
+        self.assertNotEqual(scan.get("resolvedBy"), "gradle")
+        self.assertNotIn("partial", scan)
+
+    def test_nonzero_finished_module_without_production_is_not_classpath_only_note(self):
+        stdout = (
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_CONFIG=== compileClasspath\n"
+            "com.example:compile-only:1.0.0\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+            "===MAVEN_MCP_BUILDENV===\n"
+            "com.android.tools.build:gradle:8.0.0\n"
+            "===MAVEN_MCP_BUILDENV_END===\n"
+        )
+        files = {"build.gradle.kts": "dependencies {\n}\n"}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(stdout, code=1, stderr=_STDERR_ABORTED):
+                scan = server.scan_project(root)
+        blob = " ".join(scan.get("gradleErrors") or []) + " " + " ".join(scan.get("notes") or [])
+        self.assertIn("exited with code 1", blob)
+        self.assertIn(_STDERR_ABORTED, blob)
+        self.assertNotIn(_CLASSPATH_ONLY_NOTE, blob)
+        self.assertNotIn(_NO_PRODUCTION_NOTE, blob)
+        self.assertNotEqual(scan.get("resolvedBy"), "gradle")
+
+    def test_parser_drops_unclosed_module_and_buildenv_keeps_config_error(self):
+        stdout = (
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "io.ktor:ktor-client-core:3.1.2\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+            "===MAVEN_MCP_MODULE=== :lib\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "com.later:only-resolved-in-lib:9.9.9\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_CONFIG=== debugRuntimeClasspath\n"
+            "===MAVEN_MCP_CONFIG_ERROR=== org.gradle.api.GradleException: boom\n"
+            "===MAVEN_MCP_BUILDENV===\n"
+            "com.android.tools.build:gradle:8.0.0\n"
+        )
+        modules, errors, buildenv, _buildenv_error = server._parse_single_invocation_gradle_output(stdout)
+        self.assertEqual(
+            modules[":app"]["releaseRuntimeClasspath"],
+            [("io.ktor", "ktor-client-core", "3.1.2")],
+        )
+        self.assertNotIn(":lib", modules)
+        self.assertEqual(buildenv, [])
+        self.assertTrue(any("debugRuntimeClasspath resolution error:" in e and "boom" in e for e in errors))
+
+        # A later module marker before MODULE_END discards the open buffer.
+        restarted = (
+            "===MAVEN_MCP_MODULE=== :lib\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "com.dropped:open-buffer:1.0.0\n"
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "io.ktor:ktor-client-core:3.1.2\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+        )
+        modules, _errors, _buildenv, _err = server._parse_single_invocation_gradle_output(restarted)
+        self.assertNotIn(":lib", modules)
+        self.assertEqual(
+            modules[":app"]["releaseRuntimeClasspath"],
+            [("io.ktor", "ktor-client-core", "3.1.2")],
+        )
+
+    def test_unclosed_buildenv_not_invented_when_finished_module_has_production(self):
+        stdout = (
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "io.ktor:ktor-client-core:3.1.2\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+            "===MAVEN_MCP_BUILDENV===\n"
+            "com.android.tools.build:gradle:8.0.0\n"
+        )
+        files = {"build.gradle.kts": "dependencies {\n}\n"}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(stdout, code=1, stderr=_STDERR_ABORTED):
+                result = server.scan_project(root)
+        self.assertIs(result.get("partial"), True)
+        self.assertIn(_INVOCATION_FAILED, result.get("gradleErrors") or [])
+        gavs = _gavs(result["dependencies"])
+        self.assertIn(("io.ktor", "ktor-client-core"), gavs)
+        self.assertNotIn(("com.android.tools.build", "gradle"), gavs)
+
+    def test_partial_return_keeps_closed_buildenv_classpath(self):
+        # The existing collector already selects production runtime configs.
+        # A non-zero exit must not add a second filter that drops a closed
+        # buildenv classpath just because the invocation failed.
+        stdout = (
+            "===MAVEN_MCP_MODULE=== :app\n"
+            "===MAVEN_MCP_CONFIG=== releaseRuntimeClasspath\n"
+            "io.ktor:ktor-client-core:3.1.2\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_CONFIG=== compileClasspath\n"
+            "com.example:compile-only:1.0.0\n"
+            "===MAVEN_MCP_CONFIG_END===\n"
+            "===MAVEN_MCP_MODULE_END===\n"
+            "===MAVEN_MCP_BUILDENV===\n"
+            "com.android.tools.build:gradle:8.0.0\n"
+            "===MAVEN_MCP_BUILDENV_END===\n"
+        )
+        files = {"build.gradle.kts": "dependencies {\n}\n"}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(stdout, code=1, stderr=_STDERR_ABORTED):
+                result = server.scan_project(root)
+        self.assertIs(result.get("partial"), True)
+        gavs = _gavs(result["dependencies"])
+        self.assertIn(("io.ktor", "ktor-client-core"), gavs)
+        self.assertIn(("com.android.tools.build", "gradle"), gavs)
+        self.assertNotIn(("com.example", "compile-only"), gavs)
+
+    def test_exit_1_empty_stdout_returns_invocation_message(self):
+        files = {"build.gradle.kts": "dependencies {\n}\n"}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run("", code=1, stderr=_STDERR_ABORTED):
+                scan = server.scan_project(root)
+        self.assertIn(_INVOCATION_FAILED, scan.get("gradleErrors") or [])
+        self.assertIn("All Gradle dependency tasks failed.", scan.get("notes") or [])
+        self.assertNotEqual(scan.get("resolvedBy"), "gradle")
+
+    def test_exit_0_complete_dump_is_not_partial_and_keeps_later_gav(self):
+        files = {
+            "settings.gradle.kts": 'include(":app")\n',
+            "app/build.gradle.kts": (
+                "dependencies {\n"
+                '    implementation("io.ktor:ktor-client-core:3.1.1")\n'
+                "}\n"
+            ),
+        }
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(SINGLE_INVOCATION_FIXTURE, code=0):
+                result = server.scan_project(root)
+        self.assertNotIn("partial", result)
+        self.assertIn(("com.squareup.okhttp3", "okhttp"), _gavs(result["dependencies"]))
+
+    def test_exit_0_truncated_dump_drops_unclosed_module_without_partial(self):
+        with temp_project(_CASE_A_FILES) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(_CASE_A_STDOUT, code=0):
+                result = server.scan_project(root)
+        self.assertNotIn("partial", result)
+        joined = "\n".join(result.get("gradleErrors") or [])
+        self.assertNotIn("exited with code", joined)
+        gavs = _gavs(result["dependencies"])
+        self.assertIn(("io.ktor", "ktor-client-core"), gavs)
+        self.assertNotIn(("com.later", "only-resolved-in-lib"), gavs)
+
+    def test_exit_0_config_error_forwarded_by_audit_without_partial(self):
+        files = {
+            "settings.gradle.kts": 'include(":app")\n',
+            "app/build.gradle.kts": (
+                "dependencies {\n"
+                '    implementation("io.ktor:ktor-client-core:3.1.1")\n'
+                "}\n"
+            ),
+        }
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run(CONFIG_ERROR_FIXTURE, code=0):
+                meta, osv = self._audit_mocks()
+                with meta, osv:
+                    audit = server.handle_audit_project_dependencies({"projectPath": root})
+        self.assertNotIn("partial", audit)
+        self.assertTrue(any("debugRuntimeClasspath" in e for e in audit.get("gradleErrors", [])))
+
+    def test_exit_124_empty_stdout_returns_invocation_message(self):
+        files = {"build.gradle.kts": "dependencies {\n}\n"}
+        with temp_project(files) as root:
+            write_fake_gradlew(root)
+            with self._mock_run("", code=124, stderr="Gradle command timed out after 300s"):
+                scan = server.scan_project(root)
+        blob = " ".join(scan.get("gradleErrors") or []) + " " + " ".join(scan.get("notes") or [])
+        self.assertIn("exited with code 124", blob)
+        self.assertIn("timed out", blob)
+        self.assertNotIn(_NO_PRODUCTION_NOTE, blob)
+        self.assertIn("All Gradle dependency tasks failed.", scan.get("notes") or [])
 
 
 if __name__ == "__main__":
