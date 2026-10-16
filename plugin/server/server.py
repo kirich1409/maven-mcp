@@ -3334,6 +3334,9 @@ def _resolve_pom_graph_impl(
             )
         return managed_cache[key]
 
+    # One required introduction: a single path with no patterns. ``all([])`` is
+    # true, so a node with no stored paths must not omit every child. An empty
+    # pattern list does not match.
     root: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
@@ -3341,23 +3344,83 @@ def _resolve_pom_graph_impl(
         "relation": "SELF",
         "errors": [],
         "pomLicenses": [],
-        "exclusions": set(),
+        "intros": [{
+            "parent": None,
+            "version": version,
+            "depth": 0,
+            "optional": False,
+            "paths": [[]],
+        }],
         "walk": True,
         "depth": 0,
         "_loaded": True,
         "_pom": root_pom,
+        "_omitted": False,
     }
     root["pomLicenses"] = _license_strings_from_pom(root_pom)
     nodes.append(root)
     ga_index[(group_id, artifact_id)] = 0
 
-    def exclusion_set(intros: List[Dict[str, Any]]) -> set:
-        # A required introduction walks the node. Optional edges are not part
-        # of that intersection: an empty optional set must not clear an
-        # exclusion on a required edge. All-optional keeps the old intersection.
-        required = [dep for dep in intros if not dep["optional"]]
+    def freeze_paths(
+        paths: List[List[Tuple[str, str]]],
+    ) -> Tuple[Tuple[Tuple[str, str], ...], ...]:
+        return tuple(tuple(path) for path in paths)
+
+    def sync_intro_keys(node: Dict[str, Any]) -> None:
+        node["_intro_keys"] = {
+            (
+                intro["parent"],
+                intro["version"],
+                intro["depth"],
+                freeze_paths(intro["paths"]),
+            )
+            for intro in node["intros"]
+        }
+
+    def record_intro(
+        node: Dict[str, Any], dep: Dict[str, Any], intro_depth: int
+    ) -> Optional[Dict[str, Any]]:
+        paths = [list(path) for path in dep["paths"]]
+        key = (dep["parent"], dep["version"], intro_depth, freeze_paths(paths))
+        keys = node.setdefault("_intro_keys", set())
+        if key in keys:
+            return None
+        keys.add(key)
+        intro = {
+            "parent": dep["parent"],
+            "version": dep["version"],
+            "depth": intro_depth,
+            "optional": bool(dep["optional"]),
+            "paths": paths,
+        }
+        node["intros"].append(intro)
+        return intro
+
+    def selected_paths(intros: List[Dict[str, Any]]) -> List[List[Tuple[str, str]]]:
+        # Optional introductions are not paths while any required introduction
+        # exists. They stay on the node: deleting the required introduction
+        # marks the node optional again instead of omitting it. An empty
+        # optional path must not be part of this list, or all-match would
+        # clear the required exclusion.
+        required = [intro for intro in intros if not intro["optional"]]
         pool = required or intros
-        return set.intersection(*(set(dep["exclusions"]) for dep in pool))
+        paths: List[List[Tuple[str, str]]] = []
+        for intro in pool:
+            paths.extend(intro["paths"])
+        return paths
+
+    def paths_omit(paths: List[List[Tuple[str, str]]], ga: Tuple[str, str]) -> bool:
+        if not paths:
+            return False
+        return all(_pom_ga_excluded(ga, path) for path in paths)
+
+    def child_paths(
+        selected: List[List[Tuple[str, str]]], edge_patterns: List[Tuple[str, str]]
+    ) -> List[List[Tuple[str, str]]]:
+        patterns = list(edge_patterns)
+        if not selected:
+            return [patterns]
+        return [list(path) + patterns for path in selected]
 
     def group_declared(
         declared: List[Dict[str, Any]],
@@ -3373,19 +3436,70 @@ def _resolve_pom_graph_impl(
         return groups, order
 
     expanded_nodes: set = set()
+    pending: Dict[int, List[int]] = {0: [0]}
+    # New GAs held back while a shallower optional node is still unexpanded.
+    # Creating them in the same pass lets the farther version occupy ga_index.
+    deferred: List[Tuple[int, List[Dict[str, Any]]]] = []
+    # Restored children, mediated by the pass whose depth is the parent's own
+    # depth. Not the caller frontier: that would record them one level too near.
+    reopen_pending: Dict[int, List[Dict[str, Any]]] = {}
+    dropped_parents: set = set()
 
-    def collect_from(index: int, declared: List[Dict[str, Any]]) -> None:
+    def note_skip(dep: Dict[str, Any], reason: str) -> None:
         nonlocal partial
+        partial = True
+        row = {
+            "groupId": dep["groupId"],
+            "artifactId": dep["artifactId"],
+            "version": dep.get("version") or "",
+            "errors": [reason],
+        }
+        if row not in skipped:
+            skipped.append(row)
+
+    def already_introduced(
+        parent: int, ga: Tuple[str, str], declared: List[Dict[str, Any]]
+    ) -> bool:
+        group_id, artifact_id = ga
+        for edge in edges:
+            if edge["from"] != parent:
+                continue
+            target = nodes[edge["to"]]
+            if target.get("_omitted"):
+                continue
+            if target["groupId"] == group_id and target["artifactId"] == artifact_id:
+                return True
+        for node in nodes:
+            if node.get("_omitted"):
+                continue
+            if node["groupId"] != group_id or node["artifactId"] != artifact_id:
+                continue
+            if any(intro["parent"] == parent for intro in node["intros"]):
+                return True
+        lists = [declared]
+        lists.extend(held for _depth, held in deferred)
+        lists.extend(reopen_pending.values())
+        for items in lists:
+            for dep in items:
+                if (
+                    dep.get("parent") == parent
+                    and dep.get("groupId") == group_id
+                    and dep.get("artifactId") == artifact_id
+                ):
+                    return True
+        return False
+
+    def emit_children(
+        index: int,
+        declared_out: List[Dict[str, Any]],
+        current: List[Dict[str, Any]],
+        only_new: bool,
+    ) -> None:
         if deadline_hit:
             return
-        if index in expanded_nodes:
-            return
         node = nodes[index]
-        if not node.get("walk"):
-            return
-        expanded_nodes.add(index)
         pom = node.get("_pom")
-        if not pom:
+        if not pom or node.get("_omitted"):
             return
         props = _collect_bom_properties(
             pom, node["version"], ctx, _pom_reader=reader
@@ -3395,58 +3509,169 @@ def _resolve_pom_graph_impl(
         managed = managed_for(node, props)
         if deadline_hit:
             return
+        selected = selected_paths(node["intros"])
         for dep in _parse_direct_pom_dependencies(pom, props):
             ga = (dep["groupId"], dep["artifactId"])
             if dep.get("skip"):
-                partial = True
-                skipped.append({
-                    "groupId": dep["groupId"],
-                    "artifactId": dep["artifactId"],
-                    "version": dep.get("version") or "",
-                    "errors": [dep["skip"]],
-                })
+                if not only_new:
+                    note_skip(dep, dep["skip"])
                 continue
-            if _pom_ga_excluded(ga, node["exclusions"]):
+            if paths_omit(selected, ga):
+                continue
+            if only_new and (
+                already_introduced(index, ga, current)
+                or any(
+                    item.get("parent") == index
+                    and item.get("groupId") == ga[0]
+                    and item.get("artifactId") == ga[1]
+                    for item in declared_out
+                )
+            ):
                 continue
             resolved, reason = _resolve_declared_version(
                 dep.get("version"), managed.get(ga)
             )
             if reason or not resolved:
-                partial = True
-                skipped.append({
-                    "groupId": dep["groupId"],
-                    "artifactId": dep["artifactId"],
-                    "version": dep.get("version") or "",
-                    "errors": [reason or "version not specified"],
-                })
+                if not only_new:
+                    note_skip(dep, reason or "version not specified")
                 continue
-            child_excl = set(node["exclusions"])
-            child_excl.update(dep.get("exclusions") or [])
-            declared.append({
+            declared_out.append({
                 "parent": index,
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "version": resolved,
                 "optional": bool(dep.get("optional")),
-                "exclusions": child_excl,
+                "paths": child_paths(selected, list(dep.get("exclusions") or [])),
             })
 
-    def schedule(depth: int, index: int, pending: Dict[int, List[int]]) -> None:
+    def collect_from(index: int, declared: List[Dict[str, Any]]) -> None:
+        if deadline_hit:
+            return
         if index in expanded_nodes:
             return
-        bucket = pending.setdefault(depth, [])
+        node = nodes[index]
+        if not node.get("walk") or node.get("_omitted"):
+            return
+        expanded_nodes.add(index)
+        emit_children(index, declared, declared, only_new=False)
+
+    def schedule(depth: int, index: int, pending_nodes: Dict[int, List[int]]) -> None:
+        if index in expanded_nodes:
+            return
+        bucket = pending_nodes.setdefault(depth, [])
         if index not in bucket:
             bucket.append(index)
 
-    pending: Dict[int, List[int]] = {0: [0]}
-    # New GAs held back while a shallower optional node is still unexpanded.
-    # Creating them in the same pass lets the farther version occupy ga_index.
-    deferred: List[Tuple[int, List[Dict[str, Any]]]] = []
+    def strip_parent(items: List[Dict[str, Any]], parent: int) -> None:
+        items[:] = [item for item in items if item.get("parent") != parent]
+
+    def drop_expansion(index: int, holders: List[List[Dict[str, Any]]]) -> None:
+        dropped_parents.add(index)
+        for holder in holders:
+            strip_parent(holder, index)
+        for _depth, held in deferred:
+            strip_parent(held, index)
+        for depth in list(reopen_pending):
+            strip_parent(reopen_pending[depth], index)
+            if not reopen_pending[depth]:
+                del reopen_pending[depth]
+        edges[:] = [edge for edge in edges if edge["from"] != index]
+        orphans = []
+        for child_index, child in enumerate(nodes):
+            if child_index == index or child.get("_omitted"):
+                continue
+            kept = [intro for intro in child["intros"] if intro["parent"] != index]
+            if len(kept) == len(child["intros"]):
+                continue
+            child["intros"] = kept
+            sync_intro_keys(child)
+            if not kept:
+                orphans.append(child_index)
+            elif not any(not intro["optional"] for intro in kept):
+                # No required introduction remains. Do not fall back to the
+                # optional pattern pool and do not reopen. Children already
+                # kept stay. A version change is the only drop.
+                child["walk"] = False
+        for orphan in orphans:
+            omit_node(orphan, holders)
+
+    def omit_node(index: int, holders: List[List[Dict[str, Any]]]) -> None:
+        node = nodes[index]
+        if node.get("_omitted"):
+            return
+        node["_omitted"] = True
+        node["walk"] = False
+        node["intros"] = []
+        node["_intro_keys"] = set()
+        ga = (node["groupId"], node["artifactId"])
+        if ga_index.get(ga) == index:
+            del ga_index[ga]
+        for depth in list(pending):
+            pending[depth] = [item for item in pending[depth] if item != index]
+            if not pending[depth]:
+                del pending[depth]
+        expanded_nodes.discard(index)
+        edges[:] = [
+            edge for edge in edges if edge["from"] != index and edge["to"] != index
+        ]
+        drop_expansion(index, holders)
+
+    def revisit(
+        index: int,
+        new_intros: List[Dict[str, Any]],
+        declared: List[Dict[str, Any]],
+        holders: List[List[Dict[str, Any]]],
+    ) -> None:
+        node = nodes[index]
+        if node.get("_omitted"):
+            return
+        winner_version = node["version"]
+        replaced = False
+        for intro in new_intros:
+            if intro["depth"] != node["depth"]:
+                continue
+            if compare_versions(intro["version"], winner_version) > 0:
+                winner_version = intro["version"]
+                replaced = True
+        if replaced:
+            node["version"] = winner_version
+            for edge in edges:
+                if edge["to"] == index:
+                    edge["requirement"] = winner_version
+            expanded_nodes.discard(index)
+            node["_loaded"] = False
+            node["_pom"] = None
+            drop_expansion(index, holders)
+            node["errors"] = []
+            load_pom(node)
+            if deadline_hit and not node.get("_loaded"):
+                node["walk"] = False
+                return
+            if node["errors"] or not any(
+                not intro["optional"] for intro in node["intros"]
+            ):
+                node["walk"] = False
+            else:
+                node["walk"] = True
+                schedule(node["depth"], index, pending)
+            return
+        if index not in expanded_nodes:
+            return
+        if not any(not intro["optional"] for intro in node["intros"]):
+            node["walk"] = False
+            return
+        restored: List[Dict[str, Any]] = []
+        emit_children(index, restored, declared, only_new=True)
+        if restored:
+            # The pass at this node's depth creates the child at depth + 1.
+            # Mediating here, at the caller frontier, would record it nearer.
+            reopen_pending.setdefault(node["depth"], []).extend(restored)
 
     def promote_same_depth(depth: int, declared: List[Dict[str, Any]]) -> None:
         # A required edge to an optional node at this same depth walks that
         # node now. Its children join this depth's introductions and are not
-        # pushed onto the next depth.
+        # pushed onto the next depth. The promoting introduction is deeper
+        # than the node, so it does not change the recorded version.
         progressed = True
         while progressed:
             progressed = False
@@ -3458,17 +3683,37 @@ def _resolve_pom_graph_impl(
                 if winner in expanded_nodes:
                     continue
                 winner_node = nodes[winner]
+                if winner_node.get("_omitted"):
+                    continue
                 if winner_node["depth"] != depth or winner_node["errors"]:
                     continue
                 if winner_node["walk"]:
                     continue
                 if not any(not dep["optional"] for dep in intros):
                     continue
-                winner_node["exclusions"] = exclusion_set(intros)
+                # Keep optional introductions. They are not paths while this
+                # required introduction exists, and they are what makes the
+                # node optional again if that introduction is later deleted.
+                new_intros = []
+                for dep in intros:
+                    if dep["optional"]:
+                        continue
+                    intro = record_intro(winner_node, dep, depth + 1)
+                    if intro is not None:
+                        new_intros.append(intro)
+                # No-op here: not expanded, and the introduction is deeper
+                # than the node. Append before this call so a later walk sees
+                # the required paths.
+                revisit(winner, new_intros, declared, [declared])
                 winner_node["walk"] = True
                 collect_from(winner, declared)
                 progressed = True
                 break
+
+    def append_known_edge(parent: int, target: int, requirement: str) -> None:
+        if any(edge["from"] == parent and edge["to"] == target for edge in edges):
+            return
+        edges.append({"from": parent, "to": target, "requirement": requirement})
 
     def mediate(
         depth: int, declared: List[Dict[str, Any]], defer_new: bool
@@ -3477,30 +3722,63 @@ def _resolve_pom_graph_impl(
         if deadline_hit:
             return []
         fresh: List[Dict[str, Any]] = []
+        holders = [declared, fresh]
         groups, order = group_declared(declared)
         for ga in order:
-            intros = groups[ga]
+            intros = [
+                dep for dep in groups[ga]
+                if dep.get("parent") not in dropped_parents
+            ]
+            if not intros:
+                continue
             if ga in ga_index:
                 winner = ga_index[ga]
                 winner_node = nodes[winner]
-                for dep in intros:
-                    edges.append({
-                        "from": dep["parent"],
-                        "to": winner,
-                        "requirement": winner_node["version"],
-                    })
-                # Shallower than this frontier: expand it at its own depth so
-                # its children are mediated there, not with this frontier's
-                # children. Same-depth promotions were expanded above.
-                if (
-                    not winner_node["walk"]
-                    and not winner_node["errors"]
-                    and any(not dep["optional"] for dep in intros)
-                ):
-                    winner_node["exclusions"] = exclusion_set(intros)
-                    winner_node["walk"] = True
-                    schedule(winner_node["depth"], winner, pending)
-                continue
+                if winner_node.get("_omitted"):
+                    # An empty record must not be revived. A later introduction
+                    # is a new node.
+                    del ga_index[ga]
+                else:
+                    new_intros = []
+                    for dep in intros:
+                        intro = record_intro(winner_node, dep, depth + 1)
+                        if intro is not None:
+                            new_intros.append(intro)
+                    seen_parents = set()
+                    for dep in intros:
+                        parent = dep["parent"]
+                        if parent in seen_parents:
+                            continue
+                        seen_parents.add(parent)
+                        append_known_edge(parent, winner, winner_node["version"])
+                    required_here = any(not dep["optional"] for dep in intros)
+                    not_walking = (
+                        not winner_node["walk"]
+                        and not winner_node["errors"]
+                        and required_here
+                    )
+                    if not_walking and winner_node["depth"] < depth:
+                        # Shallower than this frontier. The edge is already
+                        # appended. Do not replace, fetch, collect, or reopen.
+                        # Expand at the node's own depth.
+                        winner_node["walk"] = True
+                        schedule(winner_node["depth"], winner, pending)
+                        continue
+                    if not_walking and winner_node["depth"] > depth:
+                        # Required, not yet walking, and deeper than this
+                        # frontier. Schedule even when the version does not
+                        # change; a same-depth higher version still replaces.
+                        winner_node["walk"] = True
+                        schedule(winner_node["depth"], winner, pending)
+                        revisit(winner, new_intros, declared, holders)
+                        continue
+                    if not_walking:
+                        winner_node["walk"] = True
+                        schedule(winner_node["depth"], winner, pending)
+                        continue
+                    if winner_node["walk"] or winner in expanded_nodes:
+                        revisit(winner, new_intros, declared, holders)
+                    continue
             if defer_new:
                 fresh.extend(intros)
                 continue
@@ -3521,12 +3799,15 @@ def _resolve_pom_graph_impl(
                 "relation": "DIRECT" if parent_rel == "SELF" else "INDIRECT",
                 "errors": [],
                 "pomLicenses": [],
-                "exclusions": exclusion_set(intros),
+                "intros": [],
                 "walk": walk,
                 "depth": depth + 1,
                 "_loaded": False,
                 "_pom": None,
+                "_omitted": False,
             }
+            for dep in intros:
+                record_intro(node, dep, depth + 1)
             load_pom(node)
             if deadline_hit and not node.get("_loaded"):
                 break
@@ -3543,17 +3824,32 @@ def _resolve_pom_graph_impl(
                 })
             if node["walk"]:
                 schedule(depth + 1, new_index, pending)
-        return fresh
+        kept = [item for item in fresh if item.get("parent") not in dropped_parents]
+        # The set hid this mediation's already-built groups. The winner's
+        # later collect must still be able to introduce its own children.
+        dropped_parents.clear()
+        return kept
 
-    while pending or deferred:
+    while pending or deferred or reopen_pending:
+        deferred[:] = [(depth, items) for depth, items in deferred if items]
+        for depth in [key for key, items in reopen_pending.items() if not items]:
+            del reopen_pending[depth]
+        if not pending and not deferred and not reopen_pending:
+            break
         if deadline_hit or _past_deadline():
             deadline_hit = True
             break
-        # Apply a held frontier only once every still-pending bucket is at
-        # least as deep, so the shallower node's children occupy ga_index first.
-        if deferred and (
-            not pending or min(pending) >= min(item[0] for item in deferred)
-        ):
+        min_deferred = min((item[0] for item in deferred), default=None)
+        min_pending = min(pending) if pending else None
+        min_reopen = min(reopen_pending) if reopen_pending else None
+        # Apply a held frontier only once every still-pending bucket, and any
+        # restored children for a shallower pass, are at least as deep.
+        deferred_ready = (
+            min_deferred is not None
+            and (min_pending is None or min_pending >= min_deferred)
+            and (min_reopen is None or min_reopen >= min_deferred)
+        )
+        if deferred_ready:
             pick = min(range(len(deferred)), key=lambda i: deferred[i][0])
             depth, declared = deferred.pop(pick)
             # Uncollected nodes at this depth introduce children in the same
@@ -3562,12 +3858,21 @@ def _resolve_pom_graph_impl(
             # is never read.
             for index in pending.pop(depth, []):
                 collect_from(index, declared)
-        else:
-            depth = min(pending)
+            declared.extend(reopen_pending.pop(depth, []))
+        elif min_pending is not None and (
+            min_reopen is None or min_pending <= min_reopen
+        ):
+            depth = min_pending
             batch = pending.pop(depth)
             declared = []
             for index in batch:
                 collect_from(index, declared)
+            declared.extend(reopen_pending.pop(depth, []))
+        elif min_reopen is not None:
+            depth = min_reopen
+            declared = reopen_pending.pop(depth)
+        else:
+            break
         if deadline_hit:
             break
         promote_same_depth(depth, declared)
@@ -3585,6 +3890,7 @@ def _resolve_pom_graph_impl(
                 and winner not in expanded_nodes
                 and not winner_node["walk"]
                 and not winner_node["errors"]
+                and not winner_node.get("_omitted")
                 and any(not dep["optional"] for dep in groups[ga])
             ):
                 defer_new = True
@@ -3597,8 +3903,12 @@ def _resolve_pom_graph_impl(
         if defer_new and held:
             deferred.append((depth, held))
 
-    public_nodes = []
-    for node in nodes:
+    index_map: Dict[int, int] = {}
+    public_nodes: List[Dict[str, Any]] = []
+    for index, node in enumerate(nodes):
+        if node.get("_omitted") or not node.get("intros"):
+            continue
+        index_map[index] = len(public_nodes)
         public_nodes.append({
             "groupId": node["groupId"],
             "artifactId": node["artifactId"],
@@ -3607,10 +3917,21 @@ def _resolve_pom_graph_impl(
             "errors": list(node["errors"]),
             "pomLicenses": list(node.get("pomLicenses") or []),
         })
+    public_edges = []
+    for edge in edges:
+        src = index_map.get(edge["from"])
+        dst = index_map.get(edge["to"])
+        if src is None or dst is None:
+            continue
+        public_edges.append({
+            "from": src,
+            "to": dst,
+            "requirement": edge["requirement"],
+        })
     out = {
         "ok": True,
         "nodes": public_nodes,
-        "edges": edges,
+        "edges": public_edges,
         "partial": partial,
         "truncated": truncated,
         "error": None,
@@ -3620,6 +3941,8 @@ def _resolve_pom_graph_impl(
         out["partial"] = True
         out["notes"] = [_tool_deadline_note()]
     return _with_capability(out, capability)
+
+
 
 
 def apply_bom_managed_versions(scan: Dict, ctx: "ResolutionContext") -> Dict:
