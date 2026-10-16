@@ -14870,9 +14870,10 @@ def _run_gradle_command(
 def _is_production_runtime_configuration(config: str) -> bool:
     """True for production runtime classpaths; excludes test/compile/classpath.
 
-    Duplicated in ``_generate_gradle_upgrade_init_script``. That script must
-    not read ``resolutionResult`` on a rejected name. Python still drops a
-    dumped upgrade tree that fails this predicate.
+    Duplicated in ``_generate_gradle_upgrade_init_script`` and
+    ``_generate_gradle_resolve_init_script``. Those scripts must not read
+    ``resolutionResult`` on a rejected name. Python still drops a dumped
+    upgrade tree that fails this predicate.
     """
     if not config:
         return False
@@ -14891,7 +14892,8 @@ def _select_configurations_to_resolve(available: List[str]) -> List[str]:
     """Pick production runtime configurations from a probed Gradle config list.
 
     Prefer ``release*RuntimeClasspath`` over bare ``runtimeClasspath``. The
-    same preference is duplicated in ``_generate_gradle_upgrade_init_script``.
+    same preference is duplicated in ``_generate_gradle_upgrade_init_script``
+    and ``_generate_gradle_resolve_init_script``.
     """
     selected = [c for c in available if _is_production_runtime_configuration(c)]
     if not selected:
@@ -14959,11 +14961,19 @@ _INIT_BUILDENV_END = "===MAVEN_MCP_BUILDENV_END==="
 
 def _generate_gradle_resolve_init_script() -> str:
     """Groovy ``--init-script`` (#401) that dumps resolved first-level GAVs for
-    every resolvable configuration of every project, plus the root buildscript
-    classpath, in ONE Gradle invocation / configuration phase — replacing the
-    previous ``1 + P*(1+C)`` separate ``gradlew`` invocations (a probe run per
-    module, then one ``dependencies --configuration`` run per selected
-    configuration, plus one ``buildEnvironment`` run) with exactly one.
+    the project configurations ``_select_configurations_to_resolve`` would keep,
+    plus the root buildscript classpath, in ONE Gradle invocation /
+    configuration phase — replacing the previous ``1 + P*(1+C)`` separate
+    ``gradlew`` invocations (a probe run per module, then one
+    ``dependencies --configuration`` run per selected configuration, plus one
+    ``buildEnvironment`` run) with exactly one.
+
+    Selection is duplicated from ``_generate_gradle_upgrade_init_script``
+    (``isProductionRuntime`` and the per-project ``release*RuntimeClasspath``
+    drop of bare ``runtimeClasspath``) and runs before any project-configuration
+    ``resolutionResult`` read. An unresolvable configuration does not enter the
+    set, so an unresolvable ``release*RuntimeClasspath`` does not drop a
+    resolvable ``runtimeClasspath``. The buildscript classpath read is separate.
 
     Only first-level (direct) dependencies are dumped, matching the old text
     parser exactly: ``_parse_gradle_dependencies_stdout`` only ever matched
@@ -14995,16 +15005,52 @@ def _generate_gradle_resolve_init_script() -> str:
 import org.gradle.api.artifacts.result.ResolvedDependencyResult
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 
+// Duplicates _is_production_runtime_configuration and
+// _select_configurations_to_resolve. A project configuration is resolved only
+// after this selection. The buildscript classpath read below is separate.
+def isTestConfiguration(String name) {
+    if (name.startsWith("test")) {
+        return true
+    }
+    return name.matches(".*[a-z]Test.*")
+}
+
+def isProductionRuntime(String name) {
+    if (name == null || name.isEmpty()) {
+        return false
+    }
+    if (isTestConfiguration(name)) {
+        return false
+    }
+    if (name == "classpath" || name == "compileOnly") {
+        return false
+    }
+    if (name == "compileClasspath" || name.endsWith("CompileClasspath")) {
+        return false
+    }
+    // endswith("RuntimeClasspath") misses Java's runtimeClasspath (lowercase r).
+    return name == "runtimeClasspath" || name.endsWith("RuntimeClasspath")
+}
+
 gradle.projectsEvaluated {
     gradle.rootProject.allprojects.each { p ->
         println("===MAVEN_MCP_MODULE=== " + p.path)
         // Gradle 9 rejects resolving another project's configurations unless the
         // project's mutable state is locked, so run the dump inside its lock.
         p.owner.applyToMutableState { pp ->
+        def selected = []
         pp.configurations.each { cfg ->
-            if (!cfg.canBeResolved) {
-                return
+            if (cfg.canBeResolved && isProductionRuntime(cfg.name)) {
+                selected.add(cfg)
             }
+        }
+        def hasRelease = selected.any { cfg ->
+            cfg.name.startsWith("release") && cfg.name.endsWith("RuntimeClasspath")
+        }
+        if (hasRelease) {
+            selected = selected.findAll { cfg -> cfg.name != "runtimeClasspath" }
+        }
+        selected.each { cfg ->
             println("===MAVEN_MCP_CONFIG=== " + cfg.name)
             try {
                 def root = cfg.incoming.resolutionResult.root
