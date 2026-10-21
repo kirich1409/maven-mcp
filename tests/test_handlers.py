@@ -1531,8 +1531,17 @@ class TestAuditProjectDependencies(unittest.TestCase):
             "<dependency><groupId>com.example</groupId><artifactId>c</artifactId><version>1.0.0</version></dependency>"
             "</dependencies></project>"
         )
+        def _route(req, *args, **kwargs):
+            # Three deps run in parallel, and each one also fetches a POM.
+            # A shared queue of three metadata responses is consumed by
+            # whichever request wins the race.
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if ".pom" in url:
+                return mock_urlopen([http_error(url, 404, "Not Found")])(req, *args, **kwargs)
+            return mock_urlopen([(200, _meta(["1.0.0"]))])(req, *args, **kwargs)
+
         with temp_project({"pom.xml": pom}) as root:
-            with _patch_urlopen([(200, _meta(["1.0.0"]))] * 3):
+            with unittest.mock.patch("urllib.request.urlopen", side_effect=_route):
                 out = server.handle_audit_project_dependencies({
                     "projectPath": root, "includeVulnerabilities": False,
                 })
