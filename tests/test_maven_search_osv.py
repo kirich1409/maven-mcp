@@ -1150,6 +1150,9 @@ class TestMaliciousFlag(unittest.TestCase):
                         server, "fetch_metadata",
                         return_value={"versions": ["1.0.0"], "resolvedFrom": None},
                     ), \
+                    unittest.mock.patch.object(
+                        server, "check_relocation", return_value=None,
+                    ), \
                     unittest.mock.patch(
                         "urllib.request.urlopen",
                         side_effect=mock_urlopen([

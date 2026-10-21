@@ -26,16 +26,15 @@ hand.
      in the same report (adds extra POM/GitHub fetches, so it's opt-in)
 
 2. Present the report:
-   - Upgrade table from `dependencies[]` (current → latest, `upgradeType`), grouped by
-     `source.kind` like `/check-deps` does.
+   - Candidate table from `dependencies[]` (`currentVersion`, `currentLine`, `candidates`), grouped by
+     `source.kind` like `/check-deps` does. Follow that skill's naming rule. The server does not choose a version. Vulnerability and license fields describe the pin.
    - Vulnerabilities section for any entry with non-empty `vulnerabilities[]`, sorted by
      severity; call out `malicious: true` findings first.
    - When `includeLicenses` was set, a `licenses` section (`summary.byCategory`,
      `uniqueSpdxIds`, `hasProprietaryOrCopyleft`) plus `newLicenseCategories` — categories
      that appear exactly once in the scanned set (e.g. one AGPL dependency in an otherwise
      Apache/MIT tree).
-   - Lead with the `summary` block (`total`, `upgradeable`, `vulnerable`, `major`, `minor`,
-     `patch`) as the headline, details below.
+   - Lead with the `summary` block (`total`, `upgradeable`, `vulnerable`) as the headline, details below. `upgradeable` counts rows with non-empty `candidates`. An `error` row was not checked.
 
 3. Follow the same confirm-before-edit discipline as `/check-deps` if the user wants
    updates applied — this skill's job is the combined report, not unattended edits.

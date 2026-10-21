@@ -86,9 +86,17 @@ GOOGLE_MAVEN_GROUPS = (
     "com.google.gms.", "com.google.mlkit.", "com.google.ar.",
 )
 
+# Qualifier boundary after the token: a digit, "-", ".", "+", or end.
+# The boundary keeps a longer word stable: "1.0.0-devtools" is not "dev",
+# and "1.0.0-prerelease" is not "pre" (#70).
+_PRERELEASE_BOUNDARY = r"(?=\d|[-.+]|$)"
 STABILITY_PATTERNS = [
     (re.compile(r'[-.]?SNAPSHOT$', re.IGNORECASE), "snapshot"),
+    (re.compile(r'[-.](?:dev|nightly)' + _PRERELEASE_BOUNDARY, re.IGNORECASE), "snapshot"),
     (re.compile(r'[-.](?:alpha|a(?=\d|[-.]|$))[-.]?\d*', re.IGNORECASE), "alpha"),
+    (re.compile(
+        r'[-.](?:eap|ea|preview|pre)' + _PRERELEASE_BOUNDARY, re.IGNORECASE,
+    ), "alpha"),
     (re.compile(r'[-.](?:beta|b(?=\d|[-.]|$))[-.]?\d*', re.IGNORECASE), "beta"),
     (re.compile(r'[-.](?:M|milestone)[-.]?\d*', re.IGNORECASE), "milestone"),
     (re.compile(r'[-.](?:RC|CR)[-.]?\d*', re.IGNORECASE), "rc"),
@@ -2713,6 +2721,8 @@ def fetch_pom(
     version: str,
     ctx: "ResolutionContext",
     deadline_monotonic: Optional[float] = None,
+    *,
+    skip_failed_metadata: bool = False,
 ) -> Optional[str]:
     repos = _repos_for(group_id, artifact_id, ctx)
     for entry in repos:
@@ -2721,6 +2731,14 @@ def fetch_pom(
         # hole (#41), not this walk. An exhausted bound skips the GET.
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             break
+        # Audit only. A metadata timeout or 5xx is already remembered for this
+        # URL; contacting the same host again for the POM spends the rest of
+        # the tool budget (#41). Other callers leave the flag false and do
+        # not consult that map.
+        if skip_failed_metadata and _repo_failure_lookup(
+            _metadata_url(entry["url"], group_id, artifact_id)
+        ) is not None:
+            continue
         url = _pom_url(entry["url"], group_id, artifact_id, version)
         try:
             status, body = _repo_http_get(
@@ -2734,15 +2752,33 @@ def fetch_pom(
 
 
 def check_relocation(
-    group_id: str, artifact_id: str, version: str, ctx: "ResolutionContext"
+    group_id: str,
+    artifact_id: str,
+    version: str,
+    ctx: "ResolutionContext",
+    deadline: Optional[float] = None,
 ) -> Optional[Dict[str, str]]:
     """Fetch a resolved coordinate's POM and report Maven relocation, if any
     (#284). Returns None when the POM can't be fetched (repo miss, transport
     failure — degrades silently, same as any other optional POM-derived field)
     or carries no `<relocation>` block. Reuses `fetch_pom`'s cache (POM TTL 7
     days), so this is one extra cached network call on top of whatever the
-    caller already made to resolve `version` — not a new resolution pass."""
-    pom = fetch_pom(group_id, artifact_id, version, ctx)
+    caller already made to resolve `version` — not a new resolution pass.
+
+    ``deadline`` is the audit's wall-clock bound. Only that path skips a
+    repository whose metadata probe is already remembered as a timeout or 5xx.
+    """
+    mono: Optional[float] = None
+    if deadline is not None:
+        remaining = deadline - _now()
+        if remaining <= 0:
+            return None
+        mono = time.monotonic() + remaining
+    pom = fetch_pom(
+        group_id, artifact_id, version, ctx,
+        deadline_monotonic=mono,
+        skip_failed_metadata=deadline is not None,
+    )
     if pom is None:
         return None
     return extract_relocation_from_pom(pom, group_id, artifact_id, version)
@@ -9102,17 +9138,36 @@ def check_version_compatibility(
 # Version classification & comparison
 # ---------------------------------------------------------------------------
 
-def classify_version(version: str) -> str:
+# ga / final / release name the release line of the same numeric core.
+_RELEASE_ALIAS_RE = re.compile(r"^[-.]?(?:ga|final|release)$", re.IGNORECASE)
+# A datestamp core (20030203.000550) is not a bare stable and not a candidate
+# once any ordinary release is published.
+_DATESTAMP_RE = re.compile(r"^\d{8,}(?:\.|$)")
+
+
+def classify_version(version: str) -> Optional[str]:
+    """Known class, or None when the qualifier is not a known token.
+
+    A bare number and a ga/final/release alias are stable. An unknown
+    qualifier such as jre or devtools is not stable: the answer omits
+    ``stability`` and the version stays on its own line.
+    """
     for pattern, stability in STABILITY_PATTERNS:
         if pattern.search(version):
             return stability
-    return "stable"
+    _core, qual = _split_core_and_qualifier(version)
+    if not qual or _RELEASE_ALIAS_RE.match(qual):
+        return "stable"
+    return None
 
 
-# Digits attached to known prerelease tokens only — free-text qualifier digits
-# (e.g. "0.6.x-compat") must not be treated as ordinal prerelease numbers (#331).
+# Digits attached to known prerelease tokens only. A "+" number on those
+# tokens is the ordinal (17-ea+9 < 17-ea+10). A "+" number on a stable
+# version is not an ordinal, because this pattern never matches it.
 _PRERELEASE_ORDINAL_RE = re.compile(
-    r"(?:alpha|a(?=\d)|beta|b(?=\d)|milestone|m(?=\d)|rc|cr|snapshot)[-.]?(\d+)",
+    r"(?:preview|eap|ea(?=\d|[-.+]|$)|pre(?=\d|[-.+]|$)|nightly|"
+    r"dev(?=\d|[-.+]|$)|alpha|a(?=\d)|beta|b(?=\d)|milestone|m(?=\d)|rc|cr|snapshot)"
+    r"[-.+]?(\d+)",
     re.IGNORECASE,
 )
 
@@ -9174,20 +9229,33 @@ def _compare_int_lists(a: List[int], b: List[int]) -> int:
     return 0
 
 
+def _release_alias_rank(version: str) -> Optional[int]:
+    """Display rank for one stable core: bare, then release, final, ga.
+
+    None when the version is not a bare stable or a ga/final/release alias.
+    Comparison treats those four as equal; this rank only picks the string.
+    """
+    if classify_version(version) != "stable":
+        return None
+    _core, qual = _split_core_and_qualifier(version)
+    if not qual:
+        return 0
+    token = qual.lstrip(".-+").lower()
+    return {"release": 1, "final": 2, "ga": 3}.get(token)
+
+
 def compare_versions(a: str, b: str) -> int:
     """Returns negative if a < b, positive if a > b, 0 if equal."""
     core_diff = _compare_int_lists(_parse_segments(a), _parse_segments(b))
     if core_diff != 0:
         return core_diff
-    weight_diff = PRERELEASE_WEIGHT.get(classify_version(a), 5) - PRERELEASE_WEIGHT.get(classify_version(b), 5)
+    weight_diff = _stability_rank(a) - _stability_rank(b)
     if weight_diff != 0:
         return weight_diff
-    has_suffix_a = bool(_split_core_and_qualifier(a)[1])
-    has_suffix_b = bool(_split_core_and_qualifier(b)[1])
-    if has_suffix_a != has_suffix_b:
-        # #325/#331: same core, same stability class, but only one side carries
-        # a qualifier at all — the bare version always ranks higher.
-        return 1 if not has_suffix_a else -1
+    # ga / final / release of one core compare equal. The displayed string
+    # is chosen by _prefer_bare, not by this inequality.
+    if _release_alias_rank(a) is not None and _release_alias_rank(b) is not None:
+        return 0
     tail_diff = _compare_int_lists(_extract_prerelease_numbers(a), _extract_prerelease_numbers(b))
     if tail_diff != 0:
         return tail_diff
@@ -9211,18 +9279,172 @@ def find_latest_version(versions: List[str], filter_mode: str = "PREFER_STABLE")
     return stable if stable is not None else versions[-1]
 
 
+def _stability_rank(version: str) -> int:
+    """Order key for a known class. An unknown qualifier sorts below snapshot."""
+    kind = classify_version(version)
+    if kind is None:
+        return -1
+    return PRERELEASE_WEIGHT.get(kind, -1)
+
+
+def _is_datestamp(version: str) -> bool:
+    core, _qual = _split_core_and_qualifier(version)
+    return bool(_DATESTAMP_RE.match(core))
+
+
+def _unknown_line_key(qualifier: str) -> str:
+    """Line name for a qualifier that is not a known token or a release alias.
+
+    ``jre8``, ``jre-8`` and ``jre.8`` are one line. One trailing number on any
+    other qualifier is an ordinal inside the line, so ``foo``, ``foo.1`` and
+    ``foo9`` share ``foo``, while ``foo-bar`` is its own line.
+    """
+    q = qualifier.lstrip(".-_+")
+    if not q:
+        return "release"
+    platform = re.fullmatch(r"(?i)(jre|android)[-.]?(\d+)", q)
+    if platform:
+        return platform.group(1).lower() + platform.group(2)
+    platform = re.fullmatch(r"(?i)(jre|android)", q)
+    if platform:
+        return platform.group(1).lower()
+    trailed = re.fullmatch(r"(?i)(.+?)[.\-]?(\d+)", q)
+    if trailed and trailed.group(1) and not trailed.group(1)[-1].isdigit():
+        return trailed.group(1).lower()
+    return q.lower()
+
+
+def version_line(version: str) -> str:
+    """``release`` for a bare stable, a release alias, or a known prerelease."""
+    if classify_version(version) is not None:
+        return "release"
+    return _unknown_line_key(_split_core_and_qualifier(version)[1])
+
+
+def _major_minor(version: str) -> Tuple[int, int]:
+    parts = _parse_segments(version)
+    major = parts[0] if parts else 0
+    minor = parts[1] if len(parts) > 1 else 0
+    return major, minor
+
+
+def candidate_distance(current: str, candidate: str) -> str:
+    """Mechanical distance. A known prerelease is ``prerelease``, not a patch."""
+    kind = classify_version(candidate)
+    if kind is None:
+        return "other"
+    if kind != "stable":
+        return "prerelease"
+    cur_major, cur_minor = _major_minor(current)
+    cand_major, cand_minor = _major_minor(candidate)
+    if cand_major != cur_major:
+        return "major"
+    if cand_minor != cur_minor:
+        return "minor"
+    return "patch"
+
+
+def _display_rank(version: str) -> int:
+    rank = _release_alias_rank(version)
+    return 4 if rank is None else rank
+
+
+def _prefer_bare(chosen: Optional[str], challenger: str) -> str:
+    """Keep the newer version. Equal aliases prefer bare, then release, final, ga."""
+    if chosen is None or compare_versions(challenger, chosen) > 0:
+        return challenger
+    if (
+        compare_versions(challenger, chosen) == 0
+        and _display_rank(challenger) < _display_rank(chosen)
+    ):
+        return challenger
+    return chosen
+
+
+def find_bare_stable(versions: List[str]) -> Optional[str]:
+    """Newest bare stable. A datestamp, prerelease, or unknown qualifier is not it."""
+    best: Optional[str] = None
+    for version in versions:
+        if classify_version(version) != "stable" or _is_datestamp(version):
+            continue
+        best = _prefer_bare(best, version)
+    return best
+
+
+def select_candidates(versions: List[str], current: str) -> List[Dict[str, Any]]:
+    """Versions newer than ``current`` that the model may choose among.
+
+    No row is recommended. Patch history inside one minor is omitted. A
+    datestamp is omitted when any ordinary version is published.
+    """
+    has_ordinary = any(not _is_datestamp(version) for version in versions)
+    pool = [
+        version for version in versions
+        if not (has_ordinary and _is_datestamp(version))
+        and compare_versions(version, current) > 0
+    ]
+    cur_major, cur_minor = _major_minor(current)
+
+    same_and_newer_minors: Dict[Tuple[int, int], str] = {}
+    higher_majors: Dict[int, str] = {}
+    for version in pool:
+        if classify_version(version) != "stable":
+            continue
+        major, minor = _major_minor(version)
+        if major == cur_major and minor >= cur_minor:
+            same_and_newer_minors[(major, minor)] = _prefer_bare(
+                same_and_newer_minors.get((major, minor)), version,
+            )
+        elif major > cur_major:
+            higher_majors[major] = _prefer_bare(higher_majors.get(major), version)
+
+    prereleases: Dict[Tuple[int, ...], str] = {}
+    unknown_lines: Dict[str, str] = {}
+    for version in pool:
+        kind = classify_version(version)
+        if kind is not None and kind != "stable":
+            core = tuple(_parse_segments(version))
+            prereleases[core] = _prefer_bare(prereleases.get(core), version)
+        elif kind is None:
+            line = version_line(version)
+            unknown_lines[line] = _prefer_bare(unknown_lines.get(line), version)
+
+    chosen: List[str] = []
+    seen = set()
+    for version in (
+        list(same_and_newer_minors.values())
+        + list(higher_majors.values())
+        + list(prereleases.values())
+        + list(unknown_lines.values())
+    ):
+        if version not in seen:
+            seen.add(version)
+            chosen.append(version)
+    chosen.sort(key=functools.cmp_to_key(compare_versions))
+
+    rows: List[Dict[str, Any]] = []
+    for version in chosen:
+        row: Dict[str, Any] = {
+            "version": version,
+            "line": version_line(version),
+            "distance": candidate_distance(current, version),
+        }
+        stability = classify_version(version)
+        if stability is not None:
+            row["stability"] = stability
+        rows.append(row)
+    return rows
+
+
 def find_latest_version_for_current(versions: List[str], current_version: str) -> Optional[str]:
     """Highest version newer-or-equal to current at acceptable stability, else None.
 
-    A candidate qualifies iff it is newer-than-or-equal to current AND ranks at
-    least as stable on snapshot < alpha < beta < milestone < rc < stable; an
-    up-to-date dependency thus returns current itself (upgradeType "none"),
-    never a less-stable SNAPSHOT/RC as an upgrade from a more stable current
-    (#312). None only when nothing at acceptable stability is >= current.
+    Kept for callers that still want one version at least as stable as current.
+    Compare and audit return ``select_candidates`` instead of this value.
     """
-    current_rank = PRERELEASE_WEIGHT.get(classify_version(current_version), 5)
+    current_rank = _stability_rank(current_version)
     for v in reversed(versions):
-        if compare_versions(v, current_version) >= 0 and PRERELEASE_WEIGHT.get(classify_version(v), 5) >= current_rank:
+        if compare_versions(v, current_version) >= 0 and _stability_rank(v) >= current_rank:
             return v
     return None
 
@@ -9653,9 +9875,7 @@ def resolve_dependency_license(
         metadata = fetch_metadata(group_id, artifact_id, ctx)
         if not resolved_version:
             versions = metadata.get("versions") or []
-            resolved_version = find_latest_version(versions, "PREFER_STABLE") or (
-                versions[-1] if versions else None
-            )
+            resolved_version = find_bare_stable(versions)
             if not resolved_version:
                 result = _license_result(
                     group_id, artifact_id, None, None, None, None, "unknown", None,
@@ -12022,15 +12242,15 @@ def _aggregate_ga_versions(
             )
         except Exception:
             versions_sorted = list(versions)
-        latest = find_latest_version(versions_sorted) if versions_sorted else ""
-        out.append(
-            {
-                "groupId": key[0],
-                "artifactId": key[1],
-                "latestVersion": latest or (versions_sorted[-1] if versions_sorted else ""),
-                "versionCount": len(versions_sorted),
-            }
-        )
+        latest = find_bare_stable(versions_sorted) if versions_sorted else None
+        row: Dict[str, Any] = {
+            "groupId": key[0],
+            "artifactId": key[1],
+            "versionCount": len(versions_sorted),
+        }
+        if latest:
+            row["latestVersion"] = latest
+        out.append(row)
         if len(out) >= limit:
             break
     return out
@@ -15877,19 +16097,19 @@ def flatten_scan_result(scan: Dict) -> Dict:
 def handle_get_latest_version(args: Dict) -> Any:
     group_id = args["groupId"]
     artifact_id = args["artifactId"]
-    filter_mode = args.get("stabilityFilter", "PREFER_STABLE")
     ctx = build_resolution_context(args)
     metadata = fetch_metadata(group_id, artifact_id, ctx)
-    selected = find_latest_version(metadata["versions"], filter_mode)
-    if not selected:
-        raise ValueError(f"No stable version found for {group_id}:{artifact_id}")
-    result = {
+    selected = find_bare_stable(metadata["versions"])
+    result: Dict[str, Any] = {
         "groupId": group_id,
         "artifactId": artifact_id,
-        "latestVersion": selected,
-        "stability": classify_version(selected),
         "allVersionsCount": len(metadata["versions"]),
     }
+    if not selected:
+        _attach_version_provenance(result, metadata, None)
+        return result
+    result["latestVersion"] = selected
+    result["stability"] = "stable"
     _attach_version_provenance(result, metadata, selected)
     # #284: the latest version of a relocated artifact is typically the
     # relocation stub itself (Maven relocation POMs stop receiving further
@@ -15921,13 +16141,15 @@ def handle_check_version_exists(args: Dict) -> Any:
             "artifactId": artifact_id,
             "version": version,
             "exists": True,
-            "stability": classify_version(version),
             # entry["name"] can be the literal repo URL (maven("url") declarations
             # set name == url), so it goes through the same userinfo redaction as
             # resolvedFrom.url.
             "repository": _strip_userinfo(entry["name"]),
             "resolvedFrom": _to_resolved_from(entry),
         }
+        stability = classify_version(version)
+        if stability is not None:
+            result["stability"] = stability
         # #284: a specific version being checked may itself be a relocation stub.
         relocated_to = check_relocation(group_id, artifact_id, version, ctx)
         if relocated_to:
@@ -15953,31 +16175,29 @@ def handle_check_multiple_dependencies(args: Dict) -> Any:
     ctx = build_resolution_context(args)
 
     def _check_one(dep: Dict) -> Dict[str, Any]:
-        # Provenance is the repo that lists the selected version, not the first
-        # HTTP 200. "No version found" omits resolvedFrom; a 401/403/5xx on a
-        # declared repo still attaches repositoryErrors and a warning.
+        # Provenance is the repo that lists the bare stable, not the first
+        # HTTP 200. No bare stable omits latestVersion and resolvedFrom and
+        # is not an error. A 401, 403, or 5xx on a declared repo still
+        # attaches repositoryErrors and a warning.
         metadata = None
         selected = None
         try:
             metadata = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
-            latest = find_latest_version(metadata["versions"], "PREFER_STABLE")
-            if not latest:
-                raise ValueError("No version found")
+            latest = find_bare_stable(metadata["versions"])
             selected = latest
             entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
-                "latestVersion": latest,
-                "stability": classify_version(latest),
             }
+            if latest:
+                entry["latestVersion"] = latest
+                entry["stability"] = "stable"
             _attach_version_provenance(entry, metadata, latest)
             return entry
         except Exception as e:
             error_entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
-                "latestVersion": "",
-                "stability": "",
                 "error": str(e),
             }
             if metadata is not None:
@@ -15997,56 +16217,47 @@ def handle_compare_dependency_versions(args: Dict) -> Any:
     ctx = build_resolution_context(args)
 
     def _compare_one(dep: Dict) -> Dict[str, Any]:
-        # Provenance is the repo that lists latestVersion (the compared
-        # version), not currentVersion and not the first HTTP 200. "No matching
-        # version found" omits resolvedFrom; declared 401/403/5xx still warn.
+        # The row lists candidates and does not name one version, so
+        # resolvedFrom is omitted. A declared 401, 403, or 5xx still warns.
+        # An empty published list is candidates: [] and is not an error.
         metadata = None
-        selected = None
         try:
             metadata = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
-            latest = find_latest_version_for_current(metadata["versions"], dep["currentVersion"])
-            if not latest:
-                raise ValueError("No matching version found")
-            selected = latest
-            upgrade_type = get_upgrade_type(dep["currentVersion"], latest)
-            entry = {
+            current = dep["currentVersion"]
+            entry: Dict[str, Any] = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
-                "currentVersion": dep["currentVersion"],
-                "latestVersion": latest,
-                "latestStability": classify_version(latest),
-                "upgradeType": upgrade_type,
-                "upgradeAvailable": upgrade_type != "none",
+                "currentVersion": current,
+                "currentLine": version_line(current),
+                "candidates": select_candidates(metadata["versions"], current),
             }
-            _attach_version_provenance(entry, metadata, latest)
+            current_stability = classify_version(current)
+            if current_stability is not None:
+                entry["currentStability"] = current_stability
+            # Provenance of one chosen version is not meaningful on a list.
+            # Repository failures of the metadata read still travel with the row.
+            _attach_version_provenance(entry, metadata, None)
+            relocated_to = check_relocation(
+                dep["groupId"], dep["artifactId"], current, ctx,
+            )
+            if relocated_to:
+                entry["relocatedTo"] = relocated_to
             return entry
         except Exception as e:
-            # A lookup that did not produce a version is not "no upgrade".
-            # Omit upgradeType/upgradeAvailable; keep error as str(e) so
-            # "No matching version found" stays distinct from fetch failures.
             error_entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "currentVersion": dep.get("currentVersion", ""),
-                "latestVersion": "",
-                "latestStability": "",
                 "error": str(e),
             }
             if metadata is not None:
-                _attach_version_provenance(error_entry, metadata, selected)
+                _attach_version_provenance(error_entry, metadata, None)
             return error_entry
 
     # #400: bounded parallel fan-out, order preserved (see
     # handle_check_multiple_dependencies for the same pattern/rationale).
     results, _partial = _map_parallel(args["dependencies"], _compare_one)
-    summary = {
-        "total": len(results),
-        "upgradeable": sum(1 for r in results if r.get("upgradeAvailable")),
-        "major": sum(1 for r in results if r.get("upgradeType") == "major"),
-        "minor": sum(1 for r in results if r.get("upgradeType") == "minor"),
-        "patch": sum(1 for r in results if r.get("upgradeType") == "patch"),
-    }
-    return {"results": results, "summary": summary}
+    return {"results": results, "summary": {"total": len(results)}}
 
 
 def handle_get_dependency_changes(args: Dict) -> Any:
@@ -16210,16 +16421,17 @@ def handle_get_dependency_health(args: Dict) -> Any:
         versions = metadata["versions"]
         result["versionCount"] = len(versions)
         result["lastPublishedToMaven"] = metadata.get("lastUpdated")
-        latest_version = find_latest_version(versions, "PREFER_STABLE") or (versions[-1] if versions else None)
-        result["latestVersion"] = latest_version
-        result["stability"] = classify_version(latest_version) if latest_version else None
+        latest_version = find_bare_stable(versions)
+        if latest_version:
+            result["latestVersion"] = latest_version
+            result["stability"] = "stable"
+        else:
+            result["signals"].append("no stable release")
 
         target_version = requested_version or latest_version
-        # Requested version, else latest. A requested version absent from the
-        # map omits resolvedFrom rather than borrowing latest's repo.
+        # Requested version, else the bare stable. A requested version absent
+        # from the map omits resolvedFrom rather than borrowing another repo.
         _attach_version_provenance(result, metadata, target_version)
-        if not find_latest_version(versions, "STABLE_ONLY"):
-            result["signals"].append("no stable release")
 
         gh_repo = None
         pom_licenses: List[Dict[str, Optional[str]]] = []
@@ -16532,8 +16744,7 @@ def _has_audit_issue(entry: Dict[str, Any]) -> bool:
     deadRepositoryHints) so they are not part of this predicate."""
     if entry.get("error"):
         return True
-    upgrade_type = entry.get("upgradeType")
-    if upgrade_type and upgrade_type != "none":
+    if entry.get("candidates"):
         return True
     if entry.get("vulnerabilities"):
         return True
@@ -16686,11 +16897,9 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
         # caller's guarantee.
         current_version = _effective_version(dep) or ""
         ga_key = f"{dep['groupId']}:{dep['artifactId']}"
-        # Provenance is the repo that lists latestVersion. A downstream
-        # exception after that version was selected still gets that version's
-        # resolvedFrom. Do not fall back to the first HTTP 200.
+        # Repository failures of the metadata read still travel with the row.
+        # There is no single latest version to attach provenance to.
         metadata = None
-        selected = None
         _audit_probe.dep_id = id(dep)
         _audit_probe.board = probe_board
         try:
@@ -16700,30 +16909,27 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
                 fetched = fetch_metadata(dep["groupId"], dep["artifactId"], ctx)
                 with metadata_cache_lock:
                     metadata = metadata_cache.setdefault(ga_key, fetched)
-            latest = find_latest_version_for_current(metadata["versions"], current_version)
-            # Metadata answered but nothing acceptable is at least as new as
-            # current. Same error-entry shape as a fetch failure — not a
-            # success row with upgradeType "none" and latestVersion null.
-            if not latest:
-                error_entry = _audit_error_entry(
-                    dep, current_version, "No matching version found",
-                )
-                _attach_version_provenance(error_entry, metadata, None)
-                return error_entry
-            selected = latest
-            upgrade_type = get_upgrade_type(current_version, latest)
             entry = {
                 "groupId": dep["groupId"],
                 "artifactId": dep["artifactId"],
                 "currentVersion": current_version,
-                "latestVersion": latest,
-                "upgradeType": upgrade_type,
+                "currentLine": version_line(current_version),
+                "candidates": select_candidates(metadata["versions"], current_version),
                 "source": dep["source"],
                 "usages": dep.get("usages", []),
                 "module": (dep.get("usages") or [{}])[0].get("module"),
                 "configuration": (dep.get("usages") or [{}])[0].get("configuration"),
             }
-            _attach_version_provenance(entry, metadata, latest)
+            current_stability = classify_version(current_version)
+            if current_stability is not None:
+                entry["currentStability"] = current_stability
+            _attach_version_provenance(entry, metadata, None)
+            relocated_to = check_relocation(
+                dep["groupId"], dep["artifactId"], current_version, ctx,
+                deadline=deadline,
+            )
+            if relocated_to:
+                entry["relocatedTo"] = relocated_to
             if dep.get("effectiveVersion") is not None:
                 entry["effectiveVersion"] = dep["effectiveVersion"]
             if dep.get("managedBy") is not None:
@@ -16734,12 +16940,11 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
             return entry
         except Exception as e:
             # str(e) is safe here: fetch_metadata's own messages are redacted
-            # at the source (see fetch_metadata), and find_latest_version_for_
-            # current/get_upgrade_type are pure version-string functions that
-            # never embed a repo URL.
+            # at the source (see fetch_metadata). select_candidates does not
+            # embed a repo URL.
             error_entry = _audit_error_entry(dep, current_version, str(e))
             if metadata is not None:
-                _attach_version_provenance(error_entry, metadata, selected)
+                _attach_version_provenance(error_entry, metadata, None)
             return error_entry
         finally:
             # Do not pop an untaken label. _map_parallel may discard this
@@ -16940,11 +17145,8 @@ def handle_audit_project_dependencies(args: Dict) -> Any:
 
     summary = {
         "total": len(audit_deps),
-        "upgradeable": sum(1 for d in audit_deps if d.get("upgradeType") and d["upgradeType"] != "none"),
+        "upgradeable": sum(1 for d in audit_deps if d.get("candidates")),
         "vulnerable": sum(1 for d in audit_deps if d.get("vulnerabilities")),
-        "major": sum(1 for d in audit_deps if d.get("upgradeType") == "major"),
-        "minor": sum(1 for d in audit_deps if d.get("upgradeType") == "minor"),
-        "patch": sum(1 for d in audit_deps if d.get("upgradeType") == "patch"),
     }
 
     # #405: onlyIssues (default false, unchanged output) filters `dependencies`
@@ -17263,7 +17465,7 @@ def _verify_one(
         existence_status = "unknown"
 
     versions = sorted(union_versions, key=functools.cmp_to_key(compare_versions))
-    latest = find_latest_version(versions, "PREFER_STABLE")
+    latest = find_bare_stable(versions)
 
     result: Dict[str, Any] = {
         "groupId": group_id,
@@ -17506,21 +17708,34 @@ _LICENSE_RESULT_SCHEMA: Dict[str, Any] = {
 }
 
 
+_CANDIDATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "version": {"type": "string"},
+        "line": {"type": "string"},
+        "stability": {
+            "type": "string",
+            "enum": ["snapshot", "alpha", "beta", "milestone", "rc", "stable"],
+        },
+        "distance": {
+            "type": "string",
+            "enum": ["patch", "minor", "major", "prerelease", "other"],
+        },
+    },
+    "required": ["version", "line", "distance"],
+}
+
+
 TOOLS = [
     {
         "name": "get_latest_version",
-        "description": "Get the latest version of a Maven artifact from Maven Central, Google Maven, or Gradle Plugin Portal.",
+        "description": "Get the newest bare stable version of a Maven artifact. A preview, nightly, or unknown qualifier is not that version. When no bare stable exists, latestVersion is absent.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "groupId": {"type": "string", "description": "Maven group ID"},
                 "artifactId": {"type": "string", "description": "Maven artifact ID"},
-                "stabilityFilter": {
-                    "type": "string",
-                    "enum": ["PREFER_STABLE", "STABLE_ONLY", "ALL"],
-                    "description": "Version stability filter. Default: PREFER_STABLE",
-                },
                 "projectPath": {"type": "string", "description": "Project root used to resolve declared repositories. Defaults to the current working directory."},
             },
             "required": ["groupId", "artifactId"],
@@ -17531,14 +17746,14 @@ TOOLS = [
                 "groupId": {"type": "string"},
                 "artifactId": {"type": "string"},
                 "latestVersion": {"type": "string"},
-                "stability": {"type": "string"},
+                "stability": {"type": "string", "enum": ["stable"]},
                 "allVersionsCount": {"type": "integer"},
                 "resolvedFrom": _RESOLVED_FROM_SCHEMA,
                 "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
                 "warnings": _WARNINGS_SCHEMA,
                 "relocatedTo": _GAV_SCHEMA,
             },
-            "required": ["groupId", "artifactId", "latestVersion", "stability", "allVersionsCount"],
+            "required": ["groupId", "artifactId", "allVersionsCount"],
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": True},
     },
@@ -17576,7 +17791,7 @@ TOOLS = [
     },
     {
         "name": "check_multiple_dependencies",
-        "description": "Batch lookup of latest versions for multiple Maven dependencies.",
+        "description": "Batch lookup of the newest bare stable version for multiple Maven dependencies. A coordinate with no bare stable omits latestVersion.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -17609,13 +17824,13 @@ TOOLS = [
                             "groupId": {"type": "string"},
                             "artifactId": {"type": "string"},
                             "latestVersion": {"type": "string"},
-                            "stability": {"type": "string"},
+                            "stability": {"type": "string", "enum": ["stable"]},
                             "resolvedFrom": _RESOLVED_FROM_SCHEMA,
                             "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
                             "warnings": _WARNINGS_SCHEMA,
                             "error": {"type": "string"},
                         },
-                        "required": ["groupId", "artifactId", "latestVersion", "stability"],
+                        "required": ["groupId", "artifactId"],
                     },
                 },
             },
@@ -17625,7 +17840,7 @@ TOOLS = [
     },
     {
         "name": "compare_dependency_versions",
-        "description": "Compare current dependency versions against the latest available and determine upgrade types (major/minor/patch).",
+        "description": "Return the parsed pin and the candidate versions newer than it. The server does not choose one of them.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -17659,31 +17874,26 @@ TOOLS = [
                             "groupId": {"type": "string"},
                             "artifactId": {"type": "string"},
                             "currentVersion": {"type": "string"},
-                            "latestVersion": {"type": "string"},
-                            "latestStability": {"type": "string"},
-                            "upgradeType": {"type": "string", "enum": ["major", "minor", "patch", "none"]},
-                            "upgradeAvailable": {"type": "boolean"},
-                            "resolvedFrom": _RESOLVED_FROM_SCHEMA,
+                            "currentLine": {"type": "string"},
+                            "currentStability": {
+                                "type": "string",
+                                "enum": ["snapshot", "alpha", "beta", "milestone", "rc", "stable"],
+                            },
+                            "candidates": {"type": "array", "items": _CANDIDATE_SCHEMA},
+                            "relocatedTo": _GAV_SCHEMA,
                             "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
                             "warnings": _WARNINGS_SCHEMA,
                             "error": {"type": "string"},
                         },
-                        "required": [
-                            "groupId", "artifactId", "currentVersion", "latestVersion",
-                            "latestStability",
-                        ],
+                        "required": ["groupId", "artifactId", "currentVersion"],
                     },
                 },
                 "summary": {
                     "type": "object",
                     "properties": {
                         "total": {"type": "integer"},
-                        "upgradeable": {"type": "integer"},
-                        "major": {"type": "integer"},
-                        "minor": {"type": "integer"},
-                        "patch": {"type": "integer"},
                     },
-                    "required": ["total", "upgradeable", "major", "minor", "patch"],
+                    "required": ["total"],
                 },
             },
             "required": ["results", "summary"],
@@ -18081,7 +18291,7 @@ TOOLS = [
                         "properties": {
                             "groupId": {"type": "string", "description": "Maven group ID"},
                             "artifactId": {"type": "string", "description": "Maven artifact ID"},
-                            "version": {"type": "string", "description": "Optional. When omitted, the latest preferred-stable version is evaluated."},
+                            "version": {"type": "string", "description": "Optional. When omitted, the newest bare stable version is evaluated."},
                         },
                         "required": ["groupId", "artifactId"],
                     },
@@ -18165,7 +18375,7 @@ TOOLS = [
                         "properties": {
                             "groupId": {"type": "string", "description": "Maven group ID"},
                             "artifactId": {"type": "string", "description": "Maven artifact ID"},
-                            "version": {"type": "string", "description": "Optional. When omitted, the latest preferred-stable version is used."},
+                            "version": {"type": "string", "description": "Optional. When omitted, the newest bare stable version is used."},
                         },
                         "required": ["groupId", "artifactId"],
                     },
@@ -18294,7 +18504,7 @@ TOOLS = [
                             "latestVersion": {"type": "string"},
                             "versionCount": {"type": "integer"},
                         },
-                        "required": ["groupId", "artifactId", "latestVersion", "versionCount"],
+                        "required": ["groupId", "artifactId", "versionCount"],
                     },
                 },
                 "searchBackend": {"type": "string", "enum": ["central", "nexus", "artifactory"]},
@@ -18305,7 +18515,7 @@ TOOLS = [
     },
     {
         "name": "audit_project_dependencies",
-        "description": "Orchestrates a full dependency audit: scans project build files, checks for available updates, and optionally queries OSV.dev for vulnerabilities. Optional includeLicenses adds license categorization, summary, and newLicenseCategories (categories unique in the scanned set). Optional onlyIssues narrows the returned dependencies to only those with a signal (error, available upgrade, vulnerability, or license flag); summary always covers the full scanned set.",
+        "description": "Orchestrates a full dependency audit: scans project build files, returns candidate versions newer than each pin, and optionally queries OSV.dev for vulnerabilities of the pinned versions. Optional includeLicenses adds license categorization, summary, and newLicenseCategories (categories unique in the scanned set). Optional onlyIssues narrows the returned dependencies to only those with a signal (error, non-empty candidates, vulnerability, or license flag); summary always covers the full scanned set.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -18314,7 +18524,7 @@ TOOLS = [
                 "includeVulnerabilities": {"type": "boolean", "description": "Include OSV vulnerability check (default true)"},
                 "productionOnly": {"type": "boolean", "description": "Exclude test-scope dependencies (default true)"},
                 "includeLicenses": {"type": "boolean", "description": "Include license intelligence (POM/GitHub resolve + category summary). Default false to avoid extra POM fetches."},
-                "onlyIssues": {"type": "boolean", "description": "Return only dependencies with a signal (error, upgrade available, vulnerability, or license flag) plus a compact summary. Default false (unchanged full output). Reduces response size on large projects."},
+                "onlyIssues": {"type": "boolean", "description": "Return only dependencies with a signal (error, non-empty candidates, vulnerability, or license flag) plus a compact summary. Default false (unchanged full output). Reduces response size on large projects."},
             },
         },
         "outputSchema": {
@@ -18329,13 +18539,14 @@ TOOLS = [
                             "groupId": {"type": "string"},
                             "artifactId": {"type": "string"},
                             "currentVersion": {"type": "string"},
-                            "latestVersion": {"type": ["string", "null"]},
-                            "upgradeType": {"type": "string"},
+                            "currentLine": {"type": "string"},
+                            "currentStability": {"type": "string"},
+                            "candidates": {"type": "array", "items": _CANDIDATE_SCHEMA},
+                            "relocatedTo": _GAV_SCHEMA,
                             "source": {"type": "object"},
                             "usages": {"type": "array"},
                             "module": {"type": ["string", "null"]},
                             "configuration": {"type": ["string", "null"]},
-                            "resolvedFrom": _RESOLVED_FROM_SCHEMA,
                             "repositoryErrors": {"type": "array", "items": _REPOSITORY_ERROR_SCHEMA},
                             "warnings": _WARNINGS_SCHEMA,
                             "vulnerabilities": {"type": "array", "items": {"type": "object"}},
@@ -18351,11 +18562,8 @@ TOOLS = [
                         "total": {"type": "integer"},
                         "upgradeable": {"type": "integer"},
                         "vulnerable": {"type": "integer"},
-                        "major": {"type": "integer"},
-                        "minor": {"type": "integer"},
-                        "patch": {"type": "integer"},
                     },
-                    "required": ["total", "upgradeable", "vulnerable", "major", "minor", "patch"],
+                    "required": ["total", "upgradeable", "vulnerable"],
                 },
             },
             "required": ["buildSystem", "dependencies", "summary"],

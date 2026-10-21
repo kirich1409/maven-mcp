@@ -25,21 +25,23 @@ The user provides `groupId:artifactId`, for example:
 
 2. **Call `get_latest_version`** with:
    - `groupId`, `artifactId`
-   - optional `stabilityFilter`: `PREFER_STABLE` (default), `STABLE_ONLY`, or `ALL`
    - optional `projectPath` when the user is inside a project (uses declared repos)
 
+   The tool returns one newest bare stable. A preview, nightly, or unknown qualifier is not that version. When no bare stable exists, `latestVersion` and `stability` are absent and `allVersionsCount` is still set. That is not an error.
+
 3. Present the tool result:
-   - `latestVersion` and `stability`
+   - `latestVersion` and `stability` when present
    - `allVersionsCount` when useful
-   - `resolvedFrom` (which repo answered; note `viaPublicFallback` if true)
-   - `relocatedTo` when present — surface the new coordinates clearly
+   - `resolvedFrom` (which repo listed that bare stable; note `viaPublicFallback` if true)
+   - `repositoryErrors` and `warnings` when present
+   - `relocatedTo` when present — call `get_latest_version` again for that coordinate. The version to use is the new coordinate's bare stable. Do not propose adding the old coordinate.
 
    Example:
 
    ```
    ## io.ktor:ktor-client-core
 
-   Latest: 3.1.3 (STABLE)
+   Latest: 3.1.3 (stable)
    Resolved from: https://repo1.maven.org/maven2 (dependency)
    ```
 

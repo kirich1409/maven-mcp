@@ -23,7 +23,15 @@ import unittest
 import unittest.mock
 import urllib.error
 
-from _helpers import server, mock_urlopen, http_error, temp_project, write_fake_gradlew, mock_gradle_resolve
+from _helpers import (
+    http_error,
+    mock_gradle_resolve,
+    mock_urlopen,
+    server,
+    temp_project,
+    write_fake_gradlew,
+)
+from fixtures.version_catalogs import RELOCATION_POM
 
 
 # --- response builders ------------------------------------------------------
@@ -87,16 +95,16 @@ class TestGetLatestVersion(unittest.TestCase):
         self.assertEqual(out["latestVersion"], "0.8.0")
         self.assertEqual(out["stability"], "stable")
 
-    def test_no_stable_version_raises(self):
-        # STABLE_ONLY over a prerelease-only metadata -> find_latest_version None
-        # -> handler raises ValueError (server.py :1235-:1236).
+    def test_no_bare_stable_omits_latest_version(self):
         with _patch_urlopen([(200, _meta(["1.0.0-alpha01"]))]):
-            with self.assertRaises(ValueError):
-                server.handle_get_latest_version({
-                    "groupId": "com.example",
-                    "artifactId": "lib",
-                    "stabilityFilter": "STABLE_ONLY",
-                })
+            out = server.handle_get_latest_version({
+                "groupId": "com.example",
+                "artifactId": "lib",
+            })
+        self.assertNotIn("latestVersion", out)
+        self.assertNotIn("stability", out)
+        self.assertEqual(out["allVersionsCount"], 1)
+        self.assertNotIn("error", out)
 
 
 # --- handle_check_version_exists --------------------------------------------
@@ -369,7 +377,7 @@ class TestCheckMultipleDependencies(unittest.TestCase):
             })
         by_artifact = {r["artifactId"]: r for r in out["results"]}
         self.assertEqual(by_artifact["good"]["latestVersion"], "1.1.0")
-        self.assertEqual(by_artifact["bad"]["latestVersion"], "")
+        self.assertNotIn("latestVersion", by_artifact["bad"])
         self.assertIn("error", by_artifact["bad"])
         # RESULT ORDERING is preserved regardless of which thread completed
         # first (#400: _map_parallel is index-mapped, not completion-order).
@@ -382,25 +390,13 @@ class TestCheckMultipleDependencies(unittest.TestCase):
 class TestCompareDependencyVersions(unittest.TestCase):
     """mirrors src/tools/__tests__/compare-dependency-versions.test.ts"""
 
-    def test_263_no_match_guard_exact_observables(self):
-        # #263 regression. dep[0]'s published versions are a single SNAPSHOT and
-        # current 1.0.0 is absent from the list: the only candidate is less
-        # stable than current, so find_latest_version_for_current returns None
-        # (a SNAPSHOT is never offered as an upgrade, #312), and — because
-        # current itself is not published — nothing newer-or-equal qualifies
-        # either (#312 correction). The `if not latest` guard (server.py :1299)
-        # therefore raises "No matching version found". dep[1] resolves normally.
-        # Asserting the EXACT error string + latestVersion, and that upgradeType
-        # and upgradeAvailable are absent, makes this fail if the guard is
-        # removed: without it, get_upgrade_type(current, None) raises a
-        # TypeError whose message would replace the error text. A failed
-        # lookup is not upgradeType "none" / upgradeAvailable false.
-        # #400: the per-dependency fan-out now runs on a ThreadPoolExecutor, so
-        # urlopen calls are no longer guaranteed to happen in input order --
-        # route by URL (which embeds the artifactId) instead of a
-        # position-based queue.
+    def test_263_snapshot_is_a_candidate_beside_a_sibling_minor(self):
+        # A published SNAPSHOT newer than the pin is a prerelease candidate.
+        # The sibling's newer bare stable is its own row. Neither is an error.
         def _route(req, *args, **kwargs):
             url = req.full_url if hasattr(req, "full_url") else str(req)
+            if url.endswith(".pom"):
+                return mock_urlopen([(404, b"")])(req, *args, **kwargs)
             if "nomatch" in url:
                 return mock_urlopen([(200, _meta(["2.0.0-SNAPSHOT"]))])(req, *args, **kwargs)
             return mock_urlopen([(200, _meta(["1.0.0", "1.1.0"]))])(req, *args, **kwargs)
@@ -417,31 +413,19 @@ class TestCompareDependencyVersions(unittest.TestCase):
         by_artifact = {r["artifactId"]: r for r in out["results"]}
         no_match, sibling = by_artifact["nomatch"], by_artifact["sibling"]
 
-        # Exact observables of the guard. A failed lookup keeps the error and
-        # omits the comparison fields — upgradeAvailable false was the bug.
-        self.assertEqual(no_match["error"], "No matching version found")
-        self.assertNotIn("upgradeType", no_match)
-        self.assertNotIn("upgradeAvailable", no_match)
-        self.assertEqual(no_match["latestVersion"], "")
+        self.assertNotIn("error", no_match)
+        self.assertEqual(no_match["candidates"][0]["version"], "2.0.0-SNAPSHOT")
+        self.assertEqual(no_match["candidates"][0]["distance"], "prerelease")
+        self.assertNotIn("latestVersion", no_match)
 
-        # Sibling still resolves successfully alongside the failed one:
-        self.assertEqual(sibling["latestVersion"], "1.1.0")
-        self.assertIs(sibling["upgradeAvailable"], True)
-        self.assertEqual(sibling["upgradeType"], "minor")
-
-        # RESULT ORDERING is preserved regardless of which thread completed
-        # first (#400: _map_parallel is index-mapped, not completion-order).
+        self.assertEqual(sibling["candidates"][0]["version"], "1.1.0")
+        self.assertEqual(sibling["candidates"][0]["distance"], "minor")
+        self.assertNotIn("error", sibling)
+        self.assertEqual(out["summary"], {"total": 2})
         self.assertEqual(out["results"][0]["artifactId"], "nomatch")
         self.assertEqual(out["results"][1]["artifactId"], "sibling")
 
-    def test_up_to_date_reports_no_upgrade_without_error(self):
-        # #312 correction: an already-up-to-date dependency (current == latest
-        # published stable) must NOT trip the `if not latest` guard. With the
-        # newer-OR-equal rule find_latest_version_for_current returns the
-        # current 2.0.0 itself, so the handler reports latestVersion 2.0.0,
-        # upgradeAvailable False (upgradeType "none") and emits NO error — where
-        # the prior strict-newer check returned None and raised a spurious
-        # "No matching version found".
+    def test_up_to_date_reports_empty_candidates_without_error(self):
         with _patch_urlopen([(200, _meta(["1.0.0", "2.0.0"]))]):
             out = server.handle_compare_dependency_versions({
                 "dependencies": [
@@ -450,10 +434,31 @@ class TestCompareDependencyVersions(unittest.TestCase):
                 ],
             })
         result = out["results"][0]
-        self.assertEqual(result["latestVersion"], "2.0.0")
-        self.assertIs(result["upgradeAvailable"], False)
-        self.assertEqual(result["upgradeType"], "none")
+        self.assertEqual(result["candidates"], [])
         self.assertNotIn("error", result)
+        self.assertNotIn("latestVersion", result)
+
+    def test_relocation_stays_on_the_old_coordinate(self):
+        pom = RELOCATION_POM.encode()
+        with _patch_urlopen([
+            (200, _meta(["1.0.0", "1.2.3"])),
+            (200, pom),
+        ]):
+            out = server.handle_compare_dependency_versions({
+                "dependencies": [{
+                    "groupId": "com.example",
+                    "artifactId": "lib",
+                    "currentVersion": "1.0.0",
+                }],
+            })
+        row = out["results"][0]
+        self.assertEqual(row["candidates"][0]["version"], "1.2.3")
+        self.assertEqual(row["artifactId"], "lib")
+        self.assertEqual(row["relocatedTo"], {
+            "groupId": "com.example",
+            "artifactId": "lib-new",
+            "version": "1.2.3",
+        })
 
 
 def _request_url(req) -> str:
@@ -502,10 +507,8 @@ def _dep(artifact_id: str, version: str = "1.0.0") -> dict:
 
 def _assert_compare_not_checked(test, row, error_part: str) -> None:
     test.assertIn(error_part, row["error"])
-    test.assertNotIn("upgradeType", row)
-    test.assertNotIn("upgradeAvailable", row)
-    test.assertEqual(row["latestVersion"], "")
-    test.assertEqual(row["latestStability"], "")
+    test.assertNotIn("candidates", row)
+    test.assertNotIn("latestVersion", row)
 
 
 class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
@@ -525,10 +528,10 @@ class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
         _assert_compare_not_checked(self, by_artifact["fail-transport"], "URLError")
         _assert_compare_not_checked(self, by_artifact["fail-auth"], "auth required")
         _assert_compare_not_checked(self, by_artifact["fail-503"], "HTTP 503")
-        self.assertEqual(out["summary"]["upgradeable"], 0)
+        self.assertEqual(out["summary"], {"total": 3})
         self.assertNotIn("resolvedFrom", by_artifact["fail-transport"])
 
-    def test_no_acceptable_version_is_not_a_metadata_failure(self):
+    def test_snapshot_and_empty_list_are_not_metadata_failures(self):
         urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
         with urlopen_patch, sleep_patch:
             out = server.handle_compare_dependency_versions({
@@ -537,14 +540,15 @@ class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
                     _dep("empty-list"),
                 ],
             })
-        for row in out["results"]:
-            self.assertEqual(row["error"], "No matching version found")
-            self.assertNotIn("Could not fetch metadata", row["error"])
-            self.assertNotIn("upgradeType", row)
-            self.assertNotIn("upgradeAvailable", row)
-            # No version was selected, so there is no per-version resolvedFrom.
-            self.assertNotIn("resolvedFrom", row)
-        self.assertEqual(out["summary"]["upgradeable"], 0)
+        by_artifact = {r["artifactId"]: r for r in out["results"]}
+        snap = by_artifact["snap-only"]
+        empty = by_artifact["empty-list"]
+        self.assertNotIn("error", snap)
+        self.assertEqual(snap["candidates"][0]["version"], "2.0.0-SNAPSHOT")
+        self.assertEqual(empty["candidates"], [])
+        self.assertNotIn("error", empty)
+        self.assertNotIn("resolvedFrom", snap)
+        self.assertEqual(out["summary"], {"total": 2})
 
     def test_published_stable_equal_to_current_is_still_no_upgrade(self):
         urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
@@ -553,10 +557,9 @@ class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
                 "dependencies": [_dep("equal-current")],
             })
         row = out["results"][0]
-        self.assertEqual(row["upgradeType"], "none")
-        self.assertIs(row["upgradeAvailable"], False)
+        self.assertEqual(row["candidates"], [])
         self.assertNotIn("error", row)
-        self.assertEqual(row["latestVersion"], row["currentVersion"])
+        self.assertNotIn("latestVersion", row)
 
     def test_sibling_upgrade_counted_error_rows_are_not(self):
         urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
@@ -569,22 +572,21 @@ class TestCompareFailedLookupIsNotCurrent(unittest.TestCase):
                 ],
             })
         by_artifact = {r["artifactId"]: r for r in out["results"]}
-        self.assertEqual(by_artifact["minor-bump"]["upgradeType"], "minor")
-        self.assertIs(by_artifact["minor-bump"]["upgradeAvailable"], True)
-        self.assertNotIn("upgradeType", by_artifact["fail-transport"])
-        self.assertNotIn("upgradeType", by_artifact["snap-only"])
-        self.assertEqual(out["summary"]["upgradeable"], 1)
-        self.assertEqual(out["summary"]["minor"], 1)
+        minor = by_artifact["minor-bump"]["candidates"][0]
+        self.assertEqual(minor["version"], "1.1.0")
+        self.assertEqual(minor["distance"], "minor")
+        self.assertIn("error", by_artifact["fail-transport"])
+        self.assertNotIn("candidates", by_artifact["fail-transport"])
+        self.assertEqual(by_artifact["snap-only"]["candidates"][0]["version"], "2.0.0-SNAPSHOT")
+        self.assertEqual(out["summary"], {"total": 3})
 
     def test_output_schema_does_not_require_upgrade_fields_on_failure(self):
         tool = next(t for t in server.TOOLS if t["name"] == "compare_dependency_versions")
         items = tool["outputSchema"]["properties"]["results"]["items"]
-        self.assertNotIn("upgradeType", items["required"])
-        self.assertNotIn("upgradeAvailable", items["required"])
-        self.assertEqual(
-            items["properties"]["upgradeType"]["enum"],
-            ["major", "minor", "patch", "none"],
-        )
+        self.assertNotIn("upgradeType", items["properties"])
+        self.assertNotIn("latestVersion", items["properties"])
+        self.assertIn("candidates", items["properties"])
+        self.assertEqual(tool["outputSchema"]["properties"]["summary"]["required"], ["total"])
 
 
 def _maven_pom(deps) -> str:
@@ -621,12 +623,17 @@ class TestAuditFailedLookupIsNotCurrent(unittest.TestCase):
         ):
             row = by_artifact[aid]
             self.assertIn(part, row["error"])
-            self.assertNotIn("upgradeType", row)
-        self.assertEqual(by_artifact["minor-bump"]["upgradeType"], "minor")
+            self.assertNotIn("candidates", row)
+        minor = by_artifact["minor-bump"]["candidates"][0]
+        self.assertEqual(minor["version"], "1.1.0")
+        self.assertEqual(minor["distance"], "minor")
         self.assertEqual(out["summary"]["upgradeable"], 1)
 
-    def test_no_acceptable_version_is_error_without_latest(self):
-        for artifact in ("snap-only", "empty-list"):
+    def test_snapshot_and_empty_list_are_not_errors(self):
+        for artifact, versions in (
+            ("snap-only", ["2.0.0-SNAPSHOT"]),
+            ("empty-list", []),
+        ):
             pom = _maven_pom([("com.example", artifact, "1.0.0")])
             urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
             with temp_project({"pom.xml": pom}) as root:
@@ -637,15 +644,17 @@ class TestAuditFailedLookupIsNotCurrent(unittest.TestCase):
                     })
             self.assertEqual(len(out["dependencies"]), 1)
             row = out["dependencies"][0]
-            self.assertEqual(row["error"], "No matching version found")
-            self.assertNotIn("Could not fetch metadata", row["error"])
-            self.assertNotIn("upgradeType", row)
+            self.assertNotIn("error", row)
             self.assertNotIn("latestVersion", row)
-            # No version was selected, so there is no per-version resolvedFrom.
             self.assertNotIn("resolvedFrom", row)
-            self.assertEqual(out["summary"]["upgradeable"], 0)
+            if artifact == "snap-only":
+                self.assertEqual(row["candidates"][0]["version"], versions[0])
+                self.assertEqual(out["summary"]["upgradeable"], 1)
+            else:
+                self.assertEqual(row["candidates"], [])
+                self.assertEqual(out["summary"]["upgradeable"], 0)
 
-    def test_latest_equal_to_current_is_still_no_upgrade(self):
+    def test_published_stable_equal_to_current_has_no_candidates(self):
         pom = _maven_pom([("com.example", "equal-current", "1.0.0")])
         urlopen_patch, sleep_patch = _patched_lookup(_issue36_metadata)
         with temp_project({"pom.xml": pom}) as root:
@@ -655,9 +664,9 @@ class TestAuditFailedLookupIsNotCurrent(unittest.TestCase):
                     "includeVulnerabilities": False,
                 })
         row = out["dependencies"][0]
-        self.assertEqual(row["upgradeType"], "none")
+        self.assertEqual(row["candidates"], [])
         self.assertNotIn("error", row)
-        self.assertEqual(row["latestVersion"], row["currentVersion"])
+        self.assertNotIn("latestVersion", row)
         self.assertEqual(out["summary"]["upgradeable"], 0)
 
 
@@ -681,10 +690,8 @@ class TestCheckDepsDoesNotCallFailedLookupCurrent(unittest.TestCase):
             % (not_equal, not_equal)
         )
         self.assertNotIn(old_rule, text)
-        self.assertIn(
-            '(`latestVersion` missing, null, or `""` and `upgradeType` absent)',
-            step2,
-        )
+        self.assertIn("A row with `error` was not checked", step2)
+        self.assertIn("empty `candidates`", step2)
         self.assertIn("not checked", step2)
         self.assertIn("and the error", step2)
         self.assertIn(
@@ -701,15 +708,9 @@ class TestCheckDepsDoesNotCallFailedLookupCurrent(unittest.TestCase):
             "**No upgrade available for any entry:** say so plainly; do not propose edits.",
             text,
         )
-        self.assertIn("without `upgradeType`", text)
         self.assertIn('Do not call it "no upgrade"', text)
         self.assertIn("Show the coordinate and the error", text)
-        self.assertIn("`summary.upgradeable` 0 is not enough", text)
-        self.assertIn(
-            "Say no upgrade only when every row has `upgradeType` `none`",
-            text,
-        )
-        self.assertIn("`latestVersion` equal to `currentVersion`", text)
+        self.assertIn("empty `candidates`", text)
         self.assertIn("no `error`", text)
 
 
@@ -1281,9 +1282,10 @@ class TestAuditProjectDependencies(unittest.TestCase):
             "<version>1.0.0</version>"
             "</dependency></dependencies></project>"
         )
-        # scan (local) -> fetch_metadata(1) -> query_osv_batch POST(1).
+        # scan (local) -> fetch_metadata -> relocation POM -> query_osv_batch POST.
         responses = [
             (200, _meta(["1.0.0", "1.1.0"])),
+            (200, b"<project></project>"),
             (200, _json({"results": [{"vulns": []}]})),
         ]
         with temp_project({"pom.xml": pom}) as root:
@@ -1291,8 +1293,8 @@ class TestAuditProjectDependencies(unittest.TestCase):
                 out = server.handle_audit_project_dependencies({"projectPath": root})
         self.assertEqual(out["buildSystem"], "maven")
         dep = out["dependencies"][0]
-        self.assertEqual(dep["latestVersion"], "1.1.0")
-        self.assertEqual(dep["upgradeType"], "minor")
+        self.assertEqual(dep["candidates"][0]["version"], "1.1.0")
+        self.assertEqual(dep["candidates"][0]["distance"], "minor")
         self.assertGreaterEqual(out["summary"]["upgradeable"], 1)
 
     def test_empty_project_no_network(self):
@@ -1335,6 +1337,7 @@ class TestAuditProjectDependencies(unittest.TestCase):
         responses = [
             (200, _meta(["1.0.0"])),
             http_error("https://repo1.maven.org/...", 404, "Not Found"),
+            (200, marker_pom),
             (200, marker_pom),
             (200, batch),
             (200, _osv_vuln_get(full)),
@@ -1406,6 +1409,8 @@ class TestAuditProjectDependencies(unittest.TestCase):
             with mock_gradle_resolve(resolved, production_count=2):
                 with unittest.mock.patch.object(
                     server, "fetch_metadata", side_effect=_counting_fetch_metadata,
+                ), unittest.mock.patch.object(
+                    server, "check_relocation", return_value=None,
                 ):
                     out = server.handle_audit_project_dependencies({
                         "projectPath": root, "includeVulnerabilities": False,
@@ -1419,8 +1424,13 @@ class TestAuditProjectDependencies(unittest.TestCase):
         # Both rows see a CONSISTENT metadata view (same version list) no
         # matter which thread's fetch ended up cached -- proof the dict
         # itself was never corrupted or left half-written under the race.
-        self.assertEqual(by_version["1.0.0"]["latestVersion"], "2.0.0")
-        self.assertEqual(by_version["2.0.0"]["upgradeType"], "none")
+        # The pin 1.0.0 keeps the newer minor and the higher major. The
+        # pin 2.0.0 has nothing newer.
+        self.assertEqual(
+            {row["version"] for row in by_version["1.0.0"]["candidates"]},
+            {"1.5.0", "2.0.0"},
+        )
+        self.assertEqual(by_version["2.0.0"]["candidates"], [])
 
     def test_deadline_marks_partial_and_flags_skipped_entries(self):
         # #402: force the deadline path deterministically by making
@@ -1447,6 +1457,8 @@ class TestAuditProjectDependencies(unittest.TestCase):
             with unittest.mock.patch.object(server, "TOOL_DEADLINE", 0.02), \
                     unittest.mock.patch.object(
                         server, "fetch_metadata", side_effect=_slow_fetch_metadata,
+                    ), unittest.mock.patch.object(
+                        server, "check_relocation", return_value=None,
                     ):
                 out = server.handle_audit_project_dependencies({
                     "projectPath": root, "includeVulnerabilities": False,
@@ -1509,10 +1521,9 @@ class TestAuditProjectDependencies(unittest.TestCase):
         self.assertEqual(len(out["dependencies"]), 1)
 
     def test_resolved_from_dedup_hoists_shared_default(self):
-        # #405: 3 deps all resolve from the SAME (public-fallback) repo ->
-        # resolvedFrom is hoisted to a top-level defaultResolvedFrom and
-        # stripped from every matching entry; no provenance is lost since a
-        # reader falls back to the top-level field.
+        # Audit does not select one version, so a shared repo is not hoisted
+        # and no row carries resolvedFrom. These pins equal the only
+        # published version, so candidates stay empty.
         pom = (
             "<project><dependencies>"
             "<dependency><groupId>com.example</groupId><artifactId>a</artifactId><version>1.0.0</version></dependency>"
@@ -1525,9 +1536,10 @@ class TestAuditProjectDependencies(unittest.TestCase):
                 out = server.handle_audit_project_dependencies({
                     "projectPath": root, "includeVulnerabilities": False,
                 })
-        self.assertIn("defaultResolvedFrom", out)
-        self.assertEqual(out["defaultResolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
+        self.assertNotIn("defaultResolvedFrom", out)
         for dep in out["dependencies"]:
+            self.assertEqual(dep["candidates"], [])
+            self.assertNotIn("error", dep)
             self.assertNotIn("resolvedFrom", dep)
 
 
