@@ -575,12 +575,10 @@ class TestProvenanceReporting(unittest.TestCase):
         self.assertEqual(out["resolvedFrom"]["url"], CUSTOM_URL)
         self.assertIs(out["resolvedFrom"]["viaPublicFallback"], False)
 
-    # --- resolvedFrom is wired onto the OTHER handlers touched by #317 --------
-    # The two tests above pin viaPublicFallback semantics through
-    # get_latest_version; these smoke-tests confirm the field is actually
-    # present (and correctly shaped) on every other success path. A
-    # custom-repo-only project where that repo answers 200 must surface
-    # resolvedFrom={url=CUSTOM_URL, scope="dependency", viaPublicFallback=False}.
+    # --- resolvedFrom on the handlers that still select one version ---------
+    # get_latest_version above pins viaPublicFallback. check_multiple and
+    # health still name one bare stable and keep resolvedFrom. compare and
+    # audit return a candidate list and omit resolvedFrom.
     def _assert_declared(self, rf):
         self.assertIsNotNone(rf)
         self.assertEqual(rf["url"], CUSTOM_URL)
@@ -600,12 +598,16 @@ class TestProvenanceReporting(unittest.TestCase):
                 })
         self._assert_declared(out["results"][0]["resolvedFrom"])
 
-    def test_compare_dependency_versions_includes_resolved_from(self):
+    def test_compare_dependency_versions_omits_resolved_from(self):
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        responses = [
+            (200, _meta(["1.0.0", "2.0.0"])),
+            http_error(CUSTOM_URL, 404, "Not Found"),
+        ]
         with temp_project(files) as root:
             with unittest.mock.patch(
                 "urllib.request.urlopen",
-                side_effect=mock_urlopen([(200, _meta(["1.0.0", "2.0.0"]))]),
+                side_effect=mock_urlopen(responses),
             ):
                 out = server.handle_compare_dependency_versions({
                     "dependencies": [{
@@ -614,7 +616,10 @@ class TestProvenanceReporting(unittest.TestCase):
                     }],
                     "projectPath": root,
                 })
-        self._assert_declared(out["results"][0]["resolvedFrom"])
+        item = out["results"][0]
+        self.assertEqual([row["version"] for row in item["candidates"]], ["2.0.0"])
+        self.assertNotIn("resolvedFrom", item)
+        self.assertNotIn("latestVersion", item)
 
     def test_get_dependency_health_includes_resolved_from(self):
         # resolvedFrom is attached for the evaluated version before the POM
@@ -635,9 +640,9 @@ class TestProvenanceReporting(unittest.TestCase):
                 })
         self._assert_declared(out["results"][0]["resolvedFrom"])
 
-    def test_audit_project_dependencies_includes_resolved_from(self):
+    def test_audit_project_dependencies_omits_resolved_from(self):
         # Gradle project with a declared dependency; vulnerabilities disabled so
-        # the only network call is the metadata fetch against the custom repo.
+        # the network calls are the metadata fetch and the relocation POM.
         files = {
             "settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL),
             "build.gradle.kts": 'dependencies { implementation("com.acme:lib:1.0.0") }',
@@ -654,12 +659,19 @@ class TestProvenanceReporting(unittest.TestCase):
             with mock_gradle_resolve(resolved):
                 with unittest.mock.patch(
                     "urllib.request.urlopen",
-                    side_effect=mock_urlopen([(200, _meta(["1.0.0", "2.0.0"]))]),
+                    side_effect=mock_urlopen([
+                        (200, _meta(["1.0.0", "2.0.0"])),
+                        http_error(CUSTOM_URL, 404, "Not Found"),
+                    ]),
                 ):
                     out = server.handle_audit_project_dependencies({
                         "projectPath": root, "includeVulnerabilities": False,
                     })
-        self._assert_declared(out["dependencies"][0]["resolvedFrom"])
+        dep = out["dependencies"][0]
+        self.assertEqual([row["version"] for row in dep["candidates"]], ["2.0.0"])
+        self.assertNotIn("resolvedFrom", dep)
+        self.assertNotIn("defaultResolvedFrom", out)
+        self.assertNotIn("latestVersion", dep)
 
     def test_get_dependency_changes_impl_includes_resolved_from(self):
         # Unlisted toVersion omits resolvedFrom. A 200 with no failures also
@@ -680,18 +692,12 @@ class TestProvenanceReporting(unittest.TestCase):
         self.assertNotIn("warnings", out)
         self.assertNotIn("repositoryErrors", out)
 
-    # --- finding #1 (code-reviewer, /finalize Phase A): the two handlers below
-    # used to build their error entry from a single try/except wrapping BOTH
-    # fetch_metadata AND downstream selection, so a downstream "no version"
-    # error dropped resolvedFrom even though a repo had actually answered. Fixed
-    # by capturing resolved_from right after fetch_metadata succeeds and
-    # threading it into the except-branch error entry too.
-    def test_check_multiple_dependencies_downstream_error_includes_resolved_from(self):
-        # The repo answers 200 but with an empty version list, so
-        # find_latest_version returns None and the handler raises "No version
-        # found". That result describes no selected version, so resolvedFrom is
-        # omitted — not copied from the first HTTP 200. No failures, so
-        # warnings and repositoryErrors are omitted too.
+    # An empty published list is not an error and does not invent a version.
+    # A real fetch failure still omits resolvedFrom.
+    def test_check_multiple_dependencies_empty_versions_omit_latest(self):
+        # The repo answers 200 with an empty version list. There is no bare
+        # stable, so latestVersion and resolvedFrom are omitted. That is not
+        # an error. No failures, so warnings and repositoryErrors are omitted.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
         with temp_project(files) as root:
             with unittest.mock.patch(
@@ -703,20 +709,25 @@ class TestProvenanceReporting(unittest.TestCase):
                     "projectPath": root,
                 })
         entry = out["results"][0]
-        self.assertIn("error", entry)
+        self.assertNotIn("error", entry)
+        self.assertNotIn("latestVersion", entry)
+        self.assertNotIn("stability", entry)
         self.assertNotIn("resolvedFrom", entry)
         self.assertNotIn("warnings", entry)
         self.assertNotIn("repositoryErrors", entry)
 
-    def test_compare_dependency_versions_downstream_error_includes_resolved_from(self):
-        # Same shape as above: empty version list -> find_latest_version_for_current
-        # returns None -> "No matching version found". The missing version
-        # omits resolvedFrom.
+    def test_compare_dependency_versions_empty_versions_are_not_an_error(self):
+        # An empty published list has nothing newer than the pin. The row is
+        # candidates: [] and is not an error, so resolvedFrom stays omitted.
         files = {"settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL)}
+        responses = [
+            (200, _meta([])),
+            http_error(CUSTOM_URL, 404, "Not Found"),
+        ]
         with temp_project(files) as root:
             with unittest.mock.patch(
                 "urllib.request.urlopen",
-                side_effect=mock_urlopen([(200, _meta([]))]),
+                side_effect=mock_urlopen(responses),
             ):
                 out = server.handle_compare_dependency_versions({
                     "dependencies": [{
@@ -726,7 +737,9 @@ class TestProvenanceReporting(unittest.TestCase):
                     "projectPath": root,
                 })
         entry = out["results"][0]
-        self.assertIn("error", entry)
+        self.assertEqual(entry["candidates"], [])
+        self.assertEqual(entry["currentVersion"], "1.0.0")
+        self.assertNotIn("error", entry)
         self.assertNotIn("resolvedFrom", entry)
         self.assertNotIn("warnings", entry)
         self.assertNotIn("repositoryErrors", entry)
@@ -1010,12 +1023,9 @@ class TestUserinfoRedaction(unittest.TestCase):
 
 
 class TestAuditDownstreamErrorResolvedFrom(unittest.TestCase):
-    # /finalize Phase 0 (removed-behavior auditor) finding: handle_audit_project_
-    # dependencies shares the #317 finding-1 shape (fetch_metadata + downstream
-    # selection in one try/except) but wasn't covered by the original fix. An
-    # unexpected exception from get_upgrade_type (after a successful fetch) must
-    # still carry resolvedFrom in the degraded entry, like the other handlers.
-    def test_downstream_exception_after_successful_fetch_preserves_resolved_from(self):
+    # A failure after metadata was fetched still marks the row unchecked.
+    # Audit does not name one version, so the error row omits resolvedFrom.
+    def test_downstream_exception_after_successful_fetch_omits_resolved_from(self):
         files = {
             "settings.gradle.kts": _settings('maven { url = uri("%s") }' % CUSTOM_URL),
             "build.gradle.kts": 'dependencies { implementation("com.acme:lib:1.0.0") }',
@@ -1035,19 +1045,16 @@ class TestAuditDownstreamErrorResolvedFrom(unittest.TestCase):
                     side_effect=mock_urlopen([(200, _meta(["1.0.0", "2.0.0"]))]),
                 ):
                     with unittest.mock.patch(
-                        "server.get_upgrade_type", side_effect=RuntimeError("boom")
+                        "server.select_candidates", side_effect=RuntimeError("boom")
                     ):
                         out = server.handle_audit_project_dependencies({
                             "projectPath": root, "includeVulnerabilities": False,
                         })
         entry = out["dependencies"][0]
-        self.assertNotIn("latestVersion", entry)  # degraded entry, same as before
-        self.assertIsNotNone(entry.get("resolvedFrom"))
-        self.assertEqual(entry["resolvedFrom"]["url"], CUSTOM_URL)
-        # silent-failure-hunter (/finalize Phase C): the degraded entry used to
-        # carry no "error" key at all (bare `except Exception:`), unlike its
-        # sibling handlers — fixed alongside the resolvedFrom threading above.
         self.assertEqual(entry.get("error"), "boom")
+        self.assertNotIn("candidates", entry)
+        self.assertNotIn("latestVersion", entry)
+        self.assertNotIn("resolvedFrom", entry)
 
 
 _PRIVATE_VERSIONS = ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
@@ -1107,12 +1114,11 @@ class TestPerVersionFallbackProvenance(unittest.TestCase):
                     "projectPath": root,
                 })
         item = out["results"][0]
-        self.assertEqual(item["latestVersion"], "1.5.0")
-        self.assertEqual(item["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
-        self.assertIs(item["resolvedFrom"]["viaPublicFallback"], True)
-        self.assertIn("public fallback", item["warnings"][0])
-        self.assertNotIn("warnings", out)
-        self.assertNotIn(CUSTOM_URL, item["warnings"][0])
+        versions = [row["version"] for row in item["candidates"]]
+        self.assertIn("1.5.0", versions)
+        self.assertNotIn("resolvedFrom", item)
+        self.assertNotIn("warnings", item)
+        self.assertNotIn("latestVersion", item)
 
     def test_audit_attributes_gradle_upgrade_to_central(self):
         files = {
@@ -1141,12 +1147,11 @@ class TestPerVersionFallbackProvenance(unittest.TestCase):
                     "projectPath": root, "includeVulnerabilities": False,
                 })
         dep = out["dependencies"][0]
-        self.assertEqual(dep["latestVersion"], "1.5.0")
-        self.assertEqual(dep["upgradeType"], "minor")
-        self.assertEqual(dep["resolvedFrom"]["url"], server.MAVEN_CENTRAL_URL)
-        self.assertIs(dep["resolvedFrom"]["viaPublicFallback"], True)
-        self.assertIn("public fallback", dep["warnings"][0])
-        self.assertNotIn(CUSTOM_URL, dep["warnings"][0])
+        versions = [row["version"] for row in dep["candidates"]]
+        self.assertIn("1.5.0", versions)
+        self.assertNotIn("resolvedFrom", dep)
+        self.assertNotIn("warnings", dep)
+        self.assertNotIn("latestVersion", dep)
         self.assertNotIn("warnings", out)
 
     def test_declared_401_is_kept_and_redacted_when_central_answers(self):

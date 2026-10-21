@@ -31,8 +31,20 @@ changelog data.
 
 ## Context: used after check-deps
 
-When the user asks "show me what changed for X" after an update table, pull coordinates and
-current → latest versions from that table without re-asking.
+When the user asks "show me what changed for X" after a candidate table, pull coordinates
+and the pin from that table. The caller names both ends. The tool lists every published
+version in the span.
+
+## Finding a fix
+
+When the user asks whether a newer version already fixes a bug, call
+`compare_dependency_versions` for the pin, then one `get_dependency_changes` from the pin
+to the newest candidate. Read the bodies. Name the version whose text mentions the bug,
+including an alpha. No mention means the notes do not show the fix. Do not invent a
+version and do not replace that answer with the naming rule in `/check-deps`.
+
+When compare returns `relocatedTo`, call `get_latest_version` for the new coordinate
+before reading notes for that line. `use` is the new coordinate.
 
 ## Error handling
 

@@ -37,19 +37,25 @@ Do **not** hand-parse `maven-metadata.xml` or POST to OSV yourself while MCP too
 
 ## Step 2 — Build the report
 
-Partition audit and compare rows before the upgrade table. Partition `error` first, so a row that has both `error` and `upgradeType` `none` is not checked, not current.
+Partition audit and compare rows before the upgrade table. Partition `error` first. A row with `error` was not checked.
 
-**Not checked:** any row with `error`, or a versioned row whose lookup produced no version (`latestVersion` missing, null, or `""` and `upgradeType` absent). List `groupId:artifactId`, `currentVersion` when present, and the error. Do not call these current. Do not put them in the upgrade table. Do not propose an edit for them.
+**Not checked:** any row with `error`. List `groupId:artifactId`, `currentVersion` when present, and the error. Do not call these current. Do not put them in the upgrade table. Do not propose an edit for them.
 
-**Upgrades:** no `error`, and `upgradeType` is `major`, `minor`, or `patch`, or a non-empty `latestVersion` that differs from `currentVersion`. Only these rows go in the upgrade table. A blank `latestVersion` must not satisfy "differs from `currentVersion`". Group upgrade rows that have `source` by `source.kind`:
+**Candidates:** no `error`, and `candidates` is non-empty. Show `currentVersion`, `currentLine`, and each candidate's `version`, `line`, `distance`, and `stability` when that key is present. An omitted `stability` is not stable. Group rows that have `source` by `source.kind`:
 
-- **catalog-library** / **catalog-plugin** — alias, current → latest, upgrade type, catalog file, usages
-- **module-direct** — module, file, artifact, current → latest, configuration; flag catalog drift
+- **catalog-library** / **catalog-plugin** — alias, current, candidates, catalog file, usages
+- **module-direct** — module, file, artifact, current, candidates, configuration; flag catalog drift
 - **plugins-dsl** — split settings `pluginManagement` vs root/module `plugins {}`
-- **buildscript-classpath** — artifact, current → latest, file; note legacy style
+- **buildscript-classpath** — artifact, current, candidates, file; note legacy style
 - **gradle-resolved** — Gradle-resolved direct dependency with no matching build-file provenance
 
-**Current:** no `error`, `upgradeType` `none`, and `latestVersion` equal to `currentVersion`. A latest-equals-current row with no `error` is still up to date.
+**Current:** no `error` and empty `candidates`. That row is still up to date.
+
+Name one version only when `currentLine` is `release` and `candidates` contains exactly one newer bare stable (`stability` `stable`, `line` `release`, `distance` `patch`) and no other bare stable. Several newer minors, a higher major, a pin whose line is not `release`, or only a newer prerelease: do not name a version from this rule. For a version you might name, read `get_dependency_changes` from the pin to that version and `get_dependency_vulnerabilities` for that version. For AGP, the Kotlin Gradle plugin, Gradle, Spring Boot, or JDK also call `check_version_compatibility`. Missing notes, an unsettled break, or an advisory means ask. Clear ordinary notes and no advisory: you may name that version. Writing the file still waits.
+
+When `relocatedTo` is present, call `get_latest_version` again for that coordinate. `use` is the new coordinate. Candidates on this row stay the old coordinate's versions. Do not propose adding the old coordinate.
+
+A question about a fix is not this naming rule. Call `compare_dependency_versions`, then one `get_dependency_changes` from the pin to the newest candidate, and read the bodies. Name the version whose text mentions the bug, including an alpha. No mention means the notes do not show the fix.
 
 When `resolvedBy: "gradle"` is present on the scan/audit result, versions are Gradle-resolved
 (effective versions from BOM/platform/constraints), not regex-guessed from build files.
@@ -77,14 +83,13 @@ with non-empty `vulnerabilities`. Use server fields (`id`, `severity`, `summary`
 `fixedVersion`, `malicious`) — do not re-derive severity from a raw querybatch response.
 Sort CRITICAL → HIGH → MEDIUM → LOW → unknown. Omit the section when empty.
 
-Surface `warnings` when present (the selected version was found only on a public fallback, or a declared repo returned 401, 403, or 5xx). A declared repo may have answered with older versions. Also surface `resolvedFrom.viaPublicFallback` when true — that flag is per selected version, not "the coordinate is missing from every declared repo".
+Surface `warnings` and `repositoryErrors` when present. A declared repo that returned 401, 403, or 5xx is named there. Compare and audit do not set `resolvedFrom`: the row has no single selected version. `get_latest_version` still sets `resolvedFrom`, and `viaPublicFallback` true means that bare stable was listed by a public fallback.
 Surface `deadRepositoryHints` from the scan/audit when present (e.g. `jcenter()`).
 
 ## Step 3 — Confirmation
 
 Before the stable non-major library batch, split toolchain pins out. Identify them by
-coordinate, not catalog alias. They get their own confirm even when `upgradeType` is
-`minor` or `patch`. Do not put them in the library batch. A green
+coordinate, not catalog alias. They get their own confirm even when the only newer bare stable is a patch, or `distance` is `minor` or `patch`. Do not put them in the library batch. A green
 `compileDemoDebugKotlin` does not make one of these a library patch.
 
 - AGP: plugin ids `com.android.application`, `com.android.library`, `com.android.test`,
@@ -175,8 +180,7 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
 
 3. **`gradlew` exists and at least one library upgrade remains.** One call. Omit
    `graphSource` (`auto`). At most 20 library upgrades. The server rejects a longer
-   list; it does not truncate. If more than 20 remain, send majors first
-   (`upgradeType` `major`), then rows whose direct audit entry already has
+   list; it does not truncate. If more than 20 remain, send rows whose candidate `distance` is `major` first, then rows whose direct audit entry already has
    `vulnerabilities`. Say the rest were `not closure-checked`. Do not loop.
 
 4. **Render that single result.** Lead with `advisory`, `graphSource`, `diffReliable`,
@@ -211,8 +215,7 @@ confirmed. Pass `projectPath` when the project is not the working directory. Lea
      direct version does not clear every known CVE and name that candidate. That
      compare is against the line-matched `safeUpgrade.version` for the queried
      package and the line, not clearance by a cross-line numeric win. That
-     compare is `compare_versions`: numeric segments, then stability class, qualifier
-     presence, prerelease ordinals, then a lexical tie-break. Not text order (`1.10`
+     compare is `compare_versions`: numeric segments, then stability class. `ga`, `final`, and `release` of one core compare equal. Then prerelease ordinals, then a lexical tie-break. Not text order (`1.10`
      is above `1.9`). An RC and a final release that share a numeric core are not equal. Ask
      again before editing. Writing that higher version is a new confirm and a new
      preview, not an in-place edit of this result.
@@ -339,7 +342,7 @@ spotless violation, `requiresCompileSdk`, `requiresMinSdk`.
 - Major version bumps require explicit per-entry confirmation.
 - Step 1 stays direct: `audit_project_dependencies` is first-level production dependencies, not the closure. The closure preview runs only after confirm, for the library batch, and is not a safety verdict.
 - The write hooks do not call `compare_upgrade_closure`. Do not add that call.
-- This skill does not auto-select unstable/pre-release versions (server uses prefer-stable).
+- The server does not name a version. Name one only by the rule in Step 2. A known prerelease stays a candidate row. Do not treat omitted `stability` as stable.
 - Gradle resolution in step 1 needs `gradlew`. Maven projects are in scope: `audit_project_dependencies` still returns their rows, and the no-wrapper preview is one POM-graph call, or no call when the batch is larger or no library upgrade remains. The Gradle wrapper path stays on Gradle and does not fall back to the POM graph.
 
 ## Fallback (MCP unavailable only)

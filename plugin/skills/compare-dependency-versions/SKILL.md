@@ -10,8 +10,7 @@ disable-model-invocation: true
 
 # Compare Dependency Versions
 
-Compare one or more Maven dependencies' current version against the latest available and
-classify the upgrade as `major` / `minor` / `patch` / `none`.
+Return the pin and the candidate versions newer than it. The server does not choose one of them.
 
 ## Steps
 
@@ -22,11 +21,13 @@ classify the upgrade as `major` / `minor` / `patch` / `none`.
    - `dependencies`: `[{groupId, artifactId, currentVersion}, ...]`
    - optional `projectPath`
 
-3. Present per-dependency: current → latest, `latestStability`, `upgradeType`,
-   `upgradeAvailable`. Use the `summary` block (`total`, `upgradeable`, `major`, `minor`,
-   `patch`) for a one-line rollup when comparing more than a couple of dependencies.
+3. Present per-dependency: `currentVersion`, `currentLine`, and each candidate's
+   `version`, `line`, `distance`, and `stability` when present. An omitted `stability`
+   is not stable. `summary` is `total` only.
 
-**A row with `error`, or without `upgradeType`, was not compared.** Show the coordinate and the error. Do not call it "no upgrade", even when `summary.upgradeable` is 0. `summary.upgradeable` 0 is not enough. Say no upgrade only when every row has `upgradeType` `none`, `latestVersion` equal to `currentVersion`, and no `error`. Do not propose edits in that case.
+**A row with `error` was not compared.** Show the coordinate and the error. Do not call it "no upgrade". Say no upgrade only when every row has no `error` and empty `candidates`. Do not propose edits in that case.
+
+Name one version only when `currentLine` is `release` and the candidates contain exactly one newer bare stable of that same major.minor and no other bare stable. Otherwise leave the list for the model to read. When `relocatedTo` is present, call `get_latest_version` for the new coordinate. `use` is that coordinate. Candidates on this row stay the old coordinate's versions.
 
 ## Constraints and non-goals
 
@@ -37,6 +38,4 @@ classify the upgrade as `major` / `minor` / `patch` / `none`.
 
 ## Fallback (MCP unavailable only)
 
-Fetch `maven-metadata.xml` per artifact, pick the highest version reachable from
-`currentVersion` under prefer-stable rules, and classify the semver diff yourself
-(major/minor/patch by first differing segment). Skips project-declared private repos.
+Fetch `maven-metadata.xml` per artifact and list the same candidate rows the server would: newest bare stable of the pin's minor, of each newer minor, and of each higher major, plus the newest newer known prerelease of each numeric core. Skips project-declared private repos.

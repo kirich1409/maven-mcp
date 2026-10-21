@@ -25,7 +25,7 @@ Search for Maven artifacts by keyword or partial coordinate when the exact
      backend
    - optional `projectPath` for mirror/closed-mode resolution
 
-3. Present `results` as a table: `groupId:artifactId`, `latestVersion`, `versionCount`. If
+3. Present `results` as a table: `groupId:artifactId`, `latestVersion`, `versionCount`. An omitted `latestVersion` means that coordinate has no bare stable. If
    `searchBackendUnavailable` is present instead of results, say which backend was tried
    and that the search could not be served (not "no results found").
 

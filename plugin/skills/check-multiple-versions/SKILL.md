@@ -24,13 +24,11 @@ dependencies and not for comparing against a *current* version.
    - `dependencies`: `[{groupId, artifactId}, ...]`
    - optional `projectPath` when the user is inside a project (uses declared repos)
 
-   Note: unlike `/latest-version`, this tool has no `stabilityFilter` override — it always
-   selects PREFER_STABLE. Call `get_latest_version` per-artifact instead if the user needs
-   `STABLE_ONLY` or `ALL` for one of them.
+   Each coordinate is the same newest bare stable as `get_latest_version`. A coordinate with no bare stable omits `latestVersion`. That omission is not an error.
 
 3. Present a table: artifact → latest version → stability → resolved-from repo. Entries
-   with an `error` (e.g. no version found) are shown separately with the error message —
-   never silently dropped.
+   with an `error` are shown separately with the error message — never silently dropped.
+   An omitted `latestVersion` with no `error` means no bare stable was published.
 
 ## Constraints and non-goals
 

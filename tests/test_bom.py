@@ -339,16 +339,17 @@ class TestScanAuditBomIntegration(unittest.TestCase):
                 "usages": [{"module": None, "configuration": "releaseRuntimeClasspath"}],
             },
         ]
-        responses = [
-            (200, meta),  # metadata for org.example:bom
-            (200, meta),  # metadata for com.example:lib
-        ]
+        def _route(req, *args, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            body = b"<project></project>" if url.endswith(".pom") else meta
+            return mock_urlopen([(200, body)])(req, *args, **kwargs)
+
         with temp_project(files) as root:
             write_fake_gradlew(root)
             with mock_gradle_resolve(resolved):
                 with unittest.mock.patch(
                     "urllib.request.urlopen",
-                    side_effect=mock_urlopen(responses),
+                    side_effect=_route,
                 ):
                     out = server.handle_audit_project_dependencies({
                         "projectPath": root,
@@ -357,7 +358,8 @@ class TestScanAuditBomIntegration(unittest.TestCase):
         by_ga = {(d["groupId"], d["artifactId"]): d for d in out["dependencies"]}
         lib = by_ga[("com.example", "lib")]
         self.assertEqual(lib["currentVersion"], "1.0.0")
-        self.assertEqual(lib["upgradeType"], "minor")
+        self.assertEqual(lib["candidates"][0]["version"], "1.1.0")
+        self.assertEqual(lib["candidates"][0]["distance"], "minor")
 
 
 if __name__ == "__main__":

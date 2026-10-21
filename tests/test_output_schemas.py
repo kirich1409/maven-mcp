@@ -225,7 +225,7 @@ _FIXTURES = {
         "groupId": "com.squareup.okhttp3",
         "artifactId": "okhttp",
         "latestVersion": "4.12.0",
-        "stability": "STABLE",
+        "stability": "stable",
         "allVersionsCount": 42,
         "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": False},
     },
@@ -242,22 +242,28 @@ _FIXTURES = {
         "results": [
             {
                 "groupId": "com.squareup.okhttp3", "artifactId": "okhttp",
-                "latestVersion": "4.12.0", "stability": "STABLE",
+                "latestVersion": "4.12.0", "stability": "stable",
                 "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": False},
             },
-            {"groupId": "com.example", "artifactId": "nope", "latestVersion": "", "stability": "", "error": "No version found"},
+            {"groupId": "com.example", "artifactId": "nope", "error": "No version found"},
         ],
     },
     "compare_dependency_versions": {
         "results": [
             {
                 "groupId": "com.squareup.okhttp3", "artifactId": "okhttp",
-                "currentVersion": "3.0.0", "latestVersion": "4.12.0", "latestStability": "STABLE",
-                "upgradeType": "major", "upgradeAvailable": True,
-                "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": False},
+                "currentVersion": "3.0.0",
+                "currentLine": "release",
+                "currentStability": "stable",
+                "candidates": [{
+                    "version": "4.12.0",
+                    "line": "release",
+                    "stability": "stable",
+                    "distance": "major",
+                }],
             },
         ],
-        "summary": {"total": 1, "upgradeable": 1, "major": 1, "minor": 0, "patch": 0},
+        "summary": {"total": 1},
     },
     "expand_bom": {
         "groupId": "org.springframework.boot", "artifactId": "spring-boot-dependencies", "version": "3.2.0",
@@ -431,16 +437,27 @@ _FIXTURES = {
             "groupId": "com.example",
             "artifactId": "lib",
             "currentVersion": "1.2.3",
-            "latestVersion": "1.3.0",
-            "upgradeType": "minor",
+            "currentLine": "release",
+            "currentStability": "stable",
+            "candidates": [{
+                "version": "1.3.0",
+                "line": "release",
+                "stability": "stable",
+                "distance": "minor",
+            }],
             "source": {"kind": "module-direct", "file": "pom.xml", "module": None},
             "usages": [{"module": None, "configuration": "implementation"}],
             "module": None,
             "configuration": "implementation",
-            "resolvedFrom": {"url": "https://repo1.maven.org/maven2/", "scope": "dependency", "viaPublicFallback": True},
+            "repositoryErrors": [{
+                "url": "https://nexus.example.com/m2",
+                "message": "auth required for https://nexus.example.com/m2 (HTTP 401)",
+                "status": 401,
+            }],
+            "warnings": ["declared repo https://nexus.example.com/m2 returned 401"],
             "vulnerabilities": [],
         }],
-        "summary": {"total": 1, "upgradeable": 1, "vulnerable": 0, "major": 0, "minor": 1, "patch": 0},
+        "summary": {"total": 1, "upgradeable": 1, "vulnerable": 0},
     },
     "catalog_entry": {
         "alias": "okhttp",
@@ -768,11 +785,20 @@ class RealHandlerOutputSchemaTest(unittest.TestCase):
                 "malicious": False,
             }],
         }]
-        # Declared 401 (not retried) plus a Central-only newer version, so the
-        # dependency item carries repositoryErrors, warnings, and resolvedFrom.
+        # Declared 401 plus a Central-only newer version. Relocation is read
+        # from the Central POM. There is no single selected version, so the
+        # item carries repositoryErrors, warnings, and relocatedTo.
+        relocation = (
+            "<project><distributionManagement><relocation>"
+            "<groupId>com.example</groupId><artifactId>lib-new</artifactId>"
+            "<version>1.2.3</version>"
+            "</relocation></distributionManagement></project>"
+        ).encode()
         responses = [
             http_error("https://nexus.example.com/m2", 401, "Unauthorized"),
             (200, _metadata_xml(["1.2.3", "1.3.0"])),
+            http_error("https://nexus.example.com/m2", 401, "Unauthorized"),
+            (200, relocation),
         ]
         with temp_project({"pom.xml": pom}) as root, unittest.mock.patch.dict(
             os.environ, {"MAVEN_MCP_PUBLIC_FALLBACK": "on"}

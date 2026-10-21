@@ -16,7 +16,7 @@ category, plain-English notes, and where the data came from.
 ## Steps
 
 1. Parse `groupId`, `artifactId`, and optionally `version` for each dependency (when
-   `version` is omitted, the latest preferred-stable version is used).
+   `version` is omitted, the newest bare stable version is used).
 
 2. Call **`get_dependency_license`** with `dependencies: [{groupId, artifactId, version?}, ...]`
    (capped at 100 items) and optional `projectPath`.

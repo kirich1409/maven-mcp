@@ -4,8 +4,7 @@ Real sockets, real ``handle_audit_project_dependencies`` — urlopen is not
 patched. A silent first repository must not spend the whole tool budget:
 
 * two or more versioned dependencies still reach the next declared
-  repository inside ``TOOL_DEADLINE``, with ``latestVersion`` from that
-  repository;
+  repository inside ``TOOL_DEADLINE``, with ``1.2.0`` in ``candidates``;
 * a row left unfinished names the repository it was waiting on, and says
   later repositories were not queried only when a later one was not
   contacted (not merely because two repositories are in scope);
@@ -181,11 +180,6 @@ def _path_counts(log):
     return Counter(event["path"] for event in log.snapshot())
 
 
-def _resolved_url(dep, out):
-    resolved = dep.get("resolvedFrom") or out.get("defaultResolvedFrom")
-    return resolved["url"] if resolved else None
-
-
 class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
     def setUp(self):
         with server._repo_failure_lock:
@@ -270,10 +264,10 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
                 )
                 for dep in out["dependencies"]:
                     self.assertEqual(dep["currentVersion"], "1.0.0")
-                    self.assertEqual(dep["latestVersion"], "1.2.0")
-                    self.assertEqual(dep["upgradeType"], "minor")
+                    versions = [row["version"] for row in dep["candidates"]]
+                    self.assertIn("1.2.0", versions)
                     self.assertNotIn("error", dep)
-                    self.assertEqual(_resolved_url(dep, out), fast_url)
+                    self.assertNotIn("latestVersion", dep)
                 self.assertGreaterEqual(len(fast_log.snapshot()), 2)
                 hang_counts = _path_counts(hang_log)
                 self.assertGreaterEqual(hang_counts["/com/example/one/maven-metadata.xml"], 1)
@@ -307,7 +301,8 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
                 self.assertEqual(len(hang_log.snapshot()), hang_after_first)
                 self.assertEqual(len(fast_log.snapshot()), fast_after_first)
                 for dep in again["dependencies"]:
-                    self.assertEqual(dep["latestVersion"], "1.2.0")
+                    versions = [row["version"] for row in dep["candidates"]]
+                    self.assertIn("1.2.0", versions)
                     self.assertNotIn("error", dep)
 
                 # Expiry sends the dead host back to the network. The 200
@@ -342,10 +337,10 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
         self.assertLess(elapsed, deadline)
         self.assertNotIn("partial", out)
         dep = out["dependencies"][0]
-        self.assertEqual(dep["latestVersion"], "1.2.0")
+        versions = [row["version"] for row in dep["candidates"]]
+        self.assertIn("1.2.0", versions)
         self.assertNotIn("error", dep)
-        self.assertEqual(dep["resolvedFrom"]["url"], fast_url)
-        self.assertFalse(dep["resolvedFrom"]["viaPublicFallback"])
+        self.assertNotIn("resolvedFrom", dep)
         hang_times = [event["t"] for event in hang_log.snapshot()]
         fast_times = [event["t"] for event in fast_log.snapshot()]
         self.assertGreaterEqual(len(hang_times), 1)
@@ -553,17 +548,25 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
                 server._repo_failure_remember(meta_url, "HTTP 500 from bad")
                 server._file_cache.set(meta_url, 200, body)
                 out = self._audit(root)
-                self.assertEqual(log.snapshot(), [])
+                self.assertFalse(any(
+                    event["path"].endswith("maven-metadata.xml")
+                    for event in log.snapshot()
+                ))
                 dep = out["dependencies"][0]
-                self.assertEqual(dep["latestVersion"], "2.0.0")
+                versions = [row["version"] for row in dep["candidates"]]
+                self.assertIn("2.0.0", versions)
                 self.assertNotIn("error", dep)
                 self.assertIsNone(server._repo_failure_lookup(meta_url))
 
                 server._repo_failure_remember(meta_url, "HTTP 500 from bad")
+                before_late = len(log.snapshot())
                 with unittest.mock.patch.object(server, "TOOL_DEADLINE", -1.0):
                     late = self._audit(root)
-                self.assertEqual(log.snapshot(), [])
-                self.assertEqual(late["dependencies"][0]["latestVersion"], "2.0.0")
+                self.assertEqual(len(log.snapshot()), before_late)
+                late_versions = [
+                    row["version"] for row in late["dependencies"][0]["candidates"]
+                ]
+                self.assertIn("2.0.0", late_versions)
                 self.assertNotIn("error", late["dependencies"][0])
                 self.assertIsNone(server._repo_failure_lookup(meta_url))
 
@@ -597,14 +600,17 @@ class AuditDeclaredRepoDeadlineTest(unittest.TestCase):
                 "while waiting for fast",
             )
 
-    def _assert_versions(self, out, fast_url, elapsed):
+    def _assert_versions(self, out, _fast_url, elapsed):
         self.assertNotIn("partial", out)
         self.assertLess(elapsed, 3.0)
         for dep in out["dependencies"]:
             self.assertEqual(dep["currentVersion"], "1.0.0")
-            self.assertEqual(dep["latestVersion"], "1.2.0")
+            versions = [row["version"] for row in dep["candidates"]]
+            self.assertIn("1.2.0", versions)
+            row = next(item for item in dep["candidates"] if item["version"] == "1.2.0")
+            self.assertEqual(row["distance"], "minor")
             self.assertNotIn("error", dep)
-            self.assertEqual(_resolved_url(dep, out), fast_url)
+            self.assertNotIn("latestVersion", dep)
 
 
 if __name__ == "__main__":

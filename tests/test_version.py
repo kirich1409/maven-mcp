@@ -12,6 +12,19 @@ import functools
 import unittest
 
 from _helpers import server
+from fixtures.version_catalogs import (
+    ALIAS_ALREADY_BARE,
+    ALIAS_FROM_OLDER,
+    ALIAS_ONLY,
+    ALPHA_AND_STABLE,
+    DATESTAMP,
+    JRE_LINES,
+    NO_BARE_STABLE,
+    ONE_PATCH,
+    ONLY_NEXT_ALPHA,
+    PLUS_ORDINAL,
+    WIDE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +63,10 @@ class ClassifyVersionTest(unittest.TestCase):
         self.assertEqual(server.classify_version("1.0-CR1"), "rc")
 
     def test_no_false_positive_on_short_form_patterns(self):
-        # mirrors classify.test.ts: "does not false-positive on short-form patterns"
-        self.assertEqual(server.classify_version("1.0-bar"), "stable")
-        self.assertEqual(server.classify_version("1.0-ace"), "stable")
+        # Short forms do not match alpha/beta. The qualifier is unknown, so
+        # stability is omitted.
+        self.assertIsNone(server.classify_version("1.0-bar"))
+        self.assertIsNone(server.classify_version("1.0-ace"))
 
     def test_classifies_milestone(self):
         # mirrors classify.test.ts: "classifies milestone versions"
@@ -64,8 +78,35 @@ class ClassifyVersionTest(unittest.TestCase):
         self.assertEqual(server.classify_version(""), "stable")
 
     def test_edge_case_garbage_input(self):
-        # edge case: unrecognised string matches no pattern — falls through to "stable"
-        self.assertEqual(server.classify_version("garbage"), "stable")
+        # No numeric core and no known token. Stability is omitted.
+        self.assertIsNone(server.classify_version("garbage"))
+
+    def test_preview_eap_and_dev_are_prereleases(self):
+        # #70: these published qualifiers are prereleases, not stable releases.
+        self.assertEqual(server.classify_version("1.1.0-preview.1"), "alpha")
+        self.assertEqual(server.classify_version("1.0.0-Preview.1"), "alpha")
+        self.assertEqual(server.classify_version("1.0.0.preview.1"), "alpha")
+        self.assertEqual(server.classify_version("1.1.1-eap13"), "alpha")
+        self.assertEqual(server.classify_version("1.1.1-EAP13"), "alpha")
+        self.assertEqual(server.classify_version("17-ea+3"), "alpha")
+        self.assertEqual(server.classify_version("1.0.0-pre"), "alpha")
+        self.assertEqual(server.classify_version("1.0.0-pre1"), "alpha")
+        self.assertEqual(server.classify_version("2.1.20-dev-1234"), "snapshot")
+        self.assertEqual(server.classify_version("1.0.0-nightly"), "snapshot")
+        self.assertEqual(server.classify_version("1.0.0-nightly.10"), "snapshot")
+
+    def test_longer_words_and_platform_qualifiers_omit_stability(self):
+        # The token ends at the qualifier boundary. A longer word and a
+        # platform qualifier are not a known class, so stability is omitted.
+        # Final stays a stable alias.
+        self.assertIsNone(server.classify_version("1.0.0-devtools"))
+        self.assertIsNone(server.classify_version("1.0.0-devtools2"))
+        self.assertIsNone(server.classify_version("1.0.0-prerelease"))
+        self.assertIsNone(server.classify_version("1.0-develop"))
+        self.assertIsNone(server.classify_version("1.0-each"))
+        self.assertIsNone(server.classify_version("33.0.0-jre"))
+        self.assertIsNone(server.classify_version("1.0.0-android"))
+        self.assertEqual(server.classify_version("1.0.0.Final"), "stable")
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +129,25 @@ class FindLatestVersionTest(unittest.TestCase):
         raw = ["0.7.0", "0.8.0-0.6.x-compat", "0.8.0"]
         versions = sorted(set(raw), key=functools.cmp_to_key(server.compare_versions))
         self.assertEqual(server.find_latest_version(versions, "PREFER_STABLE"), "0.8.0")
+
+    def test_stable_only_skips_preview_and_eap(self):
+        # #70: a preview or EAP build must not be returned as the stable release.
+        preview = sorted(
+            ["1.0.0", "1.1.0-preview.1"],
+            key=functools.cmp_to_key(server.compare_versions),
+        )
+        eap = sorted(
+            ["1.1.0", "1.1.1-eap13"],
+            key=functools.cmp_to_key(server.compare_versions),
+        )
+        self.assertEqual(server.find_latest_version(preview, "STABLE_ONLY"), "1.0.0")
+        self.assertEqual(server.find_latest_version(preview, "PREFER_STABLE"), "1.0.0")
+        self.assertEqual(server.find_latest_version(eap, "STABLE_ONLY"), "1.1.0")
+        self.assertEqual(server.find_latest_version(["1.0.0-nightly"], "STABLE_ONLY"), None)
+        self.assertEqual(
+            server.find_latest_version(["1.0.0-nightly"], "PREFER_STABLE"),
+            "1.0.0-nightly",
+        )
 
 
 class FindLatestVersionForCurrentTest(unittest.TestCase):
@@ -149,6 +209,35 @@ class FindLatestVersionForCurrentTest(unittest.TestCase):
             "0.8.0",
         )
 
+    def test_preview_is_not_an_upgrade_from_stable(self):
+        # #70: from a stable pin, a newer preview on the next core is less
+        # stable and must not be offered. The stable completion of a preview
+        # pin is offered.
+        preview = sorted(
+            ["1.0.0", "1.1.0-preview.1"],
+            key=functools.cmp_to_key(server.compare_versions),
+        )
+        self.assertEqual(
+            server.find_latest_version_for_current(preview, "1.0.0"),
+            "1.0.0",
+        )
+        same_line = sorted(
+            ["1.0.0-preview.1", "1.0.0"],
+            key=functools.cmp_to_key(server.compare_versions),
+        )
+        self.assertEqual(
+            server.find_latest_version_for_current(same_line, "1.0.0-preview.1"),
+            "1.0.0",
+        )
+        newer_preview = sorted(
+            ["1.0.0-preview.1", "1.0.0-preview.2"],
+            key=functools.cmp_to_key(server.compare_versions),
+        )
+        self.assertEqual(
+            server.find_latest_version_for_current(newer_preview, "1.0.0-preview.1"),
+            "1.0.0-preview.2",
+        )
+
 
 # ---------------------------------------------------------------------------
 # compare_versions
@@ -172,19 +261,15 @@ class CompareVersionsTest(unittest.TestCase):
         self.assertLess(server.compare_versions("2.0.0-alpha1", "2.0.0-beta1"), 0)
 
     def test_bare_release_outranks_same_core_qualifier_suffix(self):
-        # #325: "0.8.0" and "0.8.0-0.6.x-compat" share the same numeric core
-        # and both classify as "stable" (no alpha/beta/rc/milestone/snapshot
-        # match in "-compat"), so the only signal left is the prerelease-number
-        # tail. A bare release (no suffix at all) must rank above a same-core
-        # release carrying a numeric qualifier suffix, not below it.
+        # Unknown qualifier sorts below snapshot, so the bare stable of the
+        # same core is newer.
+        self.assertIsNone(server.classify_version("0.8.0-0.6.x-compat"))
         self.assertGreater(server.compare_versions("0.8.0", "0.8.0-0.6.x-compat"), 0)
         self.assertLess(server.compare_versions("0.8.0-0.6.x-compat", "0.8.0"), 0)
 
     def test_bare_release_outranks_digitless_qualifier_suffix(self):
-        # #325: a suffix with no digits at all (e.g. "-compat", "-jre") must
-        # not slip past the fix — _extract_prerelease_numbers returns [] for
-        # both a truly bare version AND a digitless suffix, so the fix must
-        # key on suffix presence, not on prerelease-number-list emptiness.
+        # An unknown digitless suffix is not stable and sorts below the bare core.
+        self.assertIsNone(server.classify_version("0.8.0-compat"))
         self.assertGreater(server.compare_versions("0.8.0", "0.8.0-compat"), 0)
         self.assertLess(server.compare_versions("0.8.0-compat", "0.8.0"), 0)
 
@@ -204,12 +289,13 @@ class CompareVersionsTest(unittest.TestCase):
         self.assertLess(server.compare_versions("1.0.0-beta", "1.0.0-beta2"), 0)
         self.assertGreater(server.compare_versions("1.0.0-beta2", "1.0.0-beta"), 0)
 
-    def test_bare_release_outranks_dot_delimited_qualifier(self):
-        # #331: .Final / .RELEASE are qualifiers, not numeric core segments.
-        self.assertGreater(server.compare_versions("1.0.0", "1.0.0.Final"), 0)
-        self.assertLess(server.compare_versions("1.0.0.Final", "1.0.0"), 0)
-        self.assertGreater(server.compare_versions("1.0.0", "1.0.0.RELEASE"), 0)
-        self.assertLess(server.compare_versions("1.0.0.RELEASE", "1.0.0"), 0)
+    def test_release_aliases_of_one_core_compare_equal(self):
+        # .Final / .RELEASE are qualifiers, not numeric core segments, and
+        # they compare equal to the bare version. Display order is separate.
+        self.assertEqual(server.compare_versions("1.0.0", "1.0.0.Final"), 0)
+        self.assertEqual(server.compare_versions("1.0.0.Final", "1.0.0"), 0)
+        self.assertEqual(server.compare_versions("1.0.0", "1.0.0.RELEASE"), 0)
+        self.assertEqual(server.compare_versions("1.0.0-ga", "1.0.0.RELEASE"), 0)
 
     def test_numeric_fourth_segment_still_part_of_core(self):
         # #331: pure numeric dotted tails remain in the core.
@@ -222,6 +308,25 @@ class CompareVersionsTest(unittest.TestCase):
         self.assertLess(server.compare_versions("1.0.0legacy", "1.0.0"), 0)
         self.assertGreater(server.compare_versions("1.0.0", "1.0.0_legacy"), 0)
         self.assertLess(server.compare_versions("1.0.0_legacy", "1.0.0"), 0)
+
+    def test_preview_eap_and_dev_order_by_class_then_ordinal(self):
+        # preview/eap are alpha, dev/nightly are snapshot, and the number
+        # attached to the token is the ordinal. A +N on that token is too.
+        self.assertGreater(server.compare_versions("1.0.0", "1.0.0-preview.1"), 0)
+        self.assertGreater(server.compare_versions("1.0.0-beta1", "1.0.0-preview.1"), 0)
+        self.assertLess(server.compare_versions("1.0.0-nightly", "1.0.0-preview.1"), 0)
+        self.assertLess(server.compare_versions("1.0.0-preview.9", "1.0.0-preview.10"), 0)
+        self.assertLess(server.compare_versions("1.1.1-eap9", "1.1.1-eap13"), 0)
+        self.assertLess(server.compare_versions("2.1.20-dev-9", "2.1.20-dev-10"), 0)
+        self.assertLess(server.compare_versions("1.0.0-nightly.9", "1.0.0-nightly.10"), 0)
+        self.assertLess(server.compare_versions("17-ea+3", "17-ea+4"), 0)
+        self.assertLess(server.compare_versions("17-ea+9", "17-ea+10"), 0)
+        self.assertGreater(server.compare_versions("17", "17-ea+3"), 0)
+        self.assertGreater(server.compare_versions("1.0.0", "1.0.0-devtools"), 0)
+        # A +N on a stable version is not an ordinal. String order keeps +10 below +9.
+        self.assertLess(server.compare_versions("1.0.0+10", "1.0.0+9"), 0)
+        self.assertEqual(server.classify_version("1.0.0-rc-preview"), "alpha")
+        self.assertEqual(server.classify_version("1.0.0-dev-preview"), "snapshot")
 
     def test_symmetric_free_text_suffixes_ignore_incidental_digits(self):
         # #331: free-text digits must not act as ordinal prerelease numbers.
@@ -335,6 +440,112 @@ class FilterVersionRangeTest(unittest.TestCase):
             server._filter_version_range(_RANGE_VERSIONS, "1.0.0", "9.9.9"),
             ["1.1.0", "1.2.0", "1.3.0", "2.0.0-beta1", "2.0.0"],
         )
+
+
+def _named_by_rule(pin, rows):
+    """The skill's naming rule. Not a server field."""
+    if server.version_line(pin) != "release":
+        return None
+    bare = [
+        row for row in rows
+        if row.get("stability") == "stable" and row.get("line") == "release"
+    ]
+    patches = [row for row in bare if row.get("distance") == "patch"]
+    if len(bare) == 1 and len(patches) == 1:
+        return patches[0]["version"]
+    return None
+
+
+def _by_version(rows):
+    return {row["version"]: row for row in rows}
+
+
+class CandidateCatalogTest(unittest.TestCase):
+    """Fixed catalogs. The server returns rows. The naming rule is asserted here."""
+
+    def test_one_patch_is_named(self):
+        rows = server.select_candidates(ONE_PATCH["versions"], ONE_PATCH["pin"])
+        self.assertEqual([row["version"] for row in rows], ["4.12.1"])
+        self.assertEqual(rows[0]["distance"], "patch")
+        self.assertEqual(rows[0]["stability"], "stable")
+        self.assertEqual(_named_by_rule(ONE_PATCH["pin"], rows), ONE_PATCH["named"])
+
+    def test_wide_jump_returns_every_row_and_names_none(self):
+        rows = server.select_candidates(WIDE["versions"], WIDE["pin"])
+        by_version = _by_version(rows)
+        self.assertEqual(set(by_version), set(WIDE["versions"]))
+        self.assertEqual(by_version["1.3.6"]["distance"], "patch")
+        self.assertEqual(by_version["1.5.6"]["distance"], "minor")
+        self.assertEqual(by_version["2.0.0"]["distance"], "major")
+        self.assertEqual(by_version["1.3.7-rc.1"]["distance"], "prerelease")
+        self.assertEqual(by_version["2.0.0-alpha.1"]["distance"], "prerelease")
+        self.assertIsNone(_named_by_rule(WIDE["pin"], rows))
+
+    def test_alpha_pin_with_stable_names_the_bare_stable(self):
+        rows = server.select_candidates(
+            ALPHA_AND_STABLE["versions"], ALPHA_AND_STABLE["pin"],
+        )
+        by_version = _by_version(rows)
+        self.assertEqual(set(by_version), {"1.3.0-alpha.5", "1.3.6"})
+        self.assertEqual(server.version_line(ALPHA_AND_STABLE["pin"]), "release")
+        self.assertEqual(
+            _named_by_rule(ALPHA_AND_STABLE["pin"], rows),
+            ALPHA_AND_STABLE["named"],
+        )
+
+    def test_only_next_alpha_is_a_row_and_is_not_named(self):
+        rows = server.select_candidates(
+            ONLY_NEXT_ALPHA["versions"], ONLY_NEXT_ALPHA["pin"],
+        )
+        self.assertEqual([row["version"] for row in rows], ["1.3.0-alpha.5"])
+        self.assertIsNone(_named_by_rule(ONLY_NEXT_ALPHA["pin"], rows))
+
+    def test_no_bare_stable_omits_latest(self):
+        self.assertIsNone(server.find_bare_stable(NO_BARE_STABLE["versions"]))
+
+    def test_plus_ordinal_on_prerelease_and_bare_stable(self):
+        self.assertLess(
+            server.compare_versions("17-ea+9", "17-ea+10"), 0,
+        )
+        self.assertGreater(server.compare_versions("17", "17-ea+10"), 0)
+        rows = server.select_candidates(PLUS_ORDINAL["versions"], PLUS_ORDINAL["pin"])
+        by_version = _by_version(rows)
+        self.assertEqual(set(by_version), {"17-ea+10", "17"})
+        self.assertEqual(by_version["17"]["distance"], "patch")
+        self.assertEqual(by_version["17-ea+10"]["distance"], "prerelease")
+
+    def test_jre_lines_stay_beside_the_bare_stable(self):
+        rows = server.select_candidates(JRE_LINES["versions"], JRE_LINES["pin"])
+        by_version = _by_version(rows)
+        self.assertIn("1.3.6", by_version)
+        self.assertEqual(by_version["1.3.6-jre8"]["line"], "jre8")
+        self.assertNotIn("1.3.6-jre-8", by_version)
+        self.assertEqual(by_version["1.4.0-jre11"]["line"], "jre11")
+        self.assertNotIn("stability", by_version["1.3.6-jre8"])
+        self.assertIsNone(_named_by_rule(JRE_LINES["pin"], rows))
+
+    def test_alias_display_prefers_bare_then_release(self):
+        self.assertEqual(
+            server.find_bare_stable(ALIAS_FROM_OLDER["versions"]),
+            "1.0.0",
+        )
+        rows = server.select_candidates(
+            ALIAS_FROM_OLDER["versions"], ALIAS_FROM_OLDER["pin"],
+        )
+        self.assertEqual([row["version"] for row in rows], [ALIAS_FROM_OLDER["shown"]])
+        self.assertEqual(
+            server.select_candidates(
+                ALIAS_ALREADY_BARE["versions"], ALIAS_ALREADY_BARE["pin"],
+            ),
+            [],
+        )
+        self.assertEqual(server.find_bare_stable(ALIAS_ONLY), "1.0.0.RELEASE")
+
+    def test_datestamp_is_not_a_candidate_beside_a_normal_release(self):
+        rows = server.select_candidates(DATESTAMP["versions"], DATESTAMP["pin"])
+        self.assertEqual(rows, [])
+        self.assertEqual(server.find_bare_stable(DATESTAMP["versions"]), "1.0.0")
+        self.assertIsNone(server.find_bare_stable(["20030203.000550"]))
 
 
 if __name__ == "__main__":
